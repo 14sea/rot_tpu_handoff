@@ -1,0 +1,193 @@
+From fb9921b86c07959281f0ba331a60d966a8e6b8e8 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Fri, 15 May 2026 21:44:08 +0100
+Subject: [PATCH 2/2] =?UTF-8?q?Phase=205:=20top-level=20Makefile=20?=
+ =?UTF-8?q?=E2=80=94=20tpu-then-rot=20build=20chain?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+New /home/test/neorv32_rot/Makefile orchestrates the cross-repo build:
+
+  tpu-then-rot
+    ├── tpu-bitstream      (Quartus + cpf in $TPU_REPO)
+    ├── tpu-zeta-verify    (ζ byte-identity gate; skip with ZETA_VERIFY=0)
+    ├── tpu-copy           (tpu.rbf → output/tpu.rbf)
+    ├── rot-firmware       (sw/stage2_loader/make all → gen_golden.py
+    │                       picks up output/tpu.rbf, bakes SHA into
+    │                       rot_golden_tpu_bitstream, installs to
+    │                       neorv32_imem_image.vhd)
+    ├── rot-bitstream      (Quartus + cpf in quartus/ → output/neorv32_demo.rbf
+    │                       carries TPU hash in IMEM)
+    └── rot-zeta-verify    (ζ byte-identity gate on ROT.rbf)
+
+Env-overridable: TPU_REPO, EP4CE6_REPO, QUARTUS_BIN, XPACK_BIN,
+ZETA_VERIFY. Toolchain PATH (xpack-riscv-none-elf + Quartus 21.1)
+plumbed via $(PATH_FULL).
+
+End-to-end ex-Quartus test:
+  cp /home/test/neorv32_tpu/neorv32_tpu.rbf output/tpu.rbf
+  cd sw/stage2_loader && make all
+  → rot_golden.h embeds 5e87f3ddd43a3c93... = sha256(neorv32_tpu.rbf) ✓
+
+Plan reference: /home/test/.claude/plans/temporal-booping-raven.md
+Phase 5 of 6 (~2h estimate). Quartus invocations in
+tpu-bitstream/rot-bitstream not exercised here (no Quartus session
+in the test harness); they replicate the canonical commands from
+both repos' READMEs.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ Makefile | 140 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+ create mode 100644 Makefile
+
+diff --git a/Makefile b/Makefile
+new file mode 100644
+index 0000000..e777dad
+--- /dev/null
++++ b/Makefile
+@@ -0,0 +1,140 @@
++# Top-level orchestration for the ROT → TPU EPCS self-reconfig flow.
++#
++# Plan reference: /home/test/.claude/plans/temporal-booping-raven.md
++# Phase 5 of 6 — chain TPU build → tpu.rbf copy → gen_golden → ROT firmware
++# → ROT bitstream so the resulting ROT.rbf has the freshly-built TPU's
++# SHA-256 baked into stage2's IMEM_INIT_FILE.
++#
++# Inputs and toolchains are env-overridable for portability:
++#
++#   make tpu-then-rot                  # full chain, defaults work on this dev box
++#   make TPU_REPO=/path/to/tpu tpu-then-rot
++#   make ZETA_VERIFY=0 tpu-then-rot    # skip ζ byte-identity gate (fast iter)
++#   make tpu-bitstream                 # build TPU side only
++#   make rot-firmware rot-bitstream    # rebuild ROT with current output/tpu.rbf
++#   make clean-output                  # wipe output/ + force-rebuild
++
++REPO         := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
++TPU_REPO    ?= /home/test/neorv32_tpu
++EP4CE6_REPO ?= /home/test/EP4CE6
++QUARTUS_BIN ?= $(HOME)/intelFPGA_lite/21.1/quartus/bin
++XPACK_BIN   ?= $(HOME)/xpack-riscv-none-elf-gcc-14.2.0-3/bin
++ZETA_PIPELINE ?= $(EP4CE6_REPO)/scripts/bit_workaround/zeta_pipeline.py
++ZETA_VERIFY ?= 1
++
++QSH         := $(QUARTUS_BIN)/quartus_sh
++QCPF        := $(QUARTUS_BIN)/quartus_cpf
++PATH_FULL   := $(XPACK_BIN):$(QUARTUS_BIN):$(PATH)
++
++TPU_QUARTUS  := $(TPU_REPO)/quartus
++TPU_PROJECT  := neorv32_tpu
++TPU_SOF      := $(TPU_QUARTUS)/output_files/$(TPU_PROJECT).sof
++TPU_RBF_SRC  := $(TPU_REPO)/$(TPU_PROJECT).rbf
++TPU_RBF_DST  := $(REPO)/output/tpu.rbf
++
++ROT_QUARTUS  := $(REPO)/quartus
++ROT_PROJECT  := neorv32_demo
++ROT_SOF      := $(ROT_QUARTUS)/output_files/$(ROT_PROJECT).sof
++ROT_RBF      := $(REPO)/output/$(ROT_PROJECT).rbf
++
++ROT_FW_DIR   := $(REPO)/sw/stage2_loader
++NEORV32_IMEM := $(REPO)/neorv32/rtl/core/neorv32_imem_image.vhd
++
++.PHONY: tpu-then-rot tpu-bitstream tpu-zeta-verify tpu-copy \
++        rot-firmware rot-bitstream rot-zeta-verify clean-output help
++
++help:
++	@echo "Top-level targets:"
++	@echo "  tpu-then-rot      Full chain: TPU bitstream → copy → ROT firmware → ROT bitstream"
++	@echo "  tpu-bitstream     Build $(TPU_PROJECT).rbf via Quartus + cpf"
++	@echo "  tpu-zeta-verify   Run ζ byte-identity gate on TPU.rbf (RBF-only, no HW)"
++	@echo "  tpu-copy          Stage TPU.rbf into output/tpu.rbf"
++	@echo "  rot-firmware      Rebuild stage2 (regenerates rot_golden.h with TPU hash)"
++	@echo "  rot-bitstream     Build $(ROT_PROJECT).rbf via Quartus + cpf"
++	@echo "  rot-zeta-verify   Run ζ byte-identity gate on ROT.rbf (RBF-only, no HW)"
++	@echo "  clean-output      Wipe output/ + Quartus output_files/"
++	@echo
++	@echo "Override-able:"
++	@echo "  TPU_REPO=$(TPU_REPO)"
++	@echo "  EP4CE6_REPO=$(EP4CE6_REPO)"
++	@echo "  QUARTUS_BIN=$(QUARTUS_BIN)"
++	@echo "  XPACK_BIN=$(XPACK_BIN)"
++	@echo "  ZETA_VERIFY=$(ZETA_VERIFY)  (set to 0 to skip ζ gates)"
++
++# ────────────────────────────────────────────────────────────────────────────
++# TPU side
++# ────────────────────────────────────────────────────────────────────────────
++tpu-bitstream: $(TPU_RBF_SRC)
++
++$(TPU_RBF_SRC): $(TPU_QUARTUS)/$(TPU_PROJECT).qsf
++	@echo "[tpu] quartus_sh --flow compile in $(TPU_QUARTUS)"
++	@cd $(TPU_QUARTUS) && PATH="$(PATH_FULL)" $(QSH) --flow compile $(TPU_PROJECT)
++	@echo "[tpu] quartus_cpf bitstream_compression=off"
++	@cd $(TPU_QUARTUS) && PATH="$(PATH_FULL)" $(QCPF) -c -o bitstream_compression=off \
++	    output_files/$(TPU_PROJECT).sof ../$(TPU_PROJECT).rbf
++	@ls -la $(TPU_RBF_SRC)
++
++tpu-zeta-verify: $(TPU_RBF_SRC)
++	@if [ "$(ZETA_VERIFY)" = "1" ]; then \
++	    echo "[tpu] ζ byte-identity gate on $(TPU_RBF_SRC)"; \
++	    PATH="$(PATH_FULL)" python3 $(ZETA_PIPELINE) $(TPU_RBF_SRC); \
++	else \
++	    echo "[tpu] ZETA_VERIFY=0 — skipping ζ gate"; \
++	fi
++
++# tpu-copy: stage TPU.rbf into output/tpu.rbf so gen_golden.py picks it up
++# at next firmware build. Hashes match by construction (ζ already gated).
++tpu-copy: $(TPU_RBF_DST)
++
++$(TPU_RBF_DST): $(TPU_RBF_SRC)
++	@mkdir -p $(REPO)/output
++	@cp -v $(TPU_RBF_SRC) $(TPU_RBF_DST)
++
++# ────────────────────────────────────────────────────────────────────────────
++# ROT side — firmware MUST rebuild AFTER tpu-copy (so rot_golden.h sees
++# the new tpu.rbf hash) and BEFORE rot-bitstream (Quartus reads
++# neorv32_imem_image.vhd freshly written by the firmware install step).
++# ────────────────────────────────────────────────────────────────────────────
++rot-firmware: $(TPU_RBF_DST)
++	@echo "[rot] rebuilding stage2 (gen_golden.py picks up output/tpu.rbf)"
++	@cd $(ROT_FW_DIR) && PATH="$(PATH_FULL)" $(MAKE) all
++	@echo "[rot] firmware → $(NEORV32_IMEM)"
++	@grep -E "^/\* TPU:" $(ROT_FW_DIR)/rot_golden.h || true
++	@grep -E "rot_golden_tpu_bitstream\[8\]" $(ROT_FW_DIR)/rot_golden.h | head -2 || true
++
++rot-bitstream: rot-firmware
++	@echo "[rot] quartus_sh --flow compile in $(ROT_QUARTUS)"
++	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QSH) --flow compile $(ROT_PROJECT)
++	@echo "[rot] quartus_cpf bitstream_compression=off"
++	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QCPF) -c -o bitstream_compression=off \
++	    output_files/$(ROT_PROJECT).sof ../output/$(ROT_PROJECT).rbf
++	@ls -la $(ROT_RBF)
++
++rot-zeta-verify: $(ROT_RBF)
++	@if [ "$(ZETA_VERIFY)" = "1" ]; then \
++	    echo "[rot] ζ byte-identity gate on $(ROT_RBF)"; \
++	    PATH="$(PATH_FULL)" python3 $(ZETA_PIPELINE) $(ROT_RBF); \
++	else \
++	    echo "[rot] ZETA_VERIFY=0 — skipping ζ gate"; \
++	fi
++
++# ────────────────────────────────────────────────────────────────────────────
++# Meta target — full chain
++# ────────────────────────────────────────────────────────────────────────────
++tpu-then-rot: tpu-bitstream tpu-zeta-verify tpu-copy rot-firmware rot-bitstream rot-zeta-verify
++	@echo
++	@echo "═══════════════════════════════════════════════════════════════"
++	@echo " tpu-then-rot DONE"
++	@echo "   TPU.rbf:  $(TPU_RBF_SRC)"
++	@echo "   ROT.rbf:  $(ROT_RBF)  (with TPU hash baked into IMEM)"
++	@echo "═══════════════════════════════════════════════════════════════"
++	@echo
++	@echo "Next:"
++	@echo "  python3 host/sd_pack.py --port /dev/ttyUSB0 --tpu-rbf $(TPU_RBF_DST)"
++	@echo "  openFPGALoader -c usb-blaster -f $(ROT_RBF)"
++	@echo "  Power-cycle, send 't' over UART, observe '[rot] TPU sha256= [OK]'"
++
++clean-output:
++	@rm -fv $(TPU_RBF_DST) $(REPO)/output/$(ROT_PROJECT).rbf
++	@rm -rf $(TPU_QUARTUS)/output_files $(ROT_QUARTUS)/output_files
++	@echo "[clean] removed output artifacts (Quartus db/ kept for incremental rebuild)"
+-- 
+2.43.0
+

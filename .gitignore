@@ -1,0 +1,7 @@
+# Apply-marker is created in the sibling ROT repo, never here, but
+# guard against accidental copies.
+.rot_tpu_handoff_applied
+
+# Python bytecode
+__pycache__/
+*.pyc
