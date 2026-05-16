@@ -420,9 +420,72 @@ the validation + tuning loop.)*
 
 </details>
 
-### Phase 8 — Track B: `mode_g` (generate) handler
+### Phase 8 — Track B: `mode_g` (generate) handler  ✅ DONE (software path)
 
 Wire Phase 7 into stage2's dispatcher.
+
+**Landed in patches/neorv32_rot/0004-Phase-8-….patch (2026-05-16):**
+- `sw/stage2_loader/main.c` — `mode_generate` implements steps 1, 2, 2a,
+  3, 5, 6, 7 from the spec below; halts before step 8 with the same gate
+  Phase 1's `mode_tpu_verify` uses (Phases 2-4 EPCS/ALTREMOTE pending).
+  `struct sd_boot_hdr` bumped to layout v4 (`reserved[2]` → `edits_lba`
+  + `edits_sz`).  'g' wired into the main dispatcher.
+- `sw/stage2_loader/crc32_iso.{c,h}` — extracted from main.c so the host
+  test can ctypes-link the exact CRC code stage2 runs.  Exposes
+  `crc32_update` / `crc32` / `crc32_two`.  The xmodem upload path reuses
+  the same routine (it was already CRC-32/ISO-HDLC).
+- `host/sd_layout.py` — `LAYOUT_VERSION=4` adds `EDITS_LBA=8729`,
+  `EDITS_MAX_SEC=64` (32 KB cap).  `build_header` / `parse_header` /
+  `verify_layout` carry `edits_lba` + `edits_sz` in the previously-
+  reserved [56..64) header bytes; no hash-slot reflow.
+- `host/sd_pack.py` — `--edits PATH` flag (auto-discovers
+  `output/edits.bin` if present); slot-fit check; segment write.
+- `host/gen_edits.py` — emits `edits.bin` from JSON manifest or CLI
+  tuples; whitelist-validates against the same PIN_X × LAB_Y_CE6 ×
+  even-N set on-chip `lc_init` enforces.
+- `host/test_edits_bin.py` — round-trip + cross-CRC gate.  Compiles
+  `crc32_iso.c` for host x86_64 via gcc, ctypes-loads it, asserts
+  that on-chip `crc32` / `crc32_two` matches Python `binascii.crc32`
+  byte-for-byte (including the standard `'123456789'` → `0xCBF43926`
+  vector).  5/5 negative cases (bad magic / bad version / CRC flip /
+  truncation / under-header) and 5/5 whitelist rejections detected.
+
+**Validated**: build clean, 9492→13908 B IMEM (43% of 32 KB); 127/127
+LutCodec byte-identity still green; round-trip via `make
+unapply-patches` + `make apply-patches` reproduces the same head.
+
+**Effort consumed**: ~3.5 h.  Smaller than the 4–6 h budget because the
+existing xmodem CRC-32 routine was already CRC-32/ISO-HDLC (just had
+to factor into a separate TU for test reach), and Phase 7 had already
+solved the dirty-bitmap + per-frame CRC pieces.
+
+**Future-hardening rows** (deferred per CRTM principle — same
+mechanism as Phase 7's "Anti-pattern to reject" footnote):
+
+1. **`editable_les.bin` allowlist on SD**.  Plan §Phase 8 mentioned
+   a per-base sidecar that lists which LE positions the base
+   bitstream marked editable; mode_g would cross-check each
+   `(x,y,n)` against it before applying.  Initial bring-up relies on
+   `lc_init`'s static pin-friendly whitelist (`LC_ERR_X/Y/N`).  This
+   is fine when the base bitstream is built with Quartus pinning
+   *every* NN-weight LUT to a pin-friendly column — which is the
+   Phase 7 design assumption.  An allowlist lands once base
+   bitstreams begin including non-NN-weight LUTs at pin-friendly
+   positions that mode_g must NOT touch.
+2. **Ed25519 over edits.bin**.  CRC-32 is integrity, not
+   authentication.  An attacker who can rewrite edits.bin can also
+   rewrite the CRC.  Authentication remains upstream (signed by the
+   user's NN compiler).  On-chip verify with a public key baked
+   into stage2's .rodata would land alongside the analogous
+   trust-anchor row for codec table updates noted in Phase 7.
+
+**Pre-landing spec (preserved for archaeological reference)** — the
+rest of this section was the design contract before Phase 8 shipped.
+Superseded by the "Landed in patches/neorv32_rot/0004" block above;
+kept verbatim because the trust-boundary discussion is what
+motivates the CRC-32 gate.
+
+<details><summary>Original Phase 8 spec (pre-implementation)</summary>
 
 **New mode 'g' in main.c**:
 ```
@@ -514,6 +577,8 @@ CRC-16 RBF-frame poly).
    (output of LUT(input) matches the new mask's truth table).
 
 **Effort**: 4–6 h (mode handler + SD reading + integration test).
+
+</details>
 
 ### Phase 9 — EPCS slot rotation (deferred; high-frequency mode 'g')
 
@@ -743,7 +808,7 @@ ROT/TPU pair." Quartus stays.
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
 | 6: HW bench validation | 3–4 h | pending — needs AX301 + SD card |
 | **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | ✅ done (~4 h) |
-| **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | **pending — Track B integration** |
+| **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | ✅ done (~3.5 h) — software path; EPCS-write steps 8-10 wait on Phase 2-4 |
 | 9: EPCS slot rotation (high-frequency reflash) | 4–6 h | deferred — triggered by > 10×/day mode 'g' bench data |
 | 4-future: Watchdog enable + EPCS boot-attempt counter | +2 h | deferred — lands with WATCHDOG_EN=1, after Phase 8 |
 | Slack for Quartus fit / IMEM bump iterations | 4–6 h | — |
