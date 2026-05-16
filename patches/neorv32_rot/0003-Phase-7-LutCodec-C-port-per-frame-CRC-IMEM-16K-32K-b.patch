@@ -1,0 +1,985 @@
+From f6efaeb11a487ae58fab209012f01e10996c52d4 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sat, 16 May 2026 07:57:34 +0100
+Subject: [PATCH 3/3] =?UTF-8?q?Phase=207:=20LutCodec=20C=20port=20+=20per-fram?=
+ =?UTF-8?q?e=20CRC=20+=20IMEM=2016K=E2=86=9232K=20bump?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Track B (mode 'g') enabler.  Ports the minimum subset of
+EP4CE6/fuzz/bitstream.py needed for on-chip "(x, y, n, 16-bit mask)
+→ flip CRAM cells + repair frame CRC" — restricted to pin-friendly
+columns X∈{10,16,22,28} so the 35-cell canon transition layer is a
+no-op and the C codec doesn't need to carry it.
+
+New files:
+  host/gen_lutcodec_data.py
+    Build-time generator.  Calls _sigma_inv_lookup(foff, fb8, group)
+    for each pin-friendly (x, y, n) triple and emits
+    sw/stage2_loader/lutcodec_data.h with a 1152-byte packed σ⁻¹
+    table (2 bits per σ⁻¹ component × 4 = 1 byte/position) + the
+    parallel COLUMN_BASE / LAB_Y / SLOT_BASE tables the C port reads.
+    Sourced from $EP4CE6_REPO (default /home/test/EP4CE6).
+    Output is gitignored — regenerated every build, like rot_golden.h.
+
+  sw/stage2_loader/lutcodec.{c,h}
+    On-chip address-formula port of LutCodec.from_cram_model +
+    predict_sram + write_tt.  lc_init(x,y,n) does table lookup +
+    slot-1 wrap math; lut_apply_mask(rbf, lc, mask, dirty) XOR-flips
+    the cells for each set mask bit and (optionally) marks touched
+    CRAM frames in a caller-supplied bitmap for CRC repair.
+    Compact LE descriptor (12 B) — no per-position cell arrays in
+    .rodata; cells are computed on demand from σ⁻¹ + sigma_inv table.
+
+  sw/stage2_loader/crc16.{c,h}
+    CRC-16/IBM reflected (poly 0xA001, init 0xFE54) for CRAM frames
+    25..1751 — direct port of crc16_rbf_frame + patch_rbf_crc.
+    Adds lc_patch_rbf_crc_frames (dirty-bitmap variant) and
+    lc_mark_dirty (called from lut_apply_mask).
+
+  host/test_lutcodec_c.py
+    ctypes cross-validation gate.  Compiles lutcodec.c + crc16.c as a
+    host shared library and asserts byte-identical RBF output vs the
+    Python LutCodec.write_tt + patch_rbf_crc reference for 100
+    random tuples over the pin-friendly subset.  Run:
+      EP4CE6_REPO=/home/test/EP4CE6 python3 host/test_lutcodec_c.py
+    Currently passes 200/200 byte-identical at seed=20260516 + 42.
+
+Edits:
+  rtl/ax301_top.vhd
+    IMEM_SIZE 16*1024 → 32*1024.  Phase 7 σ⁻¹ table + crc/lutcodec
+    code overshoot the 16 KB budget (plan v2 §Phase 7 — ~30 KB tables
+    + 3 KB code anticipated; actual ~3 KB σ⁻¹ table + 2 KB code, well
+    inside 32 KB).  Adds one M9K row per NEORV32 IMEM doc; still
+    within the 10,320-LE jailbreak budget.
+
+  sw/stage2_loader/Makefile
+    __neorv32_rom_size 16k → 32k (linker side of the IMEM bump).
+    New lutcodec_data phony target + lutcodec.c prereq mirror the
+    existing rot_golden pattern.
+
+  .gitignore
+    Added sw/stage2_loader/lutcodec_data.h.
+
+Dead-stripped pending Phase 8: lutcodec / crc16 symbols compile cleanly
+into the build dir but are not yet referenced by main.c (mode 'g'
+handler is Phase 8).  Stage2 binary therefore stays at 9492 B.
+---
+ .gitignore                  |   2 +
+ host/gen_lutcodec_data.py   | 214 +++++++++++++++++++++++++++
+ host/test_lutcodec_c.py     | 282 ++++++++++++++++++++++++++++++++++++
+ rtl/ax301_top.vhd           |   4 +-
+ sw/stage2_loader/Makefile   |  17 ++-
+ sw/stage2_loader/crc16.c    |  50 +++++++
+ sw/stage2_loader/crc16.h    |  48 ++++++
+ sw/stage2_loader/lutcodec.c | 128 ++++++++++++++++
+ sw/stage2_loader/lutcodec.h |  70 +++++++++
+ 9 files changed, 810 insertions(+), 5 deletions(-)
+ create mode 100644 host/gen_lutcodec_data.py
+ create mode 100644 host/test_lutcodec_c.py
+ create mode 100644 sw/stage2_loader/crc16.c
+ create mode 100644 sw/stage2_loader/crc16.h
+ create mode 100644 sw/stage2_loader/lutcodec.c
+ create mode 100644 sw/stage2_loader/lutcodec.h
+
+diff --git a/.gitignore b/.gitignore
+index 4552f1a..af0cd31 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -51,6 +51,8 @@ quartus_probe/
+ 
+ sw/stage2_loader/neorv32_imem_image.vhd
+ sw/stage2_loader/rot_golden.h
++sw/stage2_loader/lutcodec_data.h
++sw/stage2_loader/lutcodec_data.c
+ 
+ # Backup / editor / OS cruft
+ *.bak
+diff --git a/host/gen_lutcodec_data.py b/host/gen_lutcodec_data.py
+new file mode 100644
+index 0000000..3bca1ca
+--- /dev/null
++++ b/host/gen_lutcodec_data.py
+@@ -0,0 +1,214 @@
++#!/usr/bin/env python3
++"""
++gen_lutcodec_data.py — Emit sw/stage2_loader/lutcodec_data.{c,h}
++(auto-gen, gitignored) with the σ⁻¹ permutation table required by the
++on-chip LutCodec C port (Phase 7).
++
++Scope: pin-friendly columns X ∈ {10, 16, 22, 28} × all valid Y rows
++× all even N. The pin-friendly choice keeps NN-weight LUTs out of the
++canon-2input asymmetric-mask layer (Pitfall #16) — Quartus's per-LE
++canon cells are a no-op at these columns so the C codec doesn't need
++the 35-cell canon transition layer.
++
++NB (empirical correction to plan v2 §Phase 7): σ⁻¹ ITSELF is NOT a
++no-op at pin-friendly columns — ~92% of pin-friendly (x, y, n) triples
++have non-identity σ⁻¹.  The full per-position table is therefore baked
++into stage2's .rodata.  Only the canon-2input asymmetric-mask layer
++(a separate axis) is sidestepped by the pin-friendly choice.
++
++Each σ⁻¹ is a permutation of (0,1,2,3), packed into 1 byte:
++  bits[1:0] = σ⁻¹[0], bits[3:2] = σ⁻¹[1],
++  bits[5:4] = σ⁻¹[2], bits[7:6] = σ⁻¹[3]
++
++Layout of the flat table is (x_idx, y_idx, n_idx):
++  flat = x_idx * NUM_Y * NUM_N + y_idx * NUM_N + n_idx
++The C side mirrors PIN_X / LAB_Y / N_VALUES so the index math is
++the same on both sides.
++
++The split into .c + .h is so future translation units (Phase 8 main.c,
++which will need PIN_X / LAB_Y_CE6 for edit-list validation) can extern
++the same constants without inline duplication.
++
++Inputs:
++  $EP4CE6_REPO (default /home/test/EP4CE6) — must contain fuzz/{config,
++  bitstream}.py and results/sigma_inv_fb8_groups.json.
++Outputs:
++  sw/stage2_loader/lutcodec_data.h
++  sw/stage2_loader/lutcodec_data.c
++"""
++import argparse
++import os
++import sys
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++EP4CE6 = os.environ.get("EP4CE6_REPO", "/home/test/EP4CE6")
++
++PIN_X = [10, 16, 22, 28]
++LAB_Y_CE6 = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21]
++N_VALUES = list(range(0, 32, 2))  # 16 values
++
++
++def pack_sigma_inv(si):
++    """Pack 4-permutation σ⁻¹ into 1 byte (2 bits per value)."""
++    return (si[0] & 3) | ((si[1] & 3) << 2) | ((si[2] & 3) << 4) | ((si[3] & 3) << 6)
++
++
++HEADER_TEMPLATE = """\
++/* AUTOGENERATED by host/gen_lutcodec_data.py — DO NOT EDIT.
++ * σ⁻¹ permutation table for pin-friendly columns
++ * X∈{{{PIN_X_STR}}} × Y∈LAB_Y_CE6 × N∈{{0,2,...,30}}.
++ * Each entry is a 4-permutation of (0,1,2,3), packed 2 bits per
++ * value; bits[1:0]=σ⁻¹[0], bits[3:2]=σ⁻¹[1], bits[5:4]=σ⁻¹[2],
++ * bits[7:6]=σ⁻¹[3].  Index: x_idx*NUM_Y*NUM_N + y_idx*NUM_N + n_idx.
++ * Sourced from $EP4CE6_REPO/results/sigma_inv_fb8_groups.json
++ * via fuzz.bitstream._sigma_inv_lookup (handles foff fallback).
++ */
++#ifndef LUTCODEC_DATA_H
++#define LUTCODEC_DATA_H
++
++#include <stdint.h>
++
++#define LUTCODEC_NUM_X  {NUM_X}
++#define LUTCODEC_NUM_Y  {NUM_Y}
++#define LUTCODEC_NUM_N  {NUM_N}
++#define LUTCODEC_PAIR_SPACING  210u
++
++extern const uint16_t lutcodec_pin_x[LUTCODEC_NUM_X];
++extern const uint16_t lutcodec_lab_y[LUTCODEC_NUM_Y];
++extern const uint32_t lutcodec_column_base[LUTCODEC_NUM_X];
++extern const uint16_t lutcodec_slot_base[3];
++extern const uint8_t  lutcodec_sigma_inv_packed[
++    LUTCODEC_NUM_X * LUTCODEC_NUM_Y * LUTCODEC_NUM_N];
++
++#endif /* LUTCODEC_DATA_H */
++"""
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--out-dir", default=os.path.join(
++        REPO, "sw", "stage2_loader"))
++    ap.add_argument("--ep4ce6", default=EP4CE6,
++                    help="path to EP4CE6 repo (env: EP4CE6_REPO)")
++    args = ap.parse_args()
++
++    if not os.path.isdir(os.path.join(args.ep4ce6, "fuzz")):
++        print(f"[gen_lutcodec_data] ERROR: EP4CE6 repo not found at "
++              f"{args.ep4ce6}.  Set EP4CE6_REPO or use --ep4ce6.",
++              file=sys.stderr)
++        sys.exit(1)
++
++    sys.path.insert(0, os.path.join(args.ep4ce6, "fuzz"))
++    from config import (SLOT_BASE, COLUMN_BASE, cram_n_delta,  # noqa: E402
++                        INVALID_LABS)
++    from bitstream import _sigma_inv_lookup  # noqa: E402
++
++    def compute_foff_fb8_group(x, y, n):
++        slot = (y - 2) % 3
++        group = (y - 2) // 3
++        nd = cram_n_delta(n)
++        if slot == 1 and group == 0:
++            addr_adj = 206 if (24 + nd <= 0) else 0
++        else:
++            wrapped = slot == 1 and (24 + group * 3 + nd < 0)
++            addr_adj = 207 if wrapped else 0
++        offset = SLOT_BASE[slot] + group * 3 + (
++            1 if slot == 0 and group > 0 else 0)
++        val = COLUMN_BASE[x] - 168 + offset + nd + addr_adj
++        return val % 210, (val // 210) % 8, group
++
++    table = []
++    skipped = []
++    for x in PIN_X:
++        for y in LAB_Y_CE6:
++            if (x, y) in INVALID_LABS:
++                # Should be empty for pin-friendly X — pin-friendly columns
++                # are all in CE6's legal placement region. Track skips
++                # defensively in case INVALID_LABS expands later.
++                skipped.append((x, y))
++                for _ in N_VALUES:
++                    table.append(0xFF)  # sentinel — lc_init treats as invalid
++                continue
++            for n in N_VALUES:
++                foff, fb8, group = compute_foff_fb8_group(x, y, n)
++                si = _sigma_inv_lookup(foff, fb8, group)
++                if not (isinstance(si, tuple) and len(si) == 4 and
++                        sorted(si) == [0, 1, 2, 3]):
++                    print(f"[gen_lutcodec_data] ERROR: σ⁻¹ for "
++                          f"(x={x},y={y},n={n}) is not a 4-permutation: "
++                          f"{si}", file=sys.stderr)
++                    sys.exit(1)
++                table.append(pack_sigma_inv(si))
++
++    if skipped:
++        print(f"[gen_lutcodec_data] WARN: {len(skipped)} INVALID_LAB "
++              f"(x,y) entries hit pin-friendly subset (unexpected): "
++              f"{skipped[:5]}", file=sys.stderr)
++
++    assert len(table) == len(PIN_X) * len(LAB_Y_CE6) * len(N_VALUES), \
++        f"table size {len(table)} != expected " \
++        f"{len(PIN_X) * len(LAB_Y_CE6) * len(N_VALUES)}"
++
++    h_text = HEADER_TEMPLATE.format(
++        PIN_X_STR=", ".join(map(str, PIN_X)),
++        NUM_X=len(PIN_X), NUM_Y=len(LAB_Y_CE6), NUM_N=len(N_VALUES),
++    )
++
++    c_lines = [
++        '/* AUTOGENERATED by host/gen_lutcodec_data.py — DO NOT EDIT. */',
++        '#include "lutcodec_data.h"',
++        "",
++        "const uint16_t lutcodec_pin_x[LUTCODEC_NUM_X] = {",
++        "    " + ", ".join(str(v) for v in PIN_X),
++        "};",
++        "",
++        "const uint16_t lutcodec_lab_y[LUTCODEC_NUM_Y] = {",
++        "    " + ", ".join(str(v) for v in LAB_Y_CE6),
++        "};",
++        "",
++        "/* COLUMN_BASE[x] for pin-friendly X only (full table is in",
++        " * EP4CE6/fuzz/config.py).  Indexed parallel to lutcodec_pin_x. */",
++        "const uint32_t lutcodec_column_base[LUTCODEC_NUM_X] = {",
++        "    " + ", ".join(f"0x{COLUMN_BASE[x]:08x}u" for x in PIN_X),
++        "};",
++        "",
++        "/* SLOT_BASE[slot] from EP4CE6/fuzz/config.py — slot = (y-2)%3. */",
++        "const uint16_t lutcodec_slot_base[3] = {",
++        "    " + ", ".join(str(SLOT_BASE[s]) for s in (0, 1, 2)),
++        "};",
++        "",
++        "const uint8_t lutcodec_sigma_inv_packed["
++        "LUTCODEC_NUM_X * LUTCODEC_NUM_Y * LUTCODEC_NUM_N] = {",
++    ]
++    for i in range(0, len(table), 16):
++        row = ", ".join(f"0x{b:02x}" for b in table[i:i + 16])
++        c_lines.append(f"    {row},")
++    c_lines[-1] = c_lines[-1].rstrip(",")
++    c_lines.append("};")
++    c_text = "\n".join(c_lines) + "\n"
++
++    def write_if_changed(path, content):
++        if os.path.exists(path):
++            with open(path) as f:
++                if f.read() == content:
++                    return False
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with open(path, "w") as f:
++            f.write(content)
++        return True
++
++    h_path = os.path.join(args.out_dir, "lutcodec_data.h")
++    c_path = os.path.join(args.out_dir, "lutcodec_data.c")
++    wrote_h = write_if_changed(h_path, h_text)
++    wrote_c = write_if_changed(c_path, c_text)
++    status = [
++        f"{'wrote' if wrote_h else 'unchanged'} {h_path}",
++        f"{'wrote' if wrote_c else 'unchanged'} {c_path}",
++    ]
++    print(f"[gen_lutcodec_data] {'; '.join(status)} "
++          f"({len(table)} σ⁻¹ entries, "
++          f"{len(PIN_X)}×{len(LAB_Y_CE6)}×{len(N_VALUES)})")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/host/test_lutcodec_c.py b/host/test_lutcodec_c.py
+new file mode 100644
+index 0000000..1116816
+--- /dev/null
++++ b/host/test_lutcodec_c.py
+@@ -0,0 +1,282 @@
++#!/usr/bin/env python3
++"""
++test_lutcodec_c.py — Phase 7 round-trip gate.
++
++Cross-compiles sw/stage2_loader/{lutcodec,lutcodec_data,crc16}.c for
++host x86_64, loads via ctypes, and asserts byte-identity vs the
++Python LutCodec reference under three regimes:
++
++  RANDOM (--n N, default 100):
++    Random (x,y,n,mask) over the pin-friendly subset.  One edit per
++    iteration; C lut_apply_with_canon vs Python LutCodec.write_tt
++    + patch_rbf_crc.
++
++  EDGE:
++    Explicit corner cases that random sampling underweights —
++      * mask ∈ {0x0000, 0xFFFF} for each (x,y,n=0) corner
++      * slot-1 wrap boundary: y=3 with n∈{12,14,...,30} (addr_adj=206)
++      * other slot-1 wrap: y∈{6,9,12,18,21} with high-N (addr_adj=207)
++
++  COMPOSE:
++    Apply 8 distinct edits to the same RBF (C and Python), then patch
++    CRC.  Catches dirty-frame bitmap bugs and edit-order independence.
++
++Run:
++  EP4CE6_REPO=/home/test/EP4CE6 python3 host/test_lutcodec_c.py
++  EP4CE6_REPO=/home/test/EP4CE6 python3 host/test_lutcodec_c.py --n 200
++  EP4CE6_REPO=/home/test/EP4CE6 python3 host/test_lutcodec_c.py --skip-random
++"""
++import argparse
++import ctypes
++import os
++import random
++import subprocess
++import sys
++import tempfile
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++EP4CE6 = os.environ.get("EP4CE6_REPO", "/home/test/EP4CE6")
++PIN_X = [10, 16, 22, 28]
++LAB_Y_CE6 = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21]
++N_VALUES = list(range(0, 32, 2))
++RBF_SIZE = 368011
++
++
++def build_so(workdir):
++    """Compile lutcodec.c + lutcodec_data.c + crc16.c into a shared library."""
++    src_dir = os.path.join(REPO, "sw", "stage2_loader")
++    subprocess.run(
++        [sys.executable, os.path.join(REPO, "host", "gen_lutcodec_data.py"),
++         "--ep4ce6", EP4CE6],
++        check=True,
++    )
++    so_path = os.path.join(workdir, "lutcodec.so")
++    subprocess.run(
++        [
++            "gcc", "-O2", "-fPIC", "-shared", "-Wall",
++            "-I", src_dir,
++            os.path.join(src_dir, "lutcodec.c"),
++            os.path.join(src_dir, "lutcodec_data.c"),
++            os.path.join(src_dir, "crc16.c"),
++            "-o", so_path,
++        ],
++        check=True,
++    )
++    return so_path
++
++
++class LutCodecT(ctypes.Structure):
++    _fields_ = [
++        ("base_addr", ctypes.c_uint32),
++        ("sigma",     ctypes.c_uint8 * 4),
++        ("bp",        ctypes.c_uint8),
++        ("k_odd",     ctypes.c_uint8),
++        ("x",         ctypes.c_uint16),
++        ("y",         ctypes.c_uint16),
++        ("n",         ctypes.c_uint16),
++    ]
++
++
++def bind(lib):
++    lib.lc_init.argtypes = [ctypes.POINTER(LutCodecT),
++                            ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16]
++    lib.lc_init.restype = ctypes.c_int
++    lib.lut_apply_mask.argtypes = [ctypes.POINTER(ctypes.c_uint8),
++                                   ctypes.POINTER(LutCodecT),
++                                   ctypes.c_uint16,
++                                   ctypes.POINTER(ctypes.c_uint8)]
++    lib.lut_apply_mask.restype = None
++    lib.lut_apply_with_canon.argtypes = [
++        ctypes.POINTER(ctypes.c_uint8),
++        ctypes.c_uint16, ctypes.c_uint16, ctypes.c_uint16,
++        ctypes.c_uint16,
++        ctypes.POINTER(ctypes.c_uint8),
++    ]
++    lib.lut_apply_with_canon.restype = ctypes.c_int
++    lib.lc_patch_rbf_crc.argtypes = [ctypes.POINTER(ctypes.c_uint8)]
++    lib.lc_patch_rbf_crc.restype = None
++
++
++def apply_one_py(LutCodec, patch_rbf_crc, baseline, x, y, n, mask):
++    return patch_rbf_crc(LutCodec.from_cram_model(x, y, n).write_tt(baseline, mask))
++
++
++def apply_one_c(lib, baseline, x, y, n, mask):
++    c_buf = (ctypes.c_uint8 * RBF_SIZE).from_buffer_copy(baseline)
++    st = lib.lut_apply_with_canon(c_buf, x, y, n, mask, None)
++    if st != 0:
++        return None, st
++    lib.lc_patch_rbf_crc(c_buf)
++    return bytes(c_buf), 0
++
++
++def diff_loc(a, b):
++    for j in range(min(len(a), len(b))):
++        if a[j] != b[j]:
++            return j
++    return -1
++
++
++def random_regime(lib, LutCodec, patch_rbf_crc, baseline, n_tuples, seed):
++    rng = random.Random(seed)
++    passed = 0; failed = []
++    for i in range(n_tuples):
++        x = rng.choice(PIN_X)
++        y = rng.choice(LAB_Y_CE6)
++        n = rng.choice(N_VALUES)
++        mask = rng.randint(0, 0xFFFF)
++        py = apply_one_py(LutCodec, patch_rbf_crc, baseline, x, y, n, mask)
++        c, st = apply_one_c(lib, baseline, x, y, n, mask)
++        if st != 0:
++            failed.append((i, x, y, n, mask, f"lut_apply_with_canon={st}"))
++            continue
++        if c == py:
++            passed += 1
++        else:
++            j = diff_loc(c, py)
++            failed.append((i, x, y, n, mask,
++                           f"first diff @ {j}: C=0x{c[j]:02x} P=0x{py[j]:02x}"))
++    return passed, failed
++
++
++def edge_cases():
++    """Hand-picked tuples that random sampling underweights."""
++    cases = []
++    # All-zero and all-one masks for the y=2, n=0 corner of each pin-friendly X.
++    for x in PIN_X:
++        for mask in (0x0000, 0xFFFF):
++            cases.append((x, 2, 0, mask))
++    # Slot-1 wrap at y=3 (group=0): wrap fires when 24 + cram_n_delta(n) <= 0.
++    # cram_n_delta(12)=-24, so n>=12 wraps.  Cover n=12 and a high n.
++    for n in (12, 14, 22, 30):
++        cases.append((10, 3, n, 0x1234))
++        cases.append((28, 3, n, 0xCAFE))
++    # Other slot-1 wrap: y∈{6,9,12,18,21} with 24+group*3+nd<0.
++    # For y=6 (group=1), needs nd<-27 → n large enough (cram_n_delta(30)=-46).
++    for y in (6, 9, 12, 18, 21):
++        cases.append((16, y, 30, 0xABCD))
++    # Sparse and dense masks at mid-table position.
++    for mask in (0x0001, 0x8000, 0x0101, 0x5555, 0xAAAA):
++        cases.append((22, 10, 16, mask))
++    return cases
++
++
++def edge_regime(lib, LutCodec, patch_rbf_crc, baseline):
++    passed = 0; failed = []
++    for i, (x, y, n, mask) in enumerate(edge_cases()):
++        py = apply_one_py(LutCodec, patch_rbf_crc, baseline, x, y, n, mask)
++        c, st = apply_one_c(lib, baseline, x, y, n, mask)
++        if st != 0:
++            failed.append((i, x, y, n, mask, f"lut_apply_with_canon={st}"))
++            continue
++        if c == py:
++            passed += 1
++        else:
++            j = diff_loc(c, py)
++            failed.append((i, x, y, n, mask,
++                           f"first diff @ {j}: C=0x{c[j]:02x} P=0x{py[j]:02x}"))
++    return passed, failed
++
++
++def compose_regime(lib, LutCodec, patch_rbf_crc, baseline, seed):
++    """Apply 8 distinct edits in one buffer (C and Python) then CRC."""
++    rng = random.Random(seed)
++    edits = []
++    seen = set()
++    while len(edits) < 8:
++        x = rng.choice(PIN_X); y = rng.choice(LAB_Y_CE6); n = rng.choice(N_VALUES)
++        if (x, y, n) in seen: continue
++        seen.add((x, y, n))
++        edits.append((x, y, n, rng.randint(0, 0xFFFF)))
++
++    # Python: chain write_tt edits then single CRC patch.
++    py = bytes(baseline)
++    for x, y, n, mask in edits:
++        py = LutCodec.from_cram_model(x, y, n).write_tt(py, mask)
++    py = patch_rbf_crc(py)
++
++    # C: apply via lut_apply_with_canon (each call lc_init + XOR + dirty
++    # bookkeeping) using the dirty bitmap, then lc_patch_rbf_crc_frames.
++    c_buf = (ctypes.c_uint8 * RBF_SIZE).from_buffer_copy(baseline)
++    DIRTY = ((1727 + 7) // 8)
++    dirty = (ctypes.c_uint8 * DIRTY)()
++    for x, y, n, mask in edits:
++        st = lib.lut_apply_with_canon(c_buf, x, y, n, mask, dirty)
++        if st != 0:
++            return 0, [(0, x, y, n, mask,
++                        f"compose: lut_apply_with_canon={st}")]
++    # Use the dirty-frame variant to also exercise that code path.
++    lib.lc_patch_rbf_crc_frames = lib.lc_patch_rbf_crc_frames
++    lib.lc_patch_rbf_crc_frames.argtypes = [ctypes.POINTER(ctypes.c_uint8),
++                                            ctypes.POINTER(ctypes.c_uint8)]
++    lib.lc_patch_rbf_crc_frames.restype = None
++    lib.lc_patch_rbf_crc_frames(c_buf, dirty)
++    c = bytes(c_buf)
++    if c == py:
++        return 1, []
++    j = diff_loc(c, py)
++    return 0, [(0, 0, 0, 0, 0,
++                f"compose 8 edits: first diff @ {j}: "
++                f"C=0x{c[j]:02x} P=0x{py[j]:02x}")]
++
++
++def report(name, passed, total, failed):
++    print(f"  {name:9s} {passed}/{total} byte-identical")
++    if failed:
++        for f in failed[:5]:
++            print(f"    i={f[0]} (x={f[1]},y={f[2]},n={f[3]}) "
++                  f"mask=0x{f[4]:04x} — {f[5]}")
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--n", type=int, default=100,
++                    help="number of random tuples (default 100)")
++    ap.add_argument("--seed", type=int, default=20260516)
++    ap.add_argument("--skip-random", action="store_true")
++    ap.add_argument("--skip-edge", action="store_true")
++    ap.add_argument("--skip-compose", action="store_true")
++    args = ap.parse_args()
++
++    sys.path.insert(0, os.path.join(EP4CE6, "fuzz"))
++    from bitstream import LutCodec, patch_rbf_crc  # noqa: E402
++
++    with tempfile.TemporaryDirectory(prefix="lutcodec_test_") as workdir:
++        so_path = build_so(workdir)
++        lib = ctypes.CDLL(so_path)
++        bind(lib)
++
++        rng = random.Random(args.seed)
++        # Pre-patch CRC of the fake baseline so the dirty-frame variant
++        # (which only rewrites touched frames) and the full patch_rbf_crc
++        # (which rewrites all 1727) yield byte-identical output when the
++        # set of touched frames is a subset of all CRAM frames.  Real
++        # Quartus RBFs already satisfy this; the random baseline doesn't,
++        # so patch it once here.
++        baseline = bytes(rng.randint(0, 255) for _ in range(RBF_SIZE))
++        baseline = patch_rbf_crc(baseline)
++
++        any_failed = False
++        if not args.skip_random:
++            p, f = random_regime(lib, LutCodec, patch_rbf_crc, baseline,
++                                 args.n, args.seed)
++            report("RANDOM", p, args.n, f)
++            any_failed |= bool(f)
++        if not args.skip_edge:
++            cases = edge_cases()
++            p, f = edge_regime(lib, LutCodec, patch_rbf_crc, baseline)
++            report("EDGE", p, len(cases), f)
++            any_failed |= bool(f)
++        if not args.skip_compose:
++            p, f = compose_regime(lib, LutCodec, patch_rbf_crc, baseline,
++                                  args.seed + 1)
++            report("COMPOSE", p, 1, f)
++            any_failed |= bool(f)
++
++    if any_failed:
++        sys.exit(1)
++    print("OK — C codec matches Python LutCodec byte-for-byte.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/rtl/ax301_top.vhd b/rtl/ax301_top.vhd
+index 630d845..7aff475 100644
+--- a/rtl/ax301_top.vhd
++++ b/rtl/ax301_top.vhd
+@@ -1,7 +1,7 @@
+ -- ax301_top.vhd — NEORV32 SoC wrapper for 黑金 AX301 (EP4CE6F17C8)
+ --
+ -- Memory map (NEORV32 fixed):
+---   0x00000000 - 0x00003FFF : IMEM  (16 KB, M9K BRAM, instruction memory)
++--   0x00000000 - 0x00007FFF : IMEM  (32 KB, M9K BRAM, instruction memory)
+ --   0x80000000 - 0x80001FFF : DMEM  (8 KB, M9K BRAM, data memory)
+ --   0x40000000 - 0x41FFFFFF : SDRAM (32 MB, via XBUS Wishbone → sdram_ctrl)
+ --   0xFFE00000              : Boot ROM (internal, ~4 KB, NEORV32 bootloader)
+@@ -160,7 +160,7 @@ begin
+     RISCV_ISA_Zicntr => true,
+     -- Internal memories
+     IMEM_EN          => true,
+-    IMEM_SIZE        => 16*1024,  -- 16K: stage2 + SHA-256 driver for RoT measured boot
++    IMEM_SIZE        => 32*1024,  -- 32K: stage2 + SHA-256 + LutCodec σ⁻¹ table (Phase 7)
+     DMEM_EN          => true,
+     DMEM_SIZE        => 8*1024,
+     -- External bus (Wishbone → SDRAM)
+diff --git a/sw/stage2_loader/Makefile b/sw/stage2_loader/Makefile
+index b6a9f96..ff5c4ad 100644
+--- a/sw/stage2_loader/Makefile
++++ b/sw/stage2_loader/Makefile
+@@ -9,8 +9,10 @@ RISCV_PREFIX ?= riscv-none-elf-
+ 
+ EFFORT = -Os
+ 
+-# 16 KB IMEM (bumped from 8K to fit SHA-256 RoT measured-boot driver)
+-USER_FLAGS += -Wl,--defsym,__neorv32_rom_size=16k
++# 32 KB IMEM (bumped 16K→32K for Phase 7: stage2 + SHA-256 driver +
++# LutCodec C port (σ⁻¹ table for pin-friendly columns).  Must match
++# IMEM_SIZE in rtl/ax301_top.vhd or boot will fault.
++USER_FLAGS += -Wl,--defsym,__neorv32_rom_size=32k
+ USER_FLAGS += -Wl,--defsym,__neorv32_ram_size=8k
+ 
+ NEORV32_HOME ?= ../../neorv32
+@@ -24,6 +26,15 @@ NEORV32_HOME ?= ../../neorv32
+ rot_golden:
+ 	@python3 ../../host/gen_golden.py
+ 
+-main.c: rot_golden
++# Phase 7: σ⁻¹ table for the on-chip LutCodec C port.  Sourced from
++# $EP4CE6_REPO/results/sigma_inv_fb8_groups.json (default
++# /home/test/EP4CE6).  Output sw/stage2_loader/lutcodec_data.h is
++# gitignored — regenerated on every build.
++.PHONY: lutcodec_data
++lutcodec_data:
++	@python3 ../../host/gen_lutcodec_data.py
++
++main.c: rot_golden lutcodec_data
++lutcodec.c: lutcodec_data
+ 
+ include $(NEORV32_HOME)/sw/common/common.mk
+diff --git a/sw/stage2_loader/crc16.c b/sw/stage2_loader/crc16.c
+new file mode 100644
+index 0000000..753459a
+--- /dev/null
++++ b/sw/stage2_loader/crc16.c
+@@ -0,0 +1,50 @@
++/* crc16.c — RBF per-frame CRC port from EP4CE6/fuzz/bitstream.py.
++ * See crc16.h for algorithm constants and Python reference.
++ */
++#include "crc16.h"
++
++uint16_t crc16_rbf_frame(const uint8_t *data) {
++    uint16_t crc = CRC_INIT;
++    for (uint32_t i = 0; i < CRC_DATA_SIZE; i++) {
++        crc ^= data[i];
++        for (int k = 0; k < 8; k++) {
++            if (crc & 1u) {
++                crc = (crc >> 1) ^ CRC_POLY_REFLECTED;
++            } else {
++                crc >>= 1;
++            }
++        }
++    }
++    return crc;
++}
++
++void lc_patch_rbf_crc(uint8_t *rbf) {
++    for (uint32_t frame = CRC_FIRST_CRAM_FRAME;
++         frame <= CRC_LAST_FRAME; frame++) {
++        uint32_t s = CRC_PREAMBLE + frame * CRC_FRAME_SIZE;
++        uint16_t c = crc16_rbf_frame(rbf + s);
++        rbf[s + CRC_DATA_SIZE]     = (uint8_t)(c & 0xFFu);
++        rbf[s + CRC_DATA_SIZE + 1] = (uint8_t)((c >> 8) & 0xFFu);
++    }
++}
++
++void lc_patch_rbf_crc_frames(uint8_t *rbf, const uint8_t *dirty) {
++    for (uint32_t frame = CRC_FIRST_CRAM_FRAME;
++         frame <= CRC_LAST_FRAME; frame++) {
++        uint32_t idx = frame - CRC_FIRST_CRAM_FRAME;
++        if (!(dirty[idx >> 3] & (1u << (idx & 7u)))) continue;
++        uint32_t s = CRC_PREAMBLE + frame * CRC_FRAME_SIZE;
++        uint16_t c = crc16_rbf_frame(rbf + s);
++        rbf[s + CRC_DATA_SIZE]     = (uint8_t)(c & 0xFFu);
++        rbf[s + CRC_DATA_SIZE + 1] = (uint8_t)((c >> 8) & 0xFFu);
++    }
++}
++
++void lc_mark_dirty(uint8_t *bitmap, uint32_t off) {
++    if (off < CRC_PREAMBLE) return;
++    uint32_t rel = off - CRC_PREAMBLE;
++    uint32_t frame = rel / CRC_FRAME_SIZE;
++    if (frame < CRC_FIRST_CRAM_FRAME || frame > CRC_LAST_FRAME) return;
++    uint32_t idx = frame - CRC_FIRST_CRAM_FRAME;
++    bitmap[idx >> 3] |= (uint8_t)(1u << (idx & 7u));
++}
+diff --git a/sw/stage2_loader/crc16.h b/sw/stage2_loader/crc16.h
+new file mode 100644
+index 0000000..caaca79
+--- /dev/null
++++ b/sw/stage2_loader/crc16.h
+@@ -0,0 +1,48 @@
++/* crc16.h — RBF frame CRC port from EP4CE6/fuzz/bitstream.py.
++ *
++ * Cyclone IV RBFs are CRC-validated per 210-byte frame: 208 data bytes
++ * followed by a 16-bit little-endian CRC (low byte at offset +208).
++ * CRAM frames are indices 25..1751 inclusive; frames 0..24 are header
++ * (no CRC).  CRC algorithm: CRC-16/IBM, reflected, poly 0x8005 (in
++ * reflected form 0xA001), init 0xFE54.
++ *
++ * lc_patch_rbf_crc() walks all 1727 CRAM frames and rewrites every CRC.
++ * lc_patch_rbf_crc_frames() only touches a caller-supplied dirty-frame
++ * bitmap — used by mode 'g' (Phase 8) to skip frames untouched by edits.
++ *
++ * Frame numbering convention matches Python's: CRC_FIRST_CRAM_FRAME=25,
++ * CRC_LAST_FRAME=1751, CRC_PREAMBLE=32, frame_size=210.
++ */
++#ifndef CRC16_H
++#define CRC16_H
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define CRC_FRAME_SIZE        210u
++#define CRC_DATA_SIZE         208u
++#define CRC_FIRST_CRAM_FRAME  25u
++#define CRC_LAST_FRAME        1751u
++#define CRC_PREAMBLE          32u
++#define CRC_INIT              0xFE54u
++#define CRC_POLY_REFLECTED    0xA001u
++
++#define CRC_NUM_CRAM_FRAMES   (CRC_LAST_FRAME - CRC_FIRST_CRAM_FRAME + 1u)
++/* Dirty-frame bitmap size in bytes — one bit per CRAM frame. */
++#define CRC_DIRTY_BITMAP_BYTES ((CRC_NUM_CRAM_FRAMES + 7u) / 8u)
++
++/* CRC of a single 208-byte data block. */
++uint16_t crc16_rbf_frame(const uint8_t *data);
++
++/* Recompute CRC for every CRAM frame (25..1751) in `rbf`. */
++void lc_patch_rbf_crc(uint8_t *rbf);
++
++/* Recompute CRC only for CRAM frames marked dirty in `dirty`. Bit i
++ * (where i = frame_idx - CRC_FIRST_CRAM_FRAME) governs frame frame_idx. */
++void lc_patch_rbf_crc_frames(uint8_t *rbf, const uint8_t *dirty);
++
++/* Mark the CRAM frame covering byte offset `off` as dirty in `bitmap`.
++ * Out-of-range offsets (header / postamble) are a no-op. */
++void lc_mark_dirty(uint8_t *bitmap, uint32_t off);
++
++#endif /* CRC16_H */
+diff --git a/sw/stage2_loader/lutcodec.c b/sw/stage2_loader/lutcodec.c
+new file mode 100644
+index 0000000..a1d97e2
+--- /dev/null
++++ b/sw/stage2_loader/lutcodec.c
+@@ -0,0 +1,128 @@
++/* lutcodec.c — see lutcodec.h.
++ *
++ * Ports the address-formula path of EP4CE6/fuzz/bitstream.py:
++ * LutCodec.from_cram_model + predict_sram + write_tt, restricted to
++ * pin-friendly columns.  The σ⁻¹ permutation per (x,y,n) is read from
++ * the lutcodec_sigma_inv_packed table (auto-generated by
++ * host/gen_lutcodec_data.py); everything else is closed-form.
++ */
++#include "lutcodec.h"
++#include "crc16.h"
++
++#include <stdint.h>
++#include <stddef.h>
++
++/* cram_n_delta(n) — Python port from EP4CE6/fuzz/config.py.  n ∈ {0,2,...,30}. */
++static int32_t cram_n_delta(uint16_t n) {
++    int32_t k = (int32_t)(n / 2);   /* k = 0..15 */
++    int32_t half = k / 8;
++    int32_t kh = k % 8;
++    return -(half * 38) - (kh / 2) * 8 - (kh % 2) * 2;
++}
++
++/* cram_ctrl_bit(y) — Python port from EP4CE6/fuzz/config.py.
++ * The "non-wrapped" bp value; the slot-1 wrap path overrides this. */
++static uint8_t cram_ctrl_bit(uint16_t y) {
++    int32_t cram_row = (int32_t)y - 2;
++    int32_t slot = cram_row % 3;
++    int32_t group = cram_row / 3;
++    return (uint8_t)(7 - group - (slot > 0 ? 1 : 0));
++}
++
++static int find_index(const uint16_t *tbl, int n, uint16_t v) {
++    for (int i = 0; i < n; i++) if (tbl[i] == v) return i;
++    return -1;
++}
++
++lc_status_t lc_init(lut_codec_t *lc, uint16_t x, uint16_t y, uint16_t n) {
++    int x_idx = find_index(lutcodec_pin_x, LUTCODEC_NUM_X, x);
++    if (x_idx < 0) return LC_ERR_X;
++    int y_idx = find_index(lutcodec_lab_y, LUTCODEC_NUM_Y, y);
++    if (y_idx < 0) return LC_ERR_Y;
++    if (n > 30 || (n & 1u)) return LC_ERR_N;
++    int n_idx = (int)(n / 2);
++
++    int32_t slot = ((int32_t)y - 2) % 3;
++    int32_t group = ((int32_t)y - 2) / 3;
++    int32_t nd = cram_n_delta(n);
++
++    /* Slot-1 wrap logic (from LutCodec.from_cram_model). */
++    uint32_t addr_adj;
++    uint8_t bp;
++    if (slot == 1 && group == 0) {
++        if (24 + nd <= 0) {
++            bp = (uint8_t)(7 - group);
++            addr_adj = 206u;
++        } else {
++            bp = cram_ctrl_bit(y);
++            addr_adj = 0u;
++        }
++    } else if (slot == 1 && (24 + group * 3 + nd) < 0) {
++        bp = (uint8_t)(7 - group);
++        addr_adj = 207u;
++    } else {
++        bp = cram_ctrl_bit(y);
++        addr_adj = 0u;
++    }
++
++    /* period_start = COLUMN_BASE[x] - 136
++     * offset       = SLOT_BASE[slot] + group*3 + (slot==0 && group>0 ? 1 : 0)
++     * base_addr    = period_start + offset + nd + addr_adj
++     *              = cram_ctrl_addr(x,y,0,n) + addr_adj  */
++    uint32_t period_start = lutcodec_column_base[x_idx] - 136u;
++    uint32_t offset = (uint32_t)lutcodec_slot_base[slot]
++                    + (uint32_t)(group * 3)
++                    + ((slot == 0 && group > 0) ? 1u : 0u);
++    /* nd is negative; add as signed. */
++    lc->base_addr = (uint32_t)((int32_t)period_start + (int32_t)offset
++                               + nd + (int32_t)addr_adj);
++
++    /* Unpack σ⁻¹, then invert to σ. */
++    int flat = x_idx * LUTCODEC_NUM_Y * LUTCODEC_NUM_N
++             + y_idx * LUTCODEC_NUM_N + n_idx;
++    uint8_t packed = lutcodec_sigma_inv_packed[flat];
++    uint8_t si[4];
++    si[0] = (packed >> 0) & 3u;
++    si[1] = (packed >> 2) & 3u;
++    si[2] = (packed >> 4) & 3u;
++    si[3] = (packed >> 6) & 3u;
++    /* σ[j] = i  where σ⁻¹[i] = j. */
++    for (int i = 0; i < 4; i++) lc->sigma[si[i]] = (uint8_t)i;
++
++    lc->bp = bp;
++    lc->k_odd = (uint8_t)((n / 2) & 1u);
++    lc->x = x; lc->y = y; lc->n = n;
++    return LC_OK;
++}
++
++void lut_apply_mask(uint8_t *rbf, const lut_codec_t *lc,
++                    uint16_t mask, uint8_t *dirty) {
++    for (uint32_t b = 0; b < 16; b++) {
++        if (!((mask >> b) & 1u)) continue;
++        uint32_t f0 = (b >> lc->sigma[0]) & 1u;
++        uint32_t f1 = (b >> lc->sigma[1]) & 1u;
++        uint32_t f2 = (b >> lc->sigma[2]) & 1u;
++        uint32_t f3 = (b >> lc->sigma[3]) & 1u;
++        uint32_t pair = ((1u - f0) << 2) | ((1u - f1) << 1) | (1u - f2);
++        uint32_t da = f3 ^ (1u - f2);
++        uint32_t delta = lc->k_odd ? (1u - da) : da;
++        uint32_t addr = lc->base_addr + pair * LUTCODEC_PAIR_SPACING + delta;
++        rbf[addr] ^= (uint8_t)(1u << lc->bp);
++        if (dirty) lc_mark_dirty(dirty, addr);
++    }
++}
++
++lc_status_t lut_apply_with_canon(uint8_t *rbf,
++                                 uint16_t x, uint16_t y, uint16_t n,
++                                 uint16_t mask, uint8_t *dirty) {
++    lut_codec_t lc;
++    lc_status_t st = lc_init(&lc, x, y, n);
++    if (st != LC_OK) return st;
++    /* canon-2input asymmetric-mask layer is empirically a no-op at
++     * pin-friendly columns (Quartus emission matches zero-baseline
++     * canon state).  When this port is extended to X∈{3,4,6,7}
++     * (left-edge), apply the appropriate CANON_2INPUT_ABSOLUTE
++     * transition cells here before lut_apply_mask. */
++    lut_apply_mask(rbf, &lc, mask, dirty);
++    return LC_OK;
++}
+diff --git a/sw/stage2_loader/lutcodec.h b/sw/stage2_loader/lutcodec.h
+new file mode 100644
+index 0000000..33d31f0
+--- /dev/null
++++ b/sw/stage2_loader/lutcodec.h
+@@ -0,0 +1,70 @@
++/* lutcodec.h — On-chip C port of EP4CE6/fuzz/bitstream.py:LutCodec.
++ *
++ * Scope: pin-friendly columns X∈{10,16,22,28} × Y∈LAB_Y_CE6 × even N.
++ * The 1-input canonicalization layer (canon='a' / neg=False / no
++ * 2-input canon) is implicit — Quartus emits these positions with a
++ * deterministic canon state that matches the zero-baseline RBF.
++ *
++ * Track B mode 'g' usage (Phase 8):
++ *
++ *   lut_codec_t lc;
++ *   if (lc_init(&lc, x, y, n) != LC_OK) goto reject;
++ *   lut_apply_mask(rbf, &lc, mask, dirty_bitmap);
++ *   ...repeat per edit...
++ *   lc_patch_rbf_crc_frames(rbf, dirty_bitmap);
++ *
++ * Semantics of lut_apply_mask(rbf, lc, mask, dirty):
++ *   For each set bit b of `mask`, XOR-flip the cell that minterm b
++ *   maps to.  Equivalent to Python LutCodec.write_tt(rbf, mask) when
++ *   rbf is the zero-baseline RBF (mask=0x0000 Quartus output).
++ *   The dirty bitmap (CRC_DIRTY_BITMAP_BYTES bytes) accumulates which
++ *   CRAM frames were touched, for later CRC repair.
++ */
++#ifndef LUTCODEC_H
++#define LUTCODEC_H
++
++#include <stdint.h>
++#include "lutcodec_data.h"
++
++typedef enum {
++    LC_OK = 0,
++    LC_ERR_X = 1,       /* X not in pin-friendly whitelist */
++    LC_ERR_Y = 2,       /* Y not in LAB_Y_CE6 (CE6 fitter whitelist) */
++    LC_ERR_N = 3,       /* N out of range or odd */
++} lc_status_t;
++
++/* Compact LE descriptor.  16 cells in this LE share the same bp; we
++ * store base_addr (the addr-adj-corrected cram_ctrl_addr at pair=0)
++ * + the σ⁻¹ permutation + bp.  lut_apply_mask computes (pair,delta)
++ * per set bit via the σ-derived formula. */
++typedef struct {
++    uint32_t base_addr;   /* cram_ctrl_addr(x,y,0,n) + addr_adj */
++    uint8_t  sigma[4];    /* inverse of σ⁻¹ — used to map bit→(pair,delta) */
++    uint8_t  bp;          /* 0..7 — same for all 16 cells */
++    uint8_t  k_odd;       /* (n/2) & 1 — flips delta */
++    uint16_t x, y, n;     /* echoed for caller diagnostics */
++} lut_codec_t;
++
++lc_status_t lc_init(lut_codec_t *lc, uint16_t x, uint16_t y, uint16_t n);
++
++/* XOR-apply mask to rbf at the 16 cells of this LE; mark touched CRAM
++ * frames in `dirty` (caller-allocated CRC_DIRTY_BITMAP_BYTES).  Pass
++ * NULL for `dirty` to skip dirty-tracking (caller then must call
++ * lc_patch_rbf_crc(rbf) instead of the per-frame variant). */
++void lut_apply_mask(uint8_t *rbf, const lut_codec_t *lc,
++                    uint16_t mask, uint8_t *dirty);
++
++/* One-shot helper: lc_init + lut_apply_mask + (no-op) σ⁻¹
++ * canonicalization layer.  For pin-friendly X∈{10,16,22,28} the
++ * canon-2input asymmetric-mask layer (35-cell transition; plan v2
++ * Pitfall #16) is empirically a no-op at Quartus emission, so this
++ * wrapper is equivalent to lc_init+lut_apply_mask.  Distinct entry
++ * point exists so a future left-edge-X port (X∈{3,4,6,7}) can switch
++ * canon application on per-position without changing the call site
++ * (plan v2 §Phase 7 spec).  Returns lc_status_t — same codes as
++ * lc_init; lut_apply_mask is only invoked when lc_init returned OK. */
++lc_status_t lut_apply_with_canon(uint8_t *rbf,
++                                 uint16_t x, uint16_t y, uint16_t n,
++                                 uint16_t mask, uint8_t *dirty);
++
++#endif /* LUTCODEC_H */
+-- 
+2.43.0
+

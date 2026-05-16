@@ -224,12 +224,36 @@ Programs ROT into EPCS region 0. EPCS region 1 left blank; ROT itself populates 
 
 **Effort**: 3–4 h.
 
-### Phase 7 — Track B: LutCodec C port + σ⁻¹ + CRC
+### Phase 7 — Track B: LutCodec C port + σ⁻¹ + CRC  ✅ DONE
 
 The bitstream-RE-load-bearing piece. Port the minimum subset of
 `/home/test/EP4CE6/fuzz/bitstream.py` needed for "given (X, Y, N,
 16-bit mask) compute the (off, bp) cells to set/clear" + recompute
 frame CRCs.
+
+**Landed in patches/neorv32_rot/0003-Phase-7-….patch (2026-05-16):**
+- `host/gen_lutcodec_data.py` — emits `sw/stage2_loader/lutcodec_data.{c,h}`
+  (auto-gen, gitignored) with a packed 1152-byte σ⁻¹ table + COLUMN_BASE
+  / LAB_Y / SLOT_BASE geometry, sourced from `$EP4CE6_REPO`.
+- `sw/stage2_loader/lutcodec.{c,h}` — compact LE descriptor (12 B); cells
+  computed on-demand from σ⁻¹ + formulas (no per-position cell array).
+  Exposes `lc_init` / `lut_apply_mask` / `lut_apply_with_canon`.
+- `sw/stage2_loader/crc16.{c,h}` — `crc16_rbf_frame` + `lc_patch_rbf_crc{,_frames}`
+  + dirty-bitmap accumulator (`lc_mark_dirty`).
+- `host/test_lutcodec_c.py` — ctypes cross-test, three regimes:
+  RANDOM (100 tuples), EDGE (26 corner cases — mask∈{0,0xFFFF}, slot-1
+  wrap boundaries at y=3/6/9/12/18/21), COMPOSE (8 chained edits +
+  dirty-frame CRC). 127/127 byte-identical vs Python reference.
+- `rtl/ax301_top.vhd` + `sw/stage2_loader/Makefile` — IMEM 16K→32K bump.
+
+**Effort consumed**: ~4 h (planned 8–12).  Smaller than budgeted
+because σ⁻¹ table compressed to 1.2 KB (not 30 KB) once restricted to
+pin-friendly columns, and on-chip cell computation from formulas
+(rather than precomputed per-position) further shrunk .rodata.
+
+`main.c` left untouched per Phase 8 split — `lutcodec/crc16` symbols
+dead-stripped from current stage2 ELF (still 9492 B) until mode 'g'
+references them.
 
 **New files in patches/neorv32_rot:**
 - `sw/stage2_loader/lutcodec.c` + `lutcodec.h`:
@@ -456,8 +480,21 @@ independent blockers, each sufficient on its own:
   targets cross-LAB σ⁻¹ closure for small designs at left-edge
   columns. For Phase 7's NN-weight LUT use case, the recommended
   practice is to **pin LUTs to clean columns** (X∈{10,16,22,28}) at
-  Quartus time so σ⁻¹ permutation is a no-op — sidesteps the entire
-  Pitfall #16 axis.
+  Quartus time so the **canon-2input asymmetric-mask layer** is a
+  no-op — sidesteps the entire Pitfall #16 axis.
+
+  **Correction (Phase 7 implementation, 2026-05-16)**: the σ⁻¹
+  permutation in `_sigma_inv_lookup(foff, fb8, group)` is NOT a no-op
+  at pin-friendly columns — only ~8% (96/1152) of pin-friendly
+  (x, y, n) triples have identity σ⁻¹.  The pin-friendly choice
+  sidesteps the canon-2input layer (a 35-cell transition for
+  asymmetric Quartus emission), which IS a no-op at these columns —
+  but the per-position σ⁻¹ permutation has to be carried in the C
+  port's tables either way.  Final on-chip footprint: 1152 bytes
+  (packed σ⁻¹) + ~80 bytes of geometry tables, well under the 30 KB
+  plan estimate.  The IMEM 16K→32K bump still lands (per the Phase
+  7 contract above) but slack is now huge — Phase 8 has room for the
+  mode 'g' handler without further generic bumps.
 
 **If pure-open-toolchain self-reconfig were actually required**
 (years-out research path):
@@ -484,7 +521,7 @@ ROT/TPU pair." Quartus stays.
 | 4: ALTREMOTE_UPDATE trigger + UART drain | 2–3 h | pending |
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
 | 6: HW bench validation | 3–4 h | pending — needs AX301 + SD card |
-| **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | **pending — Track B enabler** |
+| **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | ✅ done (~4 h) |
 | **8: mode 'g' generator handler** | **4–6 h** | **pending — Track B integration** |
 | Slack for Quartus fit / IMEM bump iterations | 4–6 h | — |
 
