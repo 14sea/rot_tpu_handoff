@@ -153,9 +153,55 @@ to N slots only needs more `(lba, sz)` fields in the header.
 - **For initial bring-up: set `WATCHDOG_EN=0`** (manual fallback only). Removes the loop-trap class entirely.
 - Future enablement (after TPU firmware grows a clear-routine): set `WATCHDOG_EN=1`, `WATCHDOG_TIMEOUT≥30s`, AND require TPU's stage2_tpu / Linux to clear the watchdog (write to ALTREMOTE_UPDATE's `update` register early in boot). Until then, leave disabled.
 
+**Future hardening — boot-attempt counter** (required before
+WATCHDOG_EN=1 ships to non-bench users):
+
+Watchdog enable on its own is not sufficient — if the loaded image
+*always* fails to clear the watchdog (bad target firmware, dead
+peripheral, runtime panic), the chip ping-pongs ROT ↔ target forever
+even with WATCHDOG_EN=1, just at a slower cadence. The fix is a
+persistent boot-attempt counter that ROT increments before reconfig
+and the target zeroes after successful boot.
+
+- **Storage**: AX301 has no I²C EEPROM or non-volatile scratchpad on
+  the standard board, so the counter cannot live in DMEM (volatile)
+  or on-chip flash (doesn't exist on EP4CE6E). Reserve a dedicated
+  EPCS sector — e.g. `EPCS_BOOT_CTR_BASE=0x70000` (64 KB sector,
+  one sector before TPU at 0x80000) — and store `(magic, counter)`
+  as a packed u32. The wear concern is small (one sector erase +
+  one program per reconfig × counter cap; ≪ EPCS 100k budget).
+- **ROT flow** (added to mode_t / mode_g, before
+  `epcs_remote_reconfig`):
+  1. `epcs_read(EPCS_BOOT_CTR_BASE, …)` → `(magic, ctr)`.
+  2. If `magic != BOOT_CTR_MAGIC` (uninitialized / corrupted),
+     treat as `ctr=0`.
+  3. If `ctr >= BOOT_CTR_MAX` (default 3): print
+     `[rot] BOOT-ATTEMPT FUSE BLOWN (ctr=…) — entering console mode,
+      refusing reconfig`. Stay in ROT, accept UART commands. Operator
+     must explicitly `c` (clear counter) before next reconfig.
+  4. Else: erase + write `(BOOT_CTR_MAGIC, ctr+1)`, then proceed to
+     reconfig.
+- **Target flow** (TPU stage2_tpu / Linux init): once peripherals
+  are confirmed live (kernel reaches userspace, or stage2_tpu prints
+  banner — pick the latest checkpoint that you trust as "I am OK"),
+  call into ALTREMOTE_UPDATE's `update` register *and* erase+rewrite
+  `(BOOT_CTR_MAGIC, 0)` to ROT's counter sector. Both operations are
+  needed: the ALTREMOTE_UPDATE clear keeps the per-boot watchdog
+  satisfied; the EPCS-counter clear releases the per-history fuse.
+
+The threshold `BOOT_CTR_MAX=3` is a typical "transient flake vs
+persistent failure" cutoff (3× ALTREMOTE_UPDATE fallbacks ≈ 0.5 s of
+wasted time before the fuse blows; user gets a clear console prompt
+rather than an infinite loop).
+
+This pattern is deferred until after Phase 8 lands and the watchdog-
+clear routine is wired into the target's boot path — premature
+counter enablement on a hand-flashed bring-up board produces
+console-lockouts the operator can't easily clear without JTAG.
+
 **Test**: scope `nCONFIG` pin (or just observe UART silence then TPU stage2 banner ~150 ms later → kernel boot). Verify no extra dots/garbage at end of UART trace from truncated final byte.
 
-**Effort**: 2–3 h.
+**Effort**: 2–3 h (base Phase 4) + 2 h (boot-counter, deferred).
 
 ### Phase 5 — Build automation: cross-repo orchestrator (`tpu-then-rot`)  ✅ DONE
 
@@ -255,19 +301,77 @@ pin-friendly columns, and on-chip cell computation from formulas
 dead-stripped from current stage2 ELF (still 9492 B) until mode 'g'
 references them.
 
-**New files in patches/neorv32_rot:**
+**Anti-pattern to reject** — "move codec tables to SD card to save
+M9K / IMEM":
+
+A future reader (human or LLM) will eventually suggest that the
+~1.2 KB σ⁻¹ + geometry tables don't need to live in IMEM — they
+could be loaded from SD into SDRAM at mode 'g' entry and the IMEM
+bump rolled back. **Don't.** This proposal looks like a sound
+memory-budget optimization but violates the project's foundational
+trust model:
+
+- The whole CRTM (Chain-of-Trust Root Measurement) discipline of
+  this codebase — see CLAUDE.md, §Phase 1, §Phase 5, `rot_golden.h`
+  — is that **trusted measurement code and its constants are baked
+  into the bitstream**. Tampering requires JTAG-side EPCS rewrite,
+  which is a physically-observable event.
+- σ⁻¹ + geometry tables are part of the codec semantics: they
+  determine which CRAM cells `lut_apply_with_canon` flips. An
+  attacker who can swap the SD card can hand the running ROT a
+  table that maps "(x=10, y=2, n=0, mask=0xAAAA)" to entirely
+  different CRAM cells than Quartus did. The base bitstream's
+  SHA-256 still matches, the post-edit hash is printed to UART
+  (not compared), the EPCS image is byte-coherent (CRC is repaired
+  downstream of the lookup) — and the freshly-configured FPGA does
+  whatever the attacker's table dictates.
+- This is not a hypothetical concern. mode 'g' is the *only* path
+  in this design that takes design-time-unknown bitstream as input
+  and writes it to EPCS without a baked-golden hash check. The
+  codec tables are the last anchor that ties the EPCS output back
+  to the design-time CRAM model. Moving them to SD removes that
+  anchor.
+- The empirical premise of the "save M9K" suggestion is also wrong:
+  the actual footprint is 1.2 KB (not the plan's original 30 KB
+  budget). The IMEM bump from 16K to 32K still lands — but slack
+  is huge, so it isn't a cost worth re-engineering CRTM around.
+
+If genuinely-new bitstream-RE evidence accumulates and the codec
+tables need to evolve in production without re-synth, the
+*correct* mechanism is: bake a public key into stage2's .rodata,
+ship signed table updates on SD, verify the signature on load.
+This preserves the trust anchor at the cost of one Ed25519-verify.
+That work is out of scope here and would land alongside Phase 8's
+"edit list authentication" future-hardening row (which has the
+same structure).
+
+**Pre-landing spec (preserved for archaeological reference)** —
+the rest of this section was the design contract before Phase 7
+shipped. Superseded by the "Landed in patches/neorv32_rot/0003" and
+"Anti-pattern to reject" sections above; kept verbatim because some
+items (memory budget, validation gate) are contradicted by the
+actual implementation and the contrast is informative.
+
+<details><summary>Original Phase 7 spec (pre-implementation)</summary>
+
 - `sw/stage2_loader/lutcodec.c` + `lutcodec.h`:
   - `lut_codec_t lc_init(uint16_t x, uint16_t y, uint16_t n)` —
     computes the per-LE 16 minterm cell offsets via the same column-
     anchor + Y/N stride math as `LutCodec.from_cram_model`. Output:
-    16 (off, bp) tuples cached in the struct.
+    16 (off, bp) tuples cached in the struct. *(Shipped variant: on-
+    chip formula instead of precomputed per-LE arrays — 1.2 KB
+    σ⁻¹ vs the originally planned ~30 KB per-position tables.)*
   - `void lut_apply_mask(uint8_t *rbf, const lut_codec_t *lc, uint16_t mask)`
     — writes 16 bits absolutely (not XOR-delta) per the mask.
+    *(Shipped variant: XOR-from-zero-baseline semantics, equivalent
+    to Python LutCodec.write_tt; "absolute" framing was redundant.)*
   - `int lut_apply_with_canon(uint8_t *rbf, uint16_t x, uint16_t y,
     uint16_t n, uint16_t mask)` — wraps the above + applies σ⁻¹
     canonicalization for asymmetric masks at left-edge columns
     (X∈{3,4,6,7}). For pin-friendly columns (X∈{10,16,22,28}), σ⁻¹
-    is a no-op.
+    is a no-op. *(See σ⁻¹ correction in §Open-toolchain footnote —
+    σ⁻¹ as defined by `_sigma_inv_lookup` is in fact required at
+    pin-friendly cols; it's the canon-2input layer that's the no-op.)*
 - `sw/stage2_loader/lutcodec_data.c` + `.h` — auto-generated from
   `/home/test/EP4CE6/results/sigma_inv_fb8_groups.json` (~2 KB) plus
   any per-position canonicalization tables needed (per `Pitfall #16`).
@@ -279,8 +383,8 @@ references them.
   ~50 lines C. Track which frames were modified during edit-apply,
   recompute CRC only for those.
 
-**Validation gate**: round-trip test against Python LutCodec.
-`host/test_lutcodec_c.py`:
+**Validation gate** (pre-landing): round-trip test against Python
+LutCodec.  `host/test_lutcodec_c.py`:
 1. Generate 100 random `(x, y, n, mask)` tuples for valid CE6 LE
    positions.
 2. For each, compute the modified `.rbf` via Python `LutCodec.write_tt`.
@@ -288,7 +392,13 @@ references them.
    `lutcodec.c` for host x86_64, link as Python ctypes module).
 4. Assert byte-identical RBF output.
 
-**Memory budget on NEORV32**:
+*(Shipped variant: three regimes — RANDOM (100) + EDGE (26 corner
+cases) + COMPOSE (8 chained edits + dirty-frame CRC) = 127/127
+byte-identical. The COMPOSE regime caught a real semantic
+discrepancy in the dirty-frame CRC variant during test development
+— see commit message of 0003-Phase-7.)*
+
+**Memory budget on NEORV32** (pre-landing estimate):
 - IMEM 16 KB: stage2 currently 9.5 KB; +lutcodec ~3 KB code → ~12.5 KB.
   Tight but fits.
 - σ⁻¹ + per-position tables: ~30 KB. Goes in `.rodata` of stage2,
@@ -299,7 +409,16 @@ references them.
 - SDRAM scratch: 2× 368 KB buffers (one for source, one for output of
   apply_lut). Existing 32 MB SDRAM more than enough.
 
-**Effort**: 4–6 h (port) + 4–6 h (validation + IMEM bump) = ~8–12 h.
+*(Shipped variant: ~1.2 KB σ⁻¹ + ~80 B geometry + ~3 KB code ≈
+4.3 KB Phase 7 footprint, not 30+ KB. IMEM bump still landed for
+margin and to unblock Phase 8 wiring, but cost is 1 extra M9K
+block, not multi-k-LE.)*
+
+**Effort** (pre-landing): 4–6 h (port) + 4–6 h (validation + IMEM
+bump) = ~8–12 h.  *(Actual: ~4 h; smaller table footprint shrank
+the validation + tuning loop.)*
+
+</details>
 
 ### Phase 8 — Track B: `mode_g` (generate) handler
 
@@ -310,6 +429,7 @@ Wire Phase 7 into stage2's dispatcher.
 mode_generate:
   1. Read base.rbf from SD region 0 → SDRAM[BASE_SCRATCH=0x41000000]   (~0.7s @ ~0.5 MB/s SD)
   2. Read edits.bin from SD (small, 4-32 KB)                           (negligible)
+  2a. Verify edits.bin: magic + version + CRC-32 (see integrity gate)  (~30 µs)
   3. SHA256 verify base.rbf vs rot_golden_base[8]                      (~50 ms)
   4. Pre-erase EPCS region 1 hash check (skip if already up-to-date)
   5. For each edit (x, y, n, mask) tuple:
@@ -323,8 +443,17 @@ mode_generate:
   10. epcs_remote_reconfig (Phase 4 reuse)                              (~150 ms cold reset)
 ```
 
-**Edit list format** (`edits.bin` on SD): packed array of 8-byte records:
+**Edit list format** (`edits.bin` on SD): 16-byte header + packed
+8-byte records:
 ```c
+struct edits_hdr {
+  uint32_t magic;      // 0x45444954 ('EDIT' big-endian)
+  uint32_t version;    // 1
+  uint32_t n_records;  // count of edit_rec following the header
+  uint32_t crc32;      // CRC-32/ISO-HDLC over [version | n_records | records]
+                       // (the magic itself is excluded so a partial-read of
+                       //  the first 4 bytes can't pass a CRC check by luck)
+};
 struct edit_rec {
   uint16_t x;          // LAB X (3..31, must be in CE6 whitelist)
   uint16_t y;          // LAB Y (2..21, must be in CE6 whitelist)
@@ -339,12 +468,35 @@ at base-bitstream-build time (a QSF set_location_assignment manifest
 emitted as a sidecar `editable_les.bin` on SD; mode_g cross-checks each
 edit against this allowlist).
 
+**Integrity (not authentication) gate on edits.bin**:
+
+Before any edit is applied, `mode_g`:
+1. Checks `magic == 0x45444954` — rejects unrelated files.
+2. Validates `version == 1` — guards format evolution.
+3. Recomputes CRC-32/ISO-HDLC over `version | n_records | records` and
+   asserts equality with `crc32`. Mismatch → halt with
+   `[!] edits.bin CRC FAIL (computed=… expected=…) — refusing to apply`.
+
+Failure mode this closes: an SD read-side bit flip in one mask field
+would otherwise produce a corrupted `(x, y, n, mask)` tuple that
+`lut_apply_with_canon` faithfully applies → `patch_rbf_crc` recomputes
+correct frame CRCs over the corrupted data → EPCS is programmed with a
+**well-formed-but-wrong** bitstream. Frame CRC repair *legitimizes*
+the corruption because it operates downstream of the edit application.
+A 4-byte CRC32 header over edits.bin is the smallest mechanism that
+detects this; ~30 µs to verify on NEORV32, ~15 lines of C reusing the
+existing CRC pattern (different polynomial — CRC-32/ISO-HDLC, not the
+CRC-16 RBF-frame poly).
+
 **Trust boundary**:
 - Base bitstream: SHA-256-verified vs baked golden (high trust).
-- Edit list: NOT SHA-verified vs baked golden — its purpose is to be
-  application-mutable. Authentication is upstream of ROT (e.g., signed
-  by user's NN compiler). For initial bring-up: no edit-list signature;
-  add Ed25519 signature verify in a future phase if needed.
+- Edit list integrity: CRC-32 detects accidental corruption (SD read
+  flips, truncation, wrong file). **CRC-32 is NOT authentication** —
+  an attacker who can rewrite edits.bin can also rewrite the CRC.
+  Authentication remains upstream of ROT (signed by user's NN
+  compiler). Future hardening: add Ed25519 signature over edits.bin
+  with the public key baked into stage2's .rodata alongside
+  rot_golden_*; out of scope for initial bring-up.
 - Output bitstream: hash printed to UART for forensics; ALTREMOTE_UPDATE
   watchdog (if enabled) catches malformed output that fails to
   configure.
@@ -363,6 +515,73 @@ edit against this allowlist).
 
 **Effort**: 4–6 h (mode handler + SD reading + integration test).
 
+### Phase 9 — EPCS slot rotation (deferred; high-frequency mode 'g')
+
+**Problem**: EPCS sectors are rated for ~100,000 erase cycles.
+Phase 8 lands with a single target slot at `EPCS_TPU_BASE=0x80000`,
+which is fine for occasional reflash (per-day, per-hour). But the
+Track B use case "NN-weight LUT mask edits via mode 'g'" can want
+much higher cadence — once-per-minute adjustment from a feedback
+loop wears one sector to its limit in ≈70 days
+(60 × 24 × 70 ≈ 100,800). Defending against this requires spreading
+the writes across multiple sectors.
+
+**Mechanism**: Cyclone IV E ALTREMOTE_UPDATE supports per-image
+PAGE_SEL programming; the page-N reconfig pin assignment determines
+which EPCS offset the FPGA loads on `RECONFIG_TRIGGER`. Carve EPCS16
+(2 MB) into slots:
+
+```
+0x00000  page 0  ROT bitstream (immutable; programmed via JTAG)
+0x80000  page 1  TARGET slot A — application
+0xF0000  page 2  TARGET slot B
+0x160000 page 3  TARGET slot C
+0x1D0000 page 4  TARGET slot D
+```
+
+(Each ~360 KB target image + ~24 KB margin = 384 KB stride. Four
+slots after ROT fit in 2 MB.) Add a small u32 counter in a
+dedicated EPCS sector (reused from the Phase 4 boot-attempt counter
+sector if landed; otherwise a new one): `(magic, next_slot)`.
+
+**mode_g flow change** (vs Phase 8):
+1. Read `(magic, next_slot)` from `EPCS_SLOT_CTR_BASE`. Treat
+   missing magic as `next_slot = 1`.
+2. After SHA-verifying the generated bitstream, write it to slot
+   `next_slot` (not always 1).
+3. Update `(magic, (next_slot % 4) + 1)` so the next reconfig
+   targets a different slot.
+4. Call `epcs_remote_reconfig(next_slot)` with the freshly-written
+   page number.
+
+**Wear amortization**: 4 slots → ≈4× lifetime → ≈280 days at
+once-per-minute, or ≈75 years at once-per-hour. Combined with
+the Phase 3 pre-write hash check (which skips erase when the
+target slot already has the right image), the realized wear is
+usually much lower than the worst case.
+
+**Trade-offs**:
+- Quartus ALTREMOTE_UPDATE megawizard must be reconfigured for
+  `Number of pages = 5` (page 0 ROT + 4 target slots). Page count
+  is set at synthesis time on Cyclone IV E; runtime PAGE_SEL just
+  picks which configured page to jump to.
+- ROT firmware grows by ~100 lines (slot-counter read/write +
+  page selection). Negligible IMEM impact.
+- Trust-anchor implication: the `rot_golden_*` hash must still match
+  whatever was last written to *any* slot. If different applications
+  live in different slots (TPU in A, accelerator in B, …), each one
+  needs its own `rot_golden_*[8]` constant. Phase 5's gen_golden.py
+  already accepts multiple sections — extending to N target slots
+  is just more SECTIONS entries.
+
+**Triggering condition** (so this is not done speculatively):
+land Phase 9 when bench data shows mode 'g' is being invoked at
+**> 10× per day** on a deployed unit. Earlier than that, single-slot
+EPCS wear is irrelevant.
+
+**Effort**: 4–6 h (Quartus IP reconfig + slot-counter logic + test).
+Deferred; not part of Track B initial bring-up.
+
 ## Failure-mode handling matrix
 
 | Failure | Detection | Action / UART |
@@ -370,6 +589,7 @@ edit against this allowlist).
 | SD read error | `sd_read_many()` non-zero | `[!] SD read FAIL lba=…` halt |
 | SDRAM scratch corrupted | pre-read pattern test (Phase 3 add) | `[!] SDRAM scratch test FAIL` halt |
 | SD-side base SHA mismatch (Track A or B) | golden compare in mode_t / mode_g | `[!] base SHA mismatch — refusing EPCS write` halt |
+| edits.bin corrupted (Track B) | CRC-32 header check before record dispatch | `[!] edits.bin CRC FAIL (computed=… expected=…) — refusing to apply` halt. Closes the "CRC repair legitimizes corrupted edit" hole (see Phase 8 integrity gate). |
 | Edit position outside whitelist (Track B) | `editable_les.bin` allowlist check | `[!] edit (X,Y,N) not in editable region — halt` |
 | Edit at unmapped CE6 position (Track B) | `lc_init` returns NULL | `[!] (X,Y,N) outside CE6 LE whitelist — halt` |
 | Asymmetric mask at unmined σ⁻¹ position (Track B) | canon table KeyError-equivalent in C | `[!] σ⁻¹ not mined for (X,Y,N) — repin LUT to clean column` halt |
@@ -378,6 +598,7 @@ edit against this allowlist).
 | EPCS post-write SHA mismatch | second hash compare | `[!] EPCS verify failed — re-erasing region 1 to 0xFF` halt |
 | ALTREMOTE_UPDATE error | altremote `current_state` ≠ idle after trigger | `[!] reconfig refused` halt in ROT |
 | Target boots but hangs | watchdog in altremote_update (WATCHDOG_EN=1) | HW auto-fallback to page 0; ROT prints `[rot] FALLBACK` (initial bring-up keeps WATCHDOG_EN=0 to avoid loop-trap) |
+| Persistent target failure (3+ fallbacks) | EPCS boot-attempt counter ≥ BOOT_CTR_MAX | `[rot] BOOT-ATTEMPT FUSE BLOWN — entering console mode, refusing reconfig`. Operator clears via UART command. (Deferred — lands with WATCHDOG_EN=1, not initial bring-up.) |
 | Truncated final UART byte | terminal sees garbage | TX-empty wait + busy-loop drain pause before nCONFIG (Phase 4) |
 | LutCodec C-vs-Python divergence | `host/test_lutcodec_c.py` cross-test | CI-time gate; fail commit if any of 100 random tuples diverge |
 
@@ -522,7 +743,9 @@ ROT/TPU pair." Quartus stays.
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
 | 6: HW bench validation | 3–4 h | pending — needs AX301 + SD card |
 | **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | ✅ done (~4 h) |
-| **8: mode 'g' generator handler** | **4–6 h** | **pending — Track B integration** |
+| **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | **pending — Track B integration** |
+| 9: EPCS slot rotation (high-frequency reflash) | 4–6 h | deferred — triggered by > 10×/day mode 'g' bench data |
+| 4-future: Watchdog enable + EPCS boot-attempt counter | +2 h | deferred — lands with WATCHDOG_EN=1, after Phase 8 |
 | Slack for Quartus fit / IMEM bump iterations | 4–6 h | — |
 
 **Total**: ~38–53 engineer-hours of focused work (was 22–29 in plan v1
