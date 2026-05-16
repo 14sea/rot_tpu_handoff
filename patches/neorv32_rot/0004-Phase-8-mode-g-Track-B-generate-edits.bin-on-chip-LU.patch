@@ -1,0 +1,1162 @@
+From d1d2bce6f0e9aa51ebbd59adba742dff1344adf5 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sat, 16 May 2026 23:05:19 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=208:=20mode=20'g'=20(Track=20B=20generate?=
+ =?UTF-8?q?)=20=E2=80=94=20edits.bin=20+=20on-chip=20LUT=20mask=20editor?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wires Phase 7's LutCodec + frame-CRC routines into a new stage2 mode
+that ingests a base .rbf + edit list from SD, applies LUT-mask edits
+in SDRAM, and recomputes frame CRCs over the dirty set.  Halts before
+EPCS write (Phases 2–4 pending hardware).
+
+Format
+------
+
+sd_layout.py bumps to LAYOUT_VERSION=4: header gains edits_lba +
+edits_sz in the previously-reserved [56..64) slot, no hash-slot
+reflow.  New SD region at LBA 8729 (32 KB cap) holds edits.bin.
+
+edits.bin is a 16-byte header + packed 8-byte records:
+  magic     0x45444954 ('EDIT' big-endian on wire)
+  version   1
+  n_records u32
+  crc32     CRC-32/ISO-HDLC over [version | n_records | records]
+  edit_rec  (x:u16, y:u16, n:u16, mask:u16) × n_records
+
+The magic is excluded from the CRC payload (per plan v3 §Phase 8) so
+a 4-byte partial read can't pass the gate by luck.
+
+Integrity gate, not authentication
+----------------------------------
+
+mode_g re-checks magic + version + CRC32 before applying any record.
+A bit-flip in the records body produces a recomputed CRC that won't
+match the header field → halt before any EPCS touch.  CRC32 detects
+accidental SD-read corruption; an attacker who can rewrite edits.bin
+can also rewrite the CRC.  Authentication remains upstream (signed by
+the user's NN compiler); a future Ed25519-on-edits.bin gate would
+land as a Phase 8 hardening row, mirroring Phase 7's "Anti-pattern to
+reject" note.
+
+This closes a hole the plan calls out specifically: without the gate,
+lc_patch_rbf_crc_frames legitimises corrupted edits by recomputing
+correct frame CRCs over the corrupted CRAM data, producing a
+well-formed-but-wrong bitstream.
+
+mode_g flow (main.c)
+--------------------
+
+  1. Read base.rbf from h->tpu_lba into TPU_SCRATCH_ADDR (mode_t reuse).
+  2. Read edits.bin from h->edits_lba into EDITS_SCRATCH_ADDR
+     (0x41E00000, 1 MB below DTB).
+  2a. Magic + version + CRC32 gate.
+  3. SHA-256 base.rbf vs rot_golden_tpu_bitstream (the canonical base).
+  5. For each record: lut_apply_with_canon + dirty bitmap (lc_init
+     whitelist rejects out-of-pin-friendly tuples).
+  6. lc_patch_rbf_crc_frames over the dirty set.
+  7. SHA-256 of the result, print to UART (no golden compare —
+     output is design-time-unknown).
+  8-10. EPCS write + read-back verify + ALTREMOTE_UPDATE reconfig:
+     deferred until Phases 2–4 land.  Halts here with the same gate
+     mode_t uses.
+
+CRC32 refactor
+--------------
+
+Extracted crc32_update / crc32 / crc32_two from main.c into a new
+crc32_iso.{c,h} TU so host/test_edits_bin.py can compile + ctypes-
+link the exact code stage2 runs.  This gives Phase 8 a CI-time gate
+on host↔chip CRC equivalence — analogous to how Phase 7's
+test_lutcodec_c.py validates the lutcodec port.  The xmodem upload
+path's CRC reuses the same routine (it was already CRC-32/ISO-HDLC).
+
+Host-side
+---------
+
+  host/gen_edits.py     emits edits.bin from JSON or CLI tuples;
+                        whitelist-validates against the same
+                        PIN_X × LAB_Y_CE6 × even-N set lc_init
+                        enforces on chip.
+  host/sd_pack.py       grows --edits PATH; auto-discovers
+                        output/edits.bin if present.
+  host/test_edits_bin.py round-trip + CRC cross-test (host vs C)
+                         + 5 negative cases + 5 whitelist rejections.
+
+Memory budget
+-------------
+
+stage2 ELF: 9492 → 13908 B.  +4416 B for mode_g + lutcodec/crc16
+linkage (previously dead-stripped) + crc32_iso TU.  IMEM 32 K
+has ~18 K slack.  bss +728 B (mode_g_dirty 217 B + alignment +
+xmodem buf).  Far below the M9K budget.
+
+Validation
+----------
+
+  $ cd sw/stage2_loader && make all              # 13908 B
+  $ EP4CE6_REPO=/home/test/EP4CE6 \
+      python3 host/test_lutcodec_c.py            # 127/127 still
+  $ python3 host/test_edits_bin.py               # 5/5 paths green
+  $ python3 -c 'import sd_layout as L; \
+      L.verify_layout(L.parse_header( \
+      L.build_header(0,0,0,edits_sz=128)))'      # v4 round-trip
+
+End-to-end silicon test deferred to Phase 6.  bench needs an AX301
+running a base bitstream whose LUTs are pinned to the pin-friendly
+column subset — the same constraint Phase 7's LutCodec port assumes.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ host/gen_edits.py            | 184 +++++++++++++++++++++++++
+ host/sd_layout.py            |  49 +++++--
+ host/sd_pack.py              |  26 +++-
+ host/test_edits_bin.py       | 235 ++++++++++++++++++++++++++++++++
+ sw/stage2_loader/crc32_iso.c |  32 +++++
+ sw/stage2_loader/crc32_iso.h |  30 ++++
+ sw/stage2_loader/main.c      | 257 ++++++++++++++++++++++++++++++++---
+ 7 files changed, 779 insertions(+), 34 deletions(-)
+ create mode 100644 host/gen_edits.py
+ create mode 100644 host/test_edits_bin.py
+ create mode 100644 sw/stage2_loader/crc32_iso.c
+ create mode 100644 sw/stage2_loader/crc32_iso.h
+
+diff --git a/host/gen_edits.py b/host/gen_edits.py
+new file mode 100644
+index 0000000..dd9d8d3
+--- /dev/null
++++ b/host/gen_edits.py
+@@ -0,0 +1,184 @@
++#!/usr/bin/env python3
++"""
++gen_edits.py — Emit a Phase 8 mode 'g' edits.bin file.
++
++File format (matches docs/plan.md §Phase 8):
++
++    struct edits_hdr {
++        uint32_t magic;       /* 0x45444954 = 'EDIT' (big-endian on wire,
++                                 stored as little-endian u32 = 0x54494445) */
++        uint32_t version;     /* 1 */
++        uint32_t n_records;
++        uint32_t crc32;       /* CRC-32/ISO-HDLC over [version | n_records | records] */
++    };
++    struct edit_rec {
++        uint16_t x;           /* LAB X — must be in PIN_X whitelist */
++        uint16_t y;           /* LAB Y — must be in LAB_Y_CE6 whitelist */
++        uint16_t n;           /* LE N — even, 0..30 */
++        uint16_t mask;        /* 16-bit truth table */
++    };
++
++The CRC32 is computed on the host side and the on-chip mode 'g' handler
++re-validates it before applying any edit (see plan §Phase 8 integrity
++gate).  Note: CRC-32 is integrity, NOT authentication — see plan
++"Trust boundary" subsection.
++
++Each record is whitelist-checked against PIN_X / LAB_Y_CE6 / even-N
++(same set the on-chip lc_init enforces).  Out-of-whitelist tuples are
++rejected here so the SD card never carries records mode 'g' would
++refuse anyway.
++
++Input modes:
++  --json PATH      Read a JSON list `[{"x":10,"y":4,"n":0,"mask":"0xabcd"}, ...]`.
++                   `mask` accepts int (0..65535), hex string ("0x..."), or
++                   "0b..." binary.
++  --edit X,Y,N,M   Add one record from the CLI (may be repeated).
++
++Output: writes edits.bin to --out (default: ./edits.bin).
++"""
++import argparse
++import binascii
++import json
++import os
++import struct
++import sys
++
++# Same whitelist as host/gen_lutcodec_data.py and the on-chip lc_init.
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from gen_lutcodec_data import PIN_X, LAB_Y_CE6, N_VALUES  # noqa: E402
++
++MAGIC_LE = 0x54494445       # 'EDIT' big-endian-on-wire → 0x45 0x44 0x49 0x54
++                            # → little-endian-u32 = 0x54494445
++VERSION  = 1
++
++
++def _parse_mask(v):
++    if isinstance(v, int):
++        m = v
++    elif isinstance(v, str):
++        s = v.strip().lower()
++        if s.startswith("0x"):
++            m = int(s, 16)
++        elif s.startswith("0b"):
++            m = int(s, 2)
++        else:
++            m = int(s, 10)
++    else:
++        raise ValueError(f"mask must be int or str, got {type(v).__name__}")
++    if not (0 <= m <= 0xFFFF):
++        raise ValueError(f"mask 0x{m:x} out of u16 range")
++    return m
++
++
++def _validate_xyn(x, y, n):
++    if x not in PIN_X:
++        raise ValueError(
++            f"x={x} not in pin-friendly whitelist {PIN_X}; on-chip "
++            f"lc_init would return LC_ERR_X.  Re-pin this LUT in Quartus "
++            f"to a clean column.")
++    if y not in LAB_Y_CE6:
++        raise ValueError(
++            f"y={y} not in LAB_Y_CE6 whitelist; on-chip lc_init would "
++            f"return LC_ERR_Y.")
++    if n not in N_VALUES:
++        raise ValueError(
++            f"n={n} not in even-N set {N_VALUES}; on-chip lc_init would "
++            f"return LC_ERR_N.")
++
++
++def pack_edits(records):
++    """Build the edits.bin payload (header + records) with the correct CRC32.
++
++    `records` is an iterable of (x, y, n, mask) tuples.  Each is
++    whitelist-checked before packing.
++    """
++    body = bytearray()
++    for (x, y, n, mask) in records:
++        _validate_xyn(x, y, n)
++        body += struct.pack("<HHHH", x, y, n, mask & 0xFFFF)
++
++    # CRC payload = version | n_records | records (magic is excluded —
++    # see plan §Phase 8 integrity gate rationale).
++    crc_payload = struct.pack("<II", VERSION, len(records)) + bytes(body)
++    crc = binascii.crc32(crc_payload) & 0xFFFFFFFF
++
++    hdr = struct.pack("<IIII", MAGIC_LE, VERSION, len(records), crc)
++    return hdr + bytes(body)
++
++
++def parse_edits(blob):
++    """Parse + integrity-check an edits.bin blob.  Returns a list of
++    (x, y, n, mask) tuples.  Raises ValueError on any failure that
++    mode_g would also catch."""
++    if len(blob) < 16:
++        raise ValueError(f"edits.bin too short: {len(blob)} < 16 B header")
++    magic, version, n_records, crc = struct.unpack("<IIII", blob[:16])
++    if magic != MAGIC_LE:
++        raise ValueError(f"bad magic: 0x{magic:08x} != 0x{MAGIC_LE:08x}")
++    if version != VERSION:
++        raise ValueError(f"unsupported version: {version} != {VERSION}")
++    body_len = n_records * 8
++    if len(blob) < 16 + body_len:
++        raise ValueError(
++            f"edits.bin truncated: have {len(blob)} B, need "
++            f"{16 + body_len} for {n_records} records")
++    body = blob[16:16 + body_len]
++    crc_payload = blob[4:16 - 4] + body  # version + n_records + records
++    # equivalently: struct.pack("<II", version, n_records) + body
++    computed = binascii.crc32(crc_payload) & 0xFFFFFFFF
++    if computed != crc:
++        raise ValueError(
++            f"CRC32 mismatch: computed=0x{computed:08x} "
++            f"expected=0x{crc:08x}")
++    out = []
++    for i in range(n_records):
++        rec = struct.unpack("<HHHH", body[i * 8:(i + 1) * 8])
++        out.append(rec)
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--json", help="JSON manifest path (list of {x,y,n,mask})")
++    ap.add_argument("--edit", action="append", default=[],
++                    metavar="X,Y,N,M",
++                    help="add one record; repeatable. Mask accepts 0x.. / 0b.. / decimal.")
++    ap.add_argument("--out", default="edits.bin",
++                    help="output path (default: edits.bin)")
++    ap.add_argument("--print", action="store_true",
++                    help="print parsed records after writing (smoke check)")
++    args = ap.parse_args()
++
++    records = []
++    if args.json:
++        with open(args.json) as f:
++            for entry in json.load(f):
++                records.append((
++                    int(entry["x"]),
++                    int(entry["y"]),
++                    int(entry["n"]),
++                    _parse_mask(entry["mask"]),
++                ))
++    for e in args.edit:
++        parts = e.split(",")
++        if len(parts) != 4:
++            raise SystemExit(f"--edit must be X,Y,N,M (got {e!r})")
++        x, y, n = int(parts[0]), int(parts[1]), int(parts[2])
++        records.append((x, y, n, _parse_mask(parts[3])))
++
++    if not records:
++        raise SystemExit("no records — pass --json and/or --edit")
++
++    blob = pack_edits(records)
++    with open(args.out, "wb") as f:
++        f.write(blob)
++    print(f"[gen_edits] wrote {args.out} ({len(blob)} B, {len(records)} records)")
++    if args.print:
++        for i, rec in enumerate(parse_edits(blob)):
++            print(f"  [{i}] x={rec[0]:2d} y={rec[1]:2d} n={rec[2]:2d} "
++                  f"mask=0x{rec[3]:04x}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/host/sd_layout.py b/host/sd_layout.py
+index 70e1039..ce2588b 100644
+--- a/host/sd_layout.py
++++ b/host/sd_layout.py
+@@ -6,30 +6,37 @@ reflashing the full blob with sd_pack.py first.
+ 
+ Layout (512-byte sectors):
+   LBA 0            : header (magic + sizes + LBAs + layout_version + hashes)
+-  LBA 1..4000      : Image  reserved slot (2 MB max)
+-  LBA 4001..4008   : DTB    reserved slot (4 KB max)
+-  LBA 4009..8008   : initrd reserved slot (2 MB max)
+-  LBA 8009..8728   : TPU.rbf reserved slot (368,640 B = 720 sectors max,
++  LBA 1..4000      : Image    reserved slot (2 MB max)
++  LBA 4001..4008   : DTB      reserved slot (4 KB max)
++  LBA 4009..8008   : initrd   reserved slot (2 MB max)
++  LBA 8009..8728   : TPU.rbf  reserved slot (368,640 B = 720 sectors max,
+                      one EP4CE6 RBF) [layout v3+]
++  LBA 8729..8792   : edits.bin reserved slot (32,768 B = 64 sectors max,
++                     mode 'g' edit list)         [layout v4+]
+ 
+ Fixed LBAs mean `sd_update.py` can rewrite just the initrd slot (and
+ the header) without shifting anything when the kernel grows.  The
+ TPU.rbf slot is read-only from stage2's perspective: stage2 hashes
+ the bytes against `rot_golden_tpu_bitstream` baked into bitstream
+-.rodata before staging into EPCS for ALTREMOTE_UPDATE.
++.rodata before staging into EPCS for ALTREMOTE_UPDATE.  The edits.bin
++slot is mode-'g'-only (Phase 8) and integrity-gated on-chip via a
++CRC-32/ISO-HDLC header (NOT a baked-golden hash — the edit list is
++design-time-unknown by definition).
+ 
+ Header byte layout (LBA 0):
+   [0..8)    magic "NEOLNX\\0\\0"
+   [8..56)   12 × u32 (image_sz, dtb_sz, initrd_sz, img_lba, dtb_lba,
+             ird_lba, layout_version, img_max_sec, dtb_max_sec,
+             ird_max_sec, tpu_lba, tpu_sz)        [v3 adds tpu_lba+sz]
+-  [56..64)  reserved (zero)
++  [56..64)  edits_lba, edits_sz                   [v4 — was reserved in v3]
+   [64..96)  IMAGE  sha256 (8 × u32 LE, numerically matches wb_sha256 H0..H7)
+   [96..128) DTB    sha256
+   [128..160) INITRD sha256
+   [160..192) TPU.rbf sha256                       [v3+; informational —
+             stage2 ignores on-card hash and trusts only the BAKED golden]
+   [192..512) zero pad
++  (edits.bin has NO on-card sha256 slot — its integrity is the
++  internal CRC-32 header, validated at mode 'g' entry.)
+ 
+ Hash encoding: hashlib.sha256(data).digest() is a 32-byte big-endian
+ stream (H0 high byte first). `wb_sha256` exposes H0..H7 as 8 × u32 the
+@@ -42,7 +49,7 @@ import struct
+ 
+ SECTOR        = 512
+ MAGIC         = b"NEOLNX\x00\x00"
+-LAYOUT_VERSION = 3          # bumped for TPU.rbf slot + hash
++LAYOUT_VERSION = 4          # v4 adds edits.bin slot for mode 'g' (Phase 8)
+ 
+ HASH_OFF      = 64          # sector offset of first hash word
+ HASH_LEN      = 32          # 8 × u32
+@@ -65,7 +72,10 @@ IRD_MAX_SEC   = 4000     # 2 MB
+ TPU_LBA       = IRD_LBA + IRD_MAX_SEC       # 8009
+ TPU_MAX_SEC   = 720      # 368,640 B — one EP4CE6 RBF (368,011 B)
+ 
+-END_LBA       = TPU_LBA + TPU_MAX_SEC       # 8729
++EDITS_LBA     = TPU_LBA + TPU_MAX_SEC       # 8729
++EDITS_MAX_SEC = 64       # 32,768 B — plan §Phase 8 says 4–32 KB typical
++
++END_LBA       = EDITS_LBA + EDITS_MAX_SEC   # 8793
+ 
+ 
+ def pad_sector(b: bytes) -> bytes:
+@@ -87,27 +97,35 @@ def build_header(image_sz: int, dtb_sz: int, initrd_sz: int,
+                  dtb_hash:   bytes = b"\x00" * 32,
+                  initrd_hash: bytes = b"\x00" * 32,
+                  tpu_sz: int = 0,
+-                 tpu_hash: bytes = b"\x00" * 32) -> bytes:
++                 tpu_hash: bytes = b"\x00" * 32,
++                 edits_sz: int = 0) -> bytes:
+     """Build the 512-byte LBA-0 header sector. Hashes must each be 32 B,
+     already encoded via `sha256_for_card()` (or any 32 B blob).
+ 
+     tpu_sz=0 omits TPU from the layout (legacy 3-payload SD card with v3
+     header still has a TPU slot reserved on disk but unused). When
+-    nonzero, the caller must also supply tpu_hash."""
++    nonzero, the caller must also supply tpu_hash.
++
++    edits_sz=0 omits the mode-'g' edit list; stage2 mode 'g' will refuse
++    to run with edits_sz=0 (`[!] header edits_sz=0`).  No edits_hash is
++    stored on-card — integrity is the internal CRC-32 in edits.bin."""
+     for name, h in (("image", image_hash), ("dtb", dtb_hash),
+                     ("initrd", initrd_hash), ("tpu", tpu_hash)):
+         if len(h) != HASH_LEN:
+             raise ValueError(f"{name}_hash must be {HASH_LEN} B, got {len(h)}")
+     hdr = MAGIC + struct.pack(
+-        "<IIIIIIIIIIII",
++        "<IIIIIIIIIIIIII",
+         image_sz, dtb_sz, initrd_sz,
+         IMG_LBA, DTB_LBA, IRD_LBA,
+         LAYOUT_VERSION,
+         IMG_MAX_SEC, DTB_MAX_SEC, IRD_MAX_SEC,
+         TPU_LBA, tpu_sz,
++        EDITS_LBA, edits_sz,
+     )
+-    # Pad to HASH_OFF with zeros, then append the four hash slots
+-    hdr += b"\x00" * (HASH_OFF - len(hdr))
++    # struct.pack above is exactly 14×u32 = 56 B → ends at offset 64.
++    # If a future field needs zero-pad up to HASH_OFF, restore the pad.
++    assert len(hdr) == HASH_OFF, (
++        f"header pre-hash length {len(hdr)} != HASH_OFF {HASH_OFF}")
+     hdr += image_hash + dtb_hash + initrd_hash + tpu_hash
+     return pad_sector(hdr)
+ 
+@@ -137,6 +155,10 @@ def parse_header(buf: bytes) -> dict:
+         tpu_lba, tpu_sz = struct.unpack("<II", buf[48:56])
+         out["tpu_lba"] = tpu_lba
+         out["tpu_sz"]  = tpu_sz
++    if out["layout_version"] >= 4:
++        edits_lba, edits_sz = struct.unpack("<II", buf[56:64])
++        out["edits_lba"] = edits_lba
++        out["edits_sz"]  = edits_sz
+     # Hash slots only present in layout_version >= 2
+     if out["layout_version"] >= 2 and len(buf) >= HASH_OFF + 3 * HASH_LEN:
+         out["image_hash"]  = bytes(buf[HASH_IMG_OFF:HASH_IMG_OFF + HASH_LEN])
+@@ -162,6 +184,7 @@ def verify_layout(h: dict) -> None:
+         "dtb_max_sec":    DTB_MAX_SEC,
+         "initrd_max_sec": IRD_MAX_SEC,
+         "tpu_lba":        TPU_LBA,
++        "edits_lba":      EDITS_LBA,
+     }
+     for k, v in expected.items():
+         if h[k] != v:
+diff --git a/host/sd_pack.py b/host/sd_pack.py
+index 185564c..bb7f4bb 100644
+--- a/host/sd_pack.py
++++ b/host/sd_pack.py
+@@ -30,6 +30,12 @@ def main():
+                          "for stage2 mode 't' (TPU bitstream verify + "
+                          "EPCS staging). Default: output/tpu.rbf if "
+                          "present, otherwise omit TPU slot.")
++    ap.add_argument("--edits", default=None,
++                    help="Path to edits.bin (built by host/gen_edits.py) "
++                         "to embed at the layout-v4 edits slot for "
++                         "stage2 mode 'g' (Phase 8 LUT mask editor). "
++                         "Default: output/edits.bin if present, otherwise "
++                         "omit edits slot (mode 'g' will refuse).")
+     ap.add_argument("--skip-program", action="store_true")
+     ap.add_argument("--baud", type=int, default=BAUD_CANDIDATES[0],
+                     help=f"target UART baud (default {BAUD_CANDIDATES[0]})")
+@@ -50,6 +56,11 @@ def main():
+         candidate = os.path.join(base, "output", "tpu.rbf")
+         if os.path.exists(candidate):
+             tpu_rbf = candidate
++    edits_p = args.edits
++    if edits_p is None:
++        candidate = os.path.join(base, "output", "edits.bin")
++        if os.path.exists(candidate):
++            edits_p = candidate
+ 
+     with open(kernel, "rb") as f: image_d = f.read()
+     with open(dtb,    "rb") as f: dtb_d = f.read()
+@@ -58,11 +69,16 @@ def main():
+         with open(tpu_rbf, "rb") as f: tpu_d = f.read()
+     else:
+         tpu_d = b""
++    if edits_p:
++        with open(edits_p, "rb") as f: edits_d = f.read()
++    else:
++        edits_d = b""
+ 
+     img_pad = L.pad_sector(image_d)
+     dtb_pad = L.pad_sector(dtb_d)
+     ird_pad = L.pad_sector(ird_d)
+     tpu_pad = L.pad_sector(tpu_d) if tpu_d else b""
++    edits_pad = L.pad_sector(edits_d) if edits_d else b""
+ 
+     # Slot size checks (don't silently overflow the next slot!)
+     checks = [
+@@ -72,9 +88,12 @@ def main():
+     ]
+     if tpu_d:
+         checks.append(("TPU",  len(tpu_pad) // L.SECTOR, L.TPU_MAX_SEC))
++    if edits_d:
++        checks.append(("edits", len(edits_pad) // L.SECTOR, L.EDITS_MAX_SEC))
+     print(f"[0] Image {len(image_d):,}B  DTB {len(dtb_d):,}B  "
+           f"initrd {len(ird_d):,}B"
+-          + (f"  TPU.rbf {len(tpu_d):,}B" if tpu_d else "  TPU=omitted"))
++          + (f"  TPU.rbf {len(tpu_d):,}B" if tpu_d else "  TPU=omitted")
++          + (f"  edits.bin {len(edits_d):,}B" if edits_d else "  edits=omitted"))
+     for name, used, cap in checks:
+         print(f"[0] {name:6s}: {used}/{cap} sectors "
+               f"({100*used/cap:.1f}% of slot)")
+@@ -100,7 +119,8 @@ def main():
+ 
+     header = L.build_header(len(image_d), len(dtb_d), len(ird_d),
+                             img_h, dtb_h, ird_h,
+-                            tpu_sz=len(tpu_d), tpu_hash=tpu_h)
++                            tpu_sz=len(tpu_d), tpu_hash=tpu_h,
++                            edits_sz=len(edits_d))
+ 
+     segments = [
+         (L.HDR_LBA, header),
+@@ -110,6 +130,8 @@ def main():
+     ]
+     if tpu_d:
+         segments.append((L.TPU_LBA, tpu_pad))
++    if edits_d:
++        segments.append((L.EDITS_LBA, edits_pad))
+     total_sec = sum(len(d) // L.SECTOR for _, d in segments)
+     eta = total_sec * 512 * 10 / 115200
+     print(f"[0] Total {total_sec} sectors, UART eta ~{eta:.0f}s")
+diff --git a/host/test_edits_bin.py b/host/test_edits_bin.py
+new file mode 100644
+index 0000000..aac851c
+--- /dev/null
++++ b/host/test_edits_bin.py
+@@ -0,0 +1,235 @@
++#!/usr/bin/env python3
++"""
++test_edits_bin.py — Phase 8 edits.bin round-trip + cross-CRC gate.
++
++Validates that:
++
++  1. gen_edits.pack_edits + gen_edits.parse_edits round-trip byte-for-byte.
++  2. The CRC-32/ISO-HDLC computed by the on-chip C routine
++     (sw/stage2_loader/crc32_iso.c, the exact code stage2 runs in mode_g)
++     matches the host-side Python CRC.  Compiled via gcc → ctypes, so a
++     drift between the two implementations would be caught here at CI
++     time rather than after a Quartus rebuild + JTAG reflash.
++  3. Negative cases mode_g advertises in plan §Phase 8 (bad magic, bad
++     version, CRC bit-flip, truncation) all fail parse_edits.
++  4. The whitelist enforcement in gen_edits matches the on-chip lc_init
++     whitelist (PIN_X × LAB_Y_CE6 × even-N).
++
++The CRC cross-check is the load-bearing piece — Phase 8's integrity gate
++depends on host and chip computing the same value.  Random divergence
++would silently corrupt the trust boundary documented in the plan.
++
++Run:
++  python3 host/test_edits_bin.py
++"""
++import binascii
++import ctypes
++import os
++import struct
++import subprocess
++import sys
++import tempfile
++
++REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.join(REPO, "host"))
++import gen_edits  # noqa: E402
++
++
++def build_crc_so(workdir):
++    src = os.path.join(REPO, "sw", "stage2_loader", "crc32_iso.c")
++    so_path = os.path.join(workdir, "crc32_iso.so")
++    subprocess.run(
++        ["gcc", "-O2", "-fPIC", "-shared", "-Wall",
++         "-I", os.path.dirname(src), src, "-o", so_path],
++        check=True,
++    )
++    lib = ctypes.CDLL(so_path)
++    lib.crc32.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32]
++    lib.crc32.restype = ctypes.c_uint32
++    lib.crc32_two.argtypes = [
++        ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
++        ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint32,
++    ]
++    lib.crc32_two.restype = ctypes.c_uint32
++    return lib
++
++
++def _to_carr(b):
++    return (ctypes.c_uint8 * len(b)).from_buffer_copy(b)
++
++
++def test_round_trip():
++    """pack_edits → parse_edits must yield identical records."""
++    records = [
++        (10,  2, 0, 0x0000),
++        (10,  2, 0, 0xFFFF),
++        (16,  4, 6, 0xABCD),
++        (22, 10, 16, 0x1234),
++        (28, 21, 30, 0xCAFE),
++    ]
++    blob = gen_edits.pack_edits(records)
++    parsed = gen_edits.parse_edits(blob)
++    assert parsed == records, f"round-trip mismatch: {parsed!r} != {records!r}"
++    return len(records)
++
++
++def test_crc_cross(crc_lib):
++    """For the same payload bytes, the on-chip C CRC must equal binascii.crc32.
++
++    Exercises both crc32() (contiguous) and crc32_two() (two-range form,
++    which is what mode_g actually calls on edits.bin)."""
++    failures = []
++
++    # Contiguous form — sanity check that the algorithm matches at all.
++    for payload in [b"", b"A", b"123456789",  # standard test vector
++                    b"\x00" * 1000,
++                    bytes(range(256)) * 3]:
++        py_crc = binascii.crc32(payload) & 0xFFFFFFFF
++        c_crc = crc_lib.crc32(_to_carr(payload), len(payload)) \
++            if payload else crc_lib.crc32(None, 0)
++        if c_crc != py_crc:
++            failures.append(
++                f"crc32(len={len(payload)}): C=0x{c_crc:08x} "
++                f"Py=0x{py_crc:08x}")
++
++    # Standard ISO-HDLC vector — "123456789" → 0xCBF43926.
++    golden = crc_lib.crc32(_to_carr(b"123456789"), 9)
++    if golden != 0xCBF43926:
++        failures.append(
++            f"crc32('123456789') = 0x{golden:08x} != 0xCBF43926 "
++            f"(IEEE 802.3 reference)")
++
++    # Two-range form — this is what mode_g runs on edits.bin.
++    # Concat-equivalence: crc32_two(p1, p2) == crc32(p1||p2).
++    for p1, p2 in [(b"hello", b"world"),
++                   (b"\x04\x00\x00\x00\x02\x00\x00\x00",  # ver=4, n=2
++                    b"\x0a\x00\x02\x00\x00\x00\xcd\xab" * 2),
++                   (b"", b"asymmetric"),
++                   (b"asymmetric", b"")]:
++        py_crc = binascii.crc32(p1 + p2) & 0xFFFFFFFF
++        c_crc = crc_lib.crc32_two(
++            _to_carr(p1) if p1 else None, len(p1),
++            _to_carr(p2) if p2 else None, len(p2),
++        )
++        if c_crc != py_crc:
++            failures.append(
++                f"crc32_two(|{len(p1)}|, |{len(p2)}|): "
++                f"C=0x{c_crc:08x} Py=0x{py_crc:08x}")
++
++    return failures
++
++
++def test_edits_crc_matches_chip(crc_lib):
++    """For a real edits.bin, the on-chip mode_g CRC path
++    (crc32_two over [version|n_records] ∪ [records]) must match the
++    on-disk crc32 field (which gen_edits set via binascii.crc32)."""
++    records = [(10, 4, 0, 0xABCD), (16, 8, 14, 0x5A5A), (22, 11, 28, 0x1234)]
++    blob = gen_edits.pack_edits(records)
++    # Header fields
++    _magic, _ver, n_rec, on_disk_crc = struct.unpack("<IIII", blob[:16])
++    # mode_g recomputes CRC over [version|n_records] then [records].
++    p1 = blob[4:12]                     # version + n_records
++    p2 = blob[16:16 + n_rec * 8]        # records body
++    chip_crc = crc_lib.crc32_two(
++        _to_carr(p1), len(p1),
++        _to_carr(p2), len(p2),
++    )
++    assert chip_crc == on_disk_crc, (
++        f"chip_crc=0x{chip_crc:08x} != on_disk=0x{on_disk_crc:08x} "
++        f"— mode_g would refuse a freshly-generated edits.bin")
++
++
++def test_negative():
++    """Each tampering mode_g advertises in plan §Phase 8 fails parse_edits."""
++    base_records = [(10, 4, 0, 0xABCD), (16, 8, 14, 0x5A5A)]
++    blob = bytearray(gen_edits.pack_edits(base_records))
++    failures = []
++
++    def expect_fail(name, mutated, needle):
++        try:
++            gen_edits.parse_edits(bytes(mutated))
++            failures.append(f"{name}: parse_edits unexpectedly succeeded")
++        except ValueError as e:
++            if needle not in str(e):
++                failures.append(
++                    f"{name}: wrong error message: {e!r} (want '{needle}')")
++
++    bad_magic = bytearray(blob); bad_magic[0] ^= 0x10
++    expect_fail("bad-magic", bad_magic, "bad magic")
++
++    bad_ver = bytearray(blob); bad_ver[4] = 99
++    expect_fail("bad-version", bad_ver, "unsupported version")
++
++    bad_crc = bytearray(blob); bad_crc[20] ^= 0x01  # flip a record byte
++    expect_fail("crc-flip", bad_crc, "CRC32 mismatch")
++
++    short = bytearray(blob[:24])  # claims 2 records, has only 1
++    expect_fail("truncated", short, "truncated")
++
++    too_short = bytearray(blob[:10])
++    expect_fail("under-header", too_short, "too short")
++
++    return failures
++
++
++def test_whitelist():
++    """Out-of-whitelist tuples are rejected before pack."""
++    bad = [
++        ((5, 4, 0, 0), "pin-friendly whitelist"),
++        ((10, 1, 0, 0), "LAB_Y_CE6"),
++        ((10, 15, 0, 0), "LAB_Y_CE6"),  # gap in Y range
++        ((10, 4, 1, 0), "even-N"),
++        ((10, 4, 32, 0), "even-N"),
++    ]
++    failures = []
++    for tup, needle in bad:
++        try:
++            gen_edits.pack_edits([tup])
++            failures.append(f"whitelist: {tup} unexpectedly accepted")
++        except ValueError as e:
++            if needle not in str(e):
++                failures.append(
++                    f"whitelist {tup}: wrong msg: {e!r} (want '{needle}')")
++    return failures
++
++
++def main():
++    with tempfile.TemporaryDirectory(prefix="edits_test_") as wd:
++        crc_lib = build_crc_so(wd)
++
++        n = test_round_trip()
++        print(f"  round-trip  {n}/{n} records preserved")
++
++        crc_fails = test_crc_cross(crc_lib)
++        if crc_fails:
++            print(f"  CRC cross   FAIL ({len(crc_fails)})")
++            for f in crc_fails[:8]:
++                print(f"    {f}")
++        else:
++            print("  CRC cross   on-chip crc32/crc32_two = binascii.crc32")
++
++        test_edits_crc_matches_chip(crc_lib)
++        print("  edits.bin   on-chip crc32_two recomputes to "
++              "gen_edits.pack header CRC")
++
++        neg_fails = test_negative()
++        if neg_fails:
++            print(f"  negative    FAIL ({len(neg_fails)})")
++            for f in neg_fails: print(f"    {f}")
++        else:
++            print("  negative    5/5 corruption cases detected")
++
++        wl_fails = test_whitelist()
++        if wl_fails:
++            print(f"  whitelist   FAIL ({len(wl_fails)})")
++            for f in wl_fails: print(f"    {f}")
++        else:
++            print("  whitelist   5/5 out-of-set tuples rejected")
++
++        if crc_fails or neg_fails or wl_fails:
++            sys.exit(1)
++        print("OK — edits.bin format + on-chip CRC path validated.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/sw/stage2_loader/crc32_iso.c b/sw/stage2_loader/crc32_iso.c
+new file mode 100644
+index 0000000..f639bcf
+--- /dev/null
++++ b/sw/stage2_loader/crc32_iso.c
+@@ -0,0 +1,32 @@
++/* crc32_iso.c — see crc32_iso.h.
++ *
++ * Bit-serial implementation chosen for code size over speed: ~50 B of
++ * machine code, no 1-KB table.  At ~50 MHz the chip processes the
++ * 9492-byte stage2 upload in ~1 ms and a 32-KB edits.bin in ~3 ms —
++ * the table-driven variant would only save sub-millisecond and is
++ * not worth the .rodata.
++ */
++#include "crc32_iso.h"
++
++uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len)
++{
++    for (uint32_t i = 0; i < len; i++) {
++        crc ^= data[i];
++        for (int j = 0; j < 8; j++)
++            crc = (crc >> 1) ^ (0xEDB88320u & -(crc & 1u));
++    }
++    return crc;
++}
++
++uint32_t crc32(const uint8_t *data, uint32_t len)
++{
++    return ~crc32_update(0xFFFFFFFFu, data, len);
++}
++
++uint32_t crc32_two(const uint8_t *p1, uint32_t n1,
++                   const uint8_t *p2, uint32_t n2)
++{
++    uint32_t crc = crc32_update(0xFFFFFFFFu, p1, n1);
++    crc = crc32_update(crc, p2, n2);
++    return ~crc;
++}
+diff --git a/sw/stage2_loader/crc32_iso.h b/sw/stage2_loader/crc32_iso.h
+new file mode 100644
+index 0000000..ffb7733
+--- /dev/null
++++ b/sw/stage2_loader/crc32_iso.h
+@@ -0,0 +1,30 @@
++/* crc32_iso.h — CRC-32/ISO-HDLC (IEEE 802.3) helpers.
++ *
++ * Used by:
++ *   - main.c xmodem upload integrity check (file-level CRC)
++ *   - main.c mode 'g' (Phase 8) edits.bin header CRC, whose payload is
++ *     non-contiguous (skips the on-disk crc32 field) — see crc32_two.
++ *
++ * Parameters: poly 0xEDB88320 (reflected of 0x04C11DB7), init 0xFFFFFFFF,
++ * refin=refout=true, xorout 0xFFFFFFFF.  Matches Python binascii.crc32 so
++ * host-computed CRCs (gen_edits.py) validate byte-identically on chip.
++ */
++#ifndef CRC32_ISO_H
++#define CRC32_ISO_H
++
++#include <stdint.h>
++
++/* Accumulator form — pass `crc` from the previous chunk; for the first
++ * chunk use 0xFFFFFFFFu.  Does NOT apply the final xorout (~). */
++uint32_t crc32_update(uint32_t crc, const uint8_t *data, uint32_t len);
++
++/* One-shot CRC of a single contiguous range. */
++uint32_t crc32(const uint8_t *data, uint32_t len);
++
++/* CRC32 over two non-contiguous ranges, in order p1 then p2.  Required
++ * for the Phase 8 edits.bin gate: the CRC payload is
++ * [version|n_records] ∪ [records], skipping the `crc32` field itself. */
++uint32_t crc32_two(const uint8_t *p1, uint32_t n1,
++                   const uint8_t *p2, uint32_t n2);
++
++#endif /* CRC32_ISO_H */
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 443c172..3089f28 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -15,14 +15,20 @@
+ #include "sd.h"
+ #include "sha256_hw.h"
+ #include "rot_golden.h"   /* baked-in expected hashes (Option A CRTM) */
++#include "lutcodec.h"     /* Phase 7: LUT mask editor */
++#include "crc16.h"        /* Phase 7: RBF frame CRC */
++#include "crc32_iso.h"    /* Phase 8: edits.bin integrity CRC + xmodem CRC */
+ 
+ #define UBOOT_LOAD_ADDR   0x40000000UL
+ #define KERNEL_LOAD_ADDR  0x40000000UL
+ #define DTB_LOAD_ADDR     0x41F00000UL
+ #define INITRD_LOAD_ADDR  0x41F80000UL
+-/* mode_t scratch for TPU.rbf staging — well past kernel end (~1.5 MB)
+- * and far below DTB (0x41F00000). 720 sectors (368,640 B) max. */
++/* mode_t / mode_g scratch for the BASE .rbf — well past kernel end
++ * (~1.5 MB) and far below DTB (0x41F00000). 720 sectors max. */
+ #define TPU_SCRATCH_ADDR  0x41000000UL
++/* mode_g scratch for edits.bin — 1 MB before DTB, 32 KB max
++ * (EDITS_MAX_SEC = 64 sectors per sd_layout.py v4). */
++#define EDITS_SCRATCH_ADDR 0x41E00000UL
+ #define UART_BAUD         115200
+ 
+ #define SOH   0x01
+@@ -35,18 +41,6 @@
+ #define XMODEM_TIMEOUT_MS  3000
+ #define XMODEM_RETRY_MAX   20
+ 
+-/* CRC-32 (IEEE 802.3) for post-transfer integrity check */
+-static uint32_t crc32(const uint8_t *data, uint32_t len)
+-{
+-    uint32_t crc = 0xFFFFFFFF;
+-    for (uint32_t i = 0; i < len; i++) {
+-        crc ^= data[i];
+-        for (int j = 0; j < 8; j++)
+-            crc = (crc >> 1) ^ (0xEDB88320 & -(crc & 1));
+-    }
+-    return ~crc;
+-}
+-
+ static void uart_putc(char c)  { neorv32_uart0_putc(c); }
+ static void uart_puts(const char *s) { while (*s) uart_putc(*s++); }
+ 
+@@ -342,8 +336,8 @@ static void mode_set_baud(void)
+  *   [0..8)   magic
+  *   [8..32)  image_sz, dtb_sz, initrd_sz, image_lba, dtb_lba, initrd_lba
+  *   [32..48) layout_version, image_max_sec, dtb_max_sec, initrd_max_sec
+- *   [48..56) tpu_lba, tpu_sz   (v3+)
+- *   [56..64) reserved (zero)
++ *   [48..56) tpu_lba, tpu_sz       (v3+)
++ *   [56..64) edits_lba, edits_sz   (v4+; was reserved in v3)
+  */
+ struct sd_boot_hdr {
+     char     magic[8];      /* "NEOLNX\0\0" */
+@@ -353,13 +347,14 @@ struct sd_boot_hdr {
+     uint32_t image_lba;     /* usually 1 */
+     uint32_t dtb_lba;
+     uint32_t initrd_lba;
+-    uint32_t layout_version; /* 3 = TPU.rbf slot present */
++    uint32_t layout_version; /* 3 = TPU slot; 4 = + edits.bin slot */
+     uint32_t image_max_sec;
+     uint32_t dtb_max_sec;
+     uint32_t initrd_max_sec;
+     uint32_t tpu_lba;       /* v3: usually 8009 */
+     uint32_t tpu_sz;        /* v3: bytes (368,011 for EP4CE6 RBF) */
+-    uint32_t reserved[2];   /* zero-pad to 64 B */
++    uint32_t edits_lba;     /* v4: usually 8729 */
++    uint32_t edits_sz;      /* v4: bytes; 0 = no edit list */
+ };
+ 
+ static void __attribute__((noreturn)) jump_to_kernel(void)
+@@ -580,6 +575,228 @@ static void mode_tpu_verify(void)
+     while (1) {}
+ }
+ 
++/* Mode 'g' (Phase 8 — Track B: on-chip LUT mask editor).
++ *
++ * Steps (per docs/plan.md §Phase 8):
++ *   1.  Read base.rbf from SD slot (TPU slot, h->tpu_lba) into SDRAM.
++ *   2.  Read edits.bin from SD slot (h->edits_lba) into SDRAM.
++ *   2a. Integrity-gate edits.bin: magic + version + CRC-32 (the gate
++ *       documented in plan §Phase 8 — closes the "frame-CRC repair
++ *       legitimises corrupted edit" hole).
++ *   3.  SHA-256 verify base.rbf vs rot_golden_tpu_bitstream (same baked
++ *       golden mode_t uses — base for mode_g IS the canonical TPU.rbf).
++ *   5.  For each record: lut_apply_with_canon + dirty-frame marking.
++ *   6.  lc_patch_rbf_crc_frames — only dirty frames.
++ *   7.  SHA-256 of the resulting RBF → print to UART (informational;
++ *       no golden compare — the output is design-time-unknown).
++ *   8–10. EPCS write + read-back verify + ALTREMOTE_UPDATE reconfig —
++ *       NOT in this phase (Phases 2-4 not yet on silicon).  Halts here.
++ *
++ * Step 4 (pre-erase EPCS hash check) lands with Phase 3.
++ */
++
++/* Header laid down by host/gen_edits.py.  Field order MUST mirror
++ * pack_edits() in host/gen_edits.py. */
++struct edits_hdr {
++    uint32_t magic;       /* 0x54494445 ('EDIT' written big-endian on wire) */
++    uint32_t version;     /* 1 */
++    uint32_t n_records;
++    uint32_t crc32;       /* CRC-32/ISO-HDLC over [version|n_records|records] */
++};
++
++struct edit_rec {
++    uint16_t x;
++    uint16_t y;
++    uint16_t n;
++    uint16_t mask;
++};
++
++#define EDITS_MAGIC    0x54494445u  /* little-endian u32 of 'E','D','I','T' */
++#define EDITS_VERSION  1u
++
++/* Re-derived from CRC_NUM_CRAM_FRAMES — 217 B for 1727 frames.
++ * Static (not stack) because the stack lives in DMEM (8 KB) and we
++ * don't want to chew a quarter of it on the dirty bitmap. */
++static uint8_t mode_g_dirty[CRC_DIRTY_BITMAP_BYTES];
++
++static void mode_generate(void)
++{
++    uart_puts("[stage2] Mode: generate (Phase 8 — LUT mask editor)\r\n");
++
++    extern int sd_init(void);
++    extern int sd_read_block(uint32_t lba, uint8_t *dst);
++    extern int sd_read_many(uint32_t lba, uint32_t n, uint8_t *dst);
++
++    if (sd_init()) { uart_puts("[sd] init FAIL\r\n"); while (1) {} }
++
++    static uint8_t hdr_buf[512];
++    if (sd_read_block(0, hdr_buf)) {
++        uart_puts("[sd] read hdr FAIL\r\n"); while (1) {}
++    }
++
++    /* Magic + layout version */
++    const char magic[8] = { 'N','E','O','L','N','X','\0','\0' };
++    for (int i = 0; i < 8; i++) {
++        if (hdr_buf[i] != (uint8_t)magic[i]) {
++            uart_puts("[sd] bad magic\r\n"); while (1) {}
++        }
++    }
++    struct sd_boot_hdr *h = (struct sd_boot_hdr *)hdr_buf;
++    if (h->layout_version < 4) {
++        uart_puts("[!] layout_version="); uart_puthex32(h->layout_version);
++        uart_puts(" < 4 — re-pack SD with sd_pack.py from "
++                  "neorv32_rot v4+ to get edits.bin slot\r\n");
++        while (1) {}
++    }
++    if (h->tpu_sz == 0) {
++        uart_puts("[!] header tpu_sz=0 — base .rbf slot empty\r\n");
++        while (1) {}
++    }
++    if (h->edits_sz == 0) {
++        uart_puts("[!] header edits_sz=0 — SD packed without --edits;"
++                  " re-pack with host/gen_edits.py output\r\n");
++        while (1) {}
++    }
++    if (h->edits_sz < sizeof(struct edits_hdr)) {
++        uart_puts("[!] edits_sz="); uart_puthex32(h->edits_sz);
++        uart_puts(" < edits_hdr — corrupt header field\r\n");
++        while (1) {}
++    }
++
++    uart_puts("[sd] tpu_lba=");   uart_puthex32(h->tpu_lba);
++    uart_puts(" tpu_sz=");        uart_puthex32(h->tpu_sz);
++    uart_puts(" edits_lba=");     uart_puthex32(h->edits_lba);
++    uart_puts(" edits_sz=");      uart_puthex32(h->edits_sz);
++    uart_puts("\r\n");
++
++    /* === Step 1: read base.rbf into SDRAM === */
++    uint32_t tpu_blks = (h->tpu_sz + 511) / 512;
++    uart_puts("[sd] reading base.rbf\r\n");
++    if (sd_read_many(h->tpu_lba, tpu_blks, (uint8_t *)TPU_SCRATCH_ADDR)) {
++        uart_puts("[!] SD read FAIL lba="); uart_puthex32(h->tpu_lba);
++        uart_puts("\r\n"); while (1) {}
++    }
++
++    /* === Step 2: read edits.bin into SDRAM === */
++    uint32_t edits_blks = (h->edits_sz + 511) / 512;
++    uart_puts("[sd] reading edits.bin\r\n");
++    if (sd_read_many(h->edits_lba, edits_blks,
++                     (uint8_t *)EDITS_SCRATCH_ADDR)) {
++        uart_puts("[!] SD read FAIL lba="); uart_puthex32(h->edits_lba);
++        uart_puts("\r\n"); while (1) {}
++    }
++
++    /* === Step 2a: integrity gate on edits.bin === */
++    const struct edits_hdr *eh =
++        (const struct edits_hdr *)EDITS_SCRATCH_ADDR;
++    if (eh->magic != EDITS_MAGIC) {
++        uart_puts("[!] edits.bin bad magic=");
++        uart_puthex32(eh->magic);
++        uart_puts(" expected="); uart_puthex32(EDITS_MAGIC);
++        uart_puts("\r\n"); while (1) {}
++    }
++    if (eh->version != EDITS_VERSION) {
++        uart_puts("[!] edits.bin version="); uart_puthex32(eh->version);
++        uart_puts(" unsupported (want "); uart_puthex32(EDITS_VERSION);
++        uart_puts(")\r\n"); while (1) {}
++    }
++    /* CRC covers [version | n_records | records] — magic is excluded so a
++     * partial read of the first 4 bytes can't pass the gate by luck. */
++    uint32_t need = sizeof(struct edits_hdr)
++                  + (uint32_t)eh->n_records * sizeof(struct edit_rec);
++    if (need > h->edits_sz) {
++        uart_puts("[!] edits.bin truncated: need="); uart_puthex32(need);
++        uart_puts(" have="); uart_puthex32(h->edits_sz);
++        uart_puts("\r\n"); while (1) {}
++    }
++    /* CRC payload = [version | n_records] (offsets 4..12, 8 B)
++     *             ∪ [records]            (offsets 16..16+8N).
++     * The `crc32` field at offset 12 is the gap — including it in the
++     * payload would be self-referential. */
++    const uint8_t *eb = (const uint8_t *)EDITS_SCRATCH_ADDR;
++    uint32_t records_bytes = (uint32_t)eh->n_records
++                           * (uint32_t)sizeof(struct edit_rec);
++    uint32_t got_crc = crc32_two(eb + 4, 8,
++                                 eb + sizeof(struct edits_hdr),
++                                 records_bytes);
++    if (got_crc != eh->crc32) {
++        uart_puts("[!] edits.bin CRC FAIL computed=");
++        uart_puthex32(got_crc);
++        uart_puts(" expected="); uart_puthex32(eh->crc32);
++        uart_puts(" — refusing to apply\r\n");
++        while (1) {}
++    }
++    uart_puts("[rot] edits.bin CRC OK n_records=");
++    uart_puthex32(eh->n_records); uart_puts("\r\n");
++
++    /* === Step 3: SHA-256 base.rbf vs baked golden === */
++    {
++        uint32_t H[8];
++        sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H);
++        uart_puts("[rot] base sha256=");
++        for (int i = 0; i < 8; i++) uart_puthex32(H[i]);
++        int match = 1;
++        for (int i = 0; i < 8; i++)
++            if (H[i] != rot_golden_tpu_bitstream[i]) { match = 0; break; }
++        if (!match) {
++            uart_puts(" [MISMATCH] golden=");
++            for (int i = 0; i < 8; i++)
++                uart_puthex32(rot_golden_tpu_bitstream[i]);
++            uart_puts("\r\n[!] base SHA mismatch — refusing EPCS write\r\n");
++            while (1) {}
++        }
++        uart_puts(" [OK]\r\n");
++    }
++
++    /* === Step 5: apply edits === */
++    for (uint32_t b = 0; b < sizeof(mode_g_dirty); b++) mode_g_dirty[b] = 0;
++    const struct edit_rec *recs =
++        (const struct edit_rec *)((const uint8_t *)EDITS_SCRATCH_ADDR
++                                  + sizeof(struct edits_hdr));
++    uint8_t *rbf = (uint8_t *)TPU_SCRATCH_ADDR;
++    uint32_t applied = 0;
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        lc_status_t st = lut_apply_with_canon(rbf,
++                                              recs[i].x, recs[i].y,
++                                              recs[i].n, recs[i].mask,
++                                              mode_g_dirty);
++        if (st != LC_OK) {
++            uart_puts("[!] edit#"); uart_puthex32(i);
++            uart_puts(" (x="); uart_puthex32(recs[i].x);
++            uart_puts(",y="); uart_puthex32(recs[i].y);
++            uart_puts(",n="); uart_puthex32(recs[i].n);
++            uart_puts(") rejected by lc_init status=");
++            uart_puthex32((uint32_t)st);
++            uart_puts(" — re-pin to clean column / fix manifest\r\n");
++            while (1) {}
++        }
++        applied++;
++    }
++    uart_puts("[rot] applied "); uart_puthex32(applied);
++    uart_puts(" edits\r\n");
++
++    /* === Step 6: per-frame CRC repair over the dirty set === */
++    lc_patch_rbf_crc_frames(rbf, mode_g_dirty);
++    uart_puts("[rot] CRC patched (dirty frames only)\r\n");
++
++    /* === Step 7: SHA-256 of result (informational, no golden compare) === */
++    {
++        uint32_t H[8];
++        sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H);
++        uart_puts("[rot] result sha256=");
++        for (int i = 0; i < 8; i++) uart_puthex32(H[i]);
++        uart_puts("\r\n");
++    }
++
++    /* === Steps 8-10: EPCS write + verify + ALTREMOTE_UPDATE === */
++    uart_puts("[rot] Phase 8 software path complete — "
++              "generated bitstream ready in SDRAM at ");
++    uart_puthex32(TPU_SCRATCH_ADDR);
++    uart_puts(".\r\n[rot] Phases 2-4 (EPCS write + ALTREMOTE_UPDATE) "
++              "not implemented yet; halting before any EPCS touch.\r\n");
++    while (1) {}
++}
++
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+ static void mode_linux(void)
+ {
+@@ -699,7 +916,7 @@ int main(void)
+      * ROM to fall back to, so we must NOT drop into mode_uboot on timeout.
+      * Sit forever waiting for a host byte — same idle behavior as the
+      * re-prompt loop. */
+-    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify\r\n");
++    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf\r\n");
+     uart_puts("[stage2] CRTM locked — waiting for host command\r\n");
+     int mode;
+     while ((mode = uart_getc_timeout(3600000)) < 0) { }
+@@ -726,6 +943,8 @@ int main(void)
+             mode_set_baud();
+         } else if (mode == 't') {
+             mode_tpu_verify();         /* Phase 1: SD-side TPU SHA verify, halts */
++        } else if (mode == 'g') {
++            mode_generate();           /* Phase 8: LUT mask editor, halts pre-EPCS */
+         } else {
+             uart_puts("[!] unknown mode byte — ignored\r\n");
+         }
+-- 
+2.43.0
+
