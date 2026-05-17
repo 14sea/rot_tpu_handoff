@@ -1,0 +1,67 @@
+From dcb446d788d79b05839094baadd890ce76119a05 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 13:47:12 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20NH1:=20epcs.c=20wait=5Fnot=5Fbusy?=
+ =?UTF-8?q?=20=E2=80=94=20two-phase=20wait=20dodges=201-cycle=20race?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+epcs_ctrl.v (qmegawiz altasmi_parallel) has 1-cycle register latency
+from CTRL.{read,write,wren,sec_erase,rd_status} input to busy_wire
+assertion (read_reg → read_wire → do_read → busy_wire combinational
+chain).  If NEORV32 issues the subsequent STATUS poll's bus_stb at
+the cycle immediately after the CTRL store completes, the wrapper
+samples am_busy=0 (stale) and wait_not_busy() returns immediately —
+firmware then pulses shift_bytes before the megafunction has actually
+entered the operation, the pulse is lost, and the subsequent
+wait_data_valid() hangs forever.  This is the leading NH1 hypothesis
+for the deterministic mode 'P' hang (2/2 byte-identical 340 B
+captures, hang location wait_data_valid).
+
+Fix: add a bounded busy-rise spin (cap at 64 iters so degenerate-fast
+operations don't hang us if busy came and went) before the busy-fall
+wait.  Drop-in change — all wait_not_busy() callsites benefit
+(epcs_read pre-amble, epcs_read post-deassert, epcs_read_status,
+epcs_erase_sector pre/post, epcs_program_page pre/post + per-byte).
+
+Size: 14460 → 14480 B (+20 B).  Cross-tests still green (lutcodec
+127/127, edits.bin 5/5).  HW validation pending — listener-first
+flash of neorv32_demo.rbf + neorv32_imem_image rebuild, then 'P'.
+
+If mode 'P' works post-fix → NH1 confirmed.  If still hangs → NH1
+refuted, move to NH2 (rublock-vs-asmiblock device-arch contention)
+or NH3 (JTAG-volatile vs EPCS-cold-boot pin state).
+---
+ sw/stage2_loader/epcs.c | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/sw/stage2_loader/epcs.c b/sw/stage2_loader/epcs.c
+index c0b7fad..0625fcd 100644
+--- a/sw/stage2_loader/epcs.c
++++ b/sw/stage2_loader/epcs.c
+@@ -61,6 +61,21 @@ static inline uint32_t am_status(void) { return *WB_AM_STATUS; }
+ 
+ static inline void wait_not_busy(void)
+ {
++    /* Two-phase wait to dodge a 1-cycle race window in altasmi_parallel.
++     * The megafunction has 1-cycle register latency from CTRL.read (or
++     * write/wren/sec_erase/rd_status) input to busy_wire assertion
++     * (epcs_ctrl.v `read_reg` → `read_wire` → `do_read` → `busy_wire`).
++     * If NEORV32 issues this STATUS poll's bus_stb at the cycle
++     * immediately after the CTRL store completes, the wrapper samples
++     * am_busy=0 (stale) and we'd skip the wait entirely — corrupting
++     * the subsequent shift_bytes pulse because the megafunction hasn't
++     * actually entered the operation yet.  First-phase: bounded spin
++     * for busy-rise (cap at 64 iters so degenerate-fast operations
++     * don't hang us if busy already came and went).  Second-phase:
++     * wait for busy-fall as before. */
++    for (int i = 0; i < 64; i++) {
++        if (am_status() & STATUS_BUSY) break;
++    }
+     while (am_status() & STATUS_BUSY) { }
+ }
+ 
+-- 
+2.43.0
+
