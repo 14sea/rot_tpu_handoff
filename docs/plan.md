@@ -193,18 +193,27 @@ silently drops write-side ports in Lite Edition.
 
 **Effort**: 6–8 h.
 
-**Phase 3 HW status (2026-05-17 evening — INCONCLUSIVE)** — firmware
-shipped in patch 0008 (epcs.c: `epcs_read`, `epcs_read_status`,
+**Phase 3 HW status (2026-05-17 evening — INCONCLUSIVE; root cause
+identified 2026-05-17 night via static audit)** — firmware shipped in
+patch 0008 (epcs.c: `epcs_read`, `epcs_read_status`,
 `epcs_erase_sector`, `epcs_program_page` + mode 'P' diagnostic).
 Cross-tests green (test_lutcodec_c 127/127, test_edits_bin 5/5).
-HW verification attempted tonight via mode 'P' but **the experiment
-did not produce controlled data** (see Phase 4 §"2026-05-17 evening
-test — what happened and what we cannot conclude").  Two observations
-stand: (a) on the bitstream tested tonight, no autonomous reconfig
-was seen in the 7 s post-stage2-banner window; (b) `'P'` (mode 'P')
-hangs in `wait_data_valid()` on that same bitstream.  Neither
-observation has a proven cause yet.  Mode 'P' silicon validation
-remains open.
+HW verification attempted via mode 'P' but the experiment did not
+produce controlled data (see Phase 4 §"2026-05-17 evening test").
+
+**Mode 'P' hang root cause (2026-05-17 night static audit — confirmed
+empirically)**: NOT a firmware bug.  Five-candidate static-grep
+checklist ([[reference-rublock-complexity]]) found firmware A1-A4
+clean (CTRL/STATUS bit maps match, shift_bytes pulse 1-cycle wide,
+flag_data_valid handshake correct).  A5 found a megafunction-
+generation hole: `epcs_ctrl.v` was generated without
+`PORT_ASMI_ACCESS_GRANTED="PORT_USED"`, so altasmi has no protocol
+to negotiate AS-pin access with the config controller in REMOTE
+mode.  Empirically confirmed by **4× Critical Warning 169123** in
+`neorv32_demo.fit.rpt:2349-2352` (Quartus ignored altasmi's reserve-
+pin requests for DCLK / nCSO / ASDO / DATA0 because REMOTE mode owns
+them).  Mode 'P' validation is blocked on Phase 4 megafunction
+regen, not on any firmware change.  epcs.c is verified ready.
 
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
@@ -280,10 +289,22 @@ and is informational about precedence, not a rejection.
   recovered.  So "stable for 30 s" is solid but stability beyond 30 s
   is not verified.
 
-**Recovery path** (estimated 4–8 h vs original 2–3 h):
+**Recovery path** (estimated 4–8 h vs original 2–3 h; scope expanded
+2026-05-17 night to include altasmi regen after A5 audit):
 1. Re-run `qmegawiz` on `altremote_update` for Cyclone IV E REMOTE
    mode with **"Add support for writing configuration parameters"**
    explicitly enabled (it's a wizard checkbox; ALSE app note p. 3).
+   Confirm `asmi_access` output port appears in generated `.v`.
+1a. **Re-run `qmegawiz` on `altasmi_parallel` (`epcs_ctrl.v`)** with
+   `PORT_ASMI_ACCESS_GRANTED="PORT_USED"` (also
+   `PORT_ASMI_ACCESS_REQUEST="PORT_USED"` if exposed by wizard).
+   This adds the input pin altasmi needs to participate in pin
+   arbitration with the config controller in REMOTE mode.  Without
+   this, fit.rpt emits 4× Critical Warning 169123 for the dedicated
+   AS pins (DCLK/nCSO/ASDO/DATA0) and altasmi's internal SCK toggle
+   never reaches physical pins → mode 'P' `wait_data_valid()` hangs.
+   See [[reference-rublock-complexity]] §"A5 audit" for the
+   confirming fit.rpt evidence on head `0fc9641`.
 2. Rewrite `rtl/wb_altremote_update.v` as a Wishbone wrapper around the
    megafunction (not the primitive).  Expose registers for `param[2:0]`,
    `data_in[21:0]`, `read_source[1:0]`, plus trigger bits for
@@ -291,6 +312,12 @@ and is informational about precedence, not a rejection.
    delta is small: megafunction adds ~83 LCs over the bare primitive,
    our current ~189 LC wrapper would be replaced with a thinner one
    around the megafunction.
+2a. Update `rtl/wb_altasmi_parallel.v` to wire the regenerated
+   altasmi's `asmi_access_granted` input from altremote_update's
+   `asmi_access` output (top-level signal or a shared bus in
+   `neorv32_test_setup_bootloader.vhd`).  After regen verify
+   `neorv32_demo.fit.rpt` for Critical Warning 169123 — **0
+   occurrences is the success criterion** for this sub-step.
 3. `epcs.c` adds `epcs_remote_reconfig(page, ap_sel)` following the
    ALSE sequence: (a) write reg #4 = boot page byte address (caveat:
    may need to be the un-divided address per the Cyclone 10 LP note,
