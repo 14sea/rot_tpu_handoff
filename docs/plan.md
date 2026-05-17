@@ -756,12 +756,51 @@ Findings:
   authorization)
 
 **Carryover for follow-up work (after Phase 4)**:
-- (a) Firmware: pulse CTRL_RESET before each FAST_READ to reset
-  read_add_cntr.  Untested but simplest fix candidate.
+- ~~(a) Firmware: pulse CTRL_RESET before each FAST_READ to reset
+  read_add_cntr.  Untested but simplest fix candidate.~~ **TRIED via
+  NH13 — REFUTED.**  See "NH13 + NH14 — Phase 3 deeper than reset"
+  below.
 - (b) Wrapper: auto-issue megafunction reset between FAST_READs
   (edge-detect ctrl_fast_read rising → pulse am_reset_in 1 cycle).
+  Likely also insufficient given NH14 finding.
 - (c) SDC constraints to meet timing — deepest rework; might lift
   the entire metastability class of bugs.
+- (d) NEW: SHIFT_BYTES ↔ data_valid handshake redesign in the wrapper
+  + addr → pre-amble verification in the megafunction interface.
+  Phase 9-class scope.
+
+**NH13 + NH14 — Phase 3 deeper than "missing reset pulse"** (2026-05-17
+night, patches 0020 + 0021):
+
+NH13 attempted the (a) candidate: ctrl_reset stretched to 16 sysclk
+cycles in the wrapper (was 1-cycle, well below the 250 ns megafunction
+spec — patch 0020) + firmware DC_RESET pulse before each FAST_READ
+in mode_epcs_probe Phase C/D (patch 0021).  HW test (bitstream
+`c58d5239`, capture `a843ddc3`): intra-boot Phase C addr=0 bytes vs
+D1 addr=0 bytes STILL DIFFER.  Cross-bitstream variance also persists.
+**NH13 alone refuted as Phase 3 root cause.**
+
+NH14 (also in patch 0021) added MMIO 0x18 RADDR probe.  Findings on
+bitstream `5e9e0b2c` / capture `646e1719`:
+- POR RADDR=0 (clean).
+- DC_RESET pulse correctly resets RADDR to 0 between ops — **NH13
+  stretcher works as designed**, just doesn't fix the visible symptom.
+- `*DP_ADDR` writes (0, 0x100000, 0x10) do **NOT** update RADDR.
+  The addr_reg → read_address linkage is broken at the megafunction
+  interface, OR addr is only sampled at the fast_read assertion edge.
+- Phase C 4-byte read advances RADDR by 0x81E85 = 532613 — the
+  megafunction streams flash continuously while am_rden=1; SHIFT_BYTES
+  pulses latch one byte at the *current stream position*, which is
+  non-deterministic w.r.t. the requested address.
+
+**Conclusion**: Phase 3 content-read accuracy requires a wrapper
+SHIFT_BYTES ↔ data_valid handshake redesign + addr → pre-amble
+verification.  Phase 9-class effort, not a "missing one pulse"
+correction.  NH13/NH14 land as defensive (stretcher is spec-correct)
++ diagnostic baseline.  Blank-flash detect (D0 addr=0x100000 →
+ff/ff/ff/ff 3/3) STILL works correctly across NH13 and NH14 — the
+"is this slot blank?" question is silicon-OK; only "what bytes are
+at this address?" is unreliable.
 - diag_mode_p_test.py listener cleanup race FIXED 2026-05-17 night
   (`Listener.stop()` sets flag only; new `close()` called after join).
 - diag_mode_p_test.py classify() should add NH10 verdict to
