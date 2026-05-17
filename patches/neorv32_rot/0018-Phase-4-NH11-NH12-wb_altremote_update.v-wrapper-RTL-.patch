@@ -1,0 +1,131 @@
+From 211f501b959f5c936b0e8818b0f4d783d974c02c Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 20:16:28 +0100
+Subject: [PATCH 18/19] Phase 4 NH11+NH12: wb_altremote_update.v wrapper RTL
+ fixes for silicon
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes Phase 4 on AX301 silicon (bitstream md5 60094abc).
+
+The original Phase 2 direct-primitive wrapper synthesized cleanly but
+the FSM never actually drove rconfig on a SHIFT_IN_AND_RECONFIG command.
+Two cooperating defects, found by listener-first silicon test:
+
+NH11 — rconfig pulse held HIGH for 1 sysclk cycle (~20 ns @ 50 MHz).
+Cyclone IV E rublock spec requires ≥250 ns pulse width.  Fix: hold
+S_RECONFIG for 16 cycles (320 ns) using the existing bit_cnt register
+as a hold counter — no new resources.  This alone was insufficient (see
+NH12); kept defensively + spec-correct.
+
+NH12 — the bus block clears trig_shift_in / trig_reconfig one cycle
+after CMD write, but S_LOAD_POST tested them ~31 cycles later (post-
+shift) and always saw 0 → fell through to S_DONE instead of S_RECONFIG.
+SHIFT_IN_AND_RECONFIG (CMD.b0) never actually fired rconfig.
+
+Fix: add auto_reconfig flop latched at S_IDLE entry when trig_shift_in
+fires, consumed in S_LOAD_POST.  Survives the SHIFT_IN window.  +1
+register, ~+4 LE; module total 138 reg / 171 LE.
+
+Silicon verification (bitstream md5 60094abc, capture md5 613db17a):
+listener-first JTAG-volatile load, stage2 boots normally + dispatcher
+reached + 'r' command accepted + factory ALINX 2010-3-17 14:19:0 banner
+appears immediately after [rot] altremote trigger line.  Factory ALINX
+then runs stably with periodic timestamps for the rest of the capture.
+No WD-suicide observed across stage2 idle window (~4 s).
+
+Per separate-commits discipline: RTL fix is one commit, firmware
+integration is a follow-up.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ rtl/wb_altremote_update.v | 41 ++++++++++++++++++++++++++++++---------
+ 1 file changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/rtl/wb_altremote_update.v b/rtl/wb_altremote_update.v
+index 32c8564..51bbd61 100644
+--- a/rtl/wb_altremote_update.v
++++ b/rtl/wb_altremote_update.v
+@@ -112,6 +112,13 @@ module wb_altremote_update (
+     reg trig_reconfig;
+     reg trig_rsttimer;
+ 
++    // NH12 (2026-05-17 silicon): the bus block clears trig_* one cycle
++    // after CMD write, but S_LOAD_POST reads them ~31 cycles later — so
++    // SHIFT_IN_AND_RECONFIG never actually pulsed rconfig.  This flop
++    // latches the "auto-fire reconfig after shift" intent at S_IDLE
++    // entry so it survives the SHIFT_IN window.
++    reg auto_reconfig;
++
+     always @(posedge clk or negedge rst_n) begin
+         if (!rst_n) begin
+             state           <= S_IDLE;
+@@ -119,6 +126,7 @@ module wb_altremote_update (
+             shift_buf       <= 29'd0;
+             capture_reg     <= 29'd0;
+             done_sticky     <= 1'b0;
++            auto_reconfig   <= 1'b0;
+             ru_shiftnld     <= 1'b0;
+             ru_captnupdt    <= 1'b0;
+             ru_regin        <= 1'b0;
+@@ -139,11 +147,16 @@ module wb_altremote_update (
+                 S_IDLE: begin
+                     bit_cnt <= 5'd0;
+                     if (trig_shift_in) begin
+-                        shift_buf <= data_reg;
+-                        state <= S_LOAD_PRE;
++                        shift_buf     <= data_reg;
++                        // NH12: latch the "fire reconfig after shift" intent.
++                        // CMD.b0 alone is documented as SHIFT_IN_AND_RECONFIG,
++                        // so this is unconditional in the shift_in branch.
++                        auto_reconfig <= 1'b1;
++                        state         <= S_LOAD_PRE;
+                     end else if (trig_shift_out) begin
+                         state <= S_CAP_PRE;
+                     end else if (trig_reconfig) begin
++                        auto_reconfig <= 1'b0;
+                         state <= S_RECONFIG;
+                     end else if (trig_rsttimer) begin
+                         state <= S_TIMER_RST;
+@@ -174,20 +187,30 @@ module wb_altremote_update (
+                     // shiftnld=0, capt=0 → register loaded into PGM_SEL
+                     ru_shiftnld  <= 1'b0;
+                     ru_captnupdt <= 1'b0;
+-                    if (trig_reconfig || trig_shift_in) begin
+-                        // SHIFT_IN_AND_RECONFIG path: trigger reconfig now
+-                        state <= S_RECONFIG;
++                    // NH12: use the latched intent instead of the
++                    // long-since-cleared bus-side trig_* signals.
++                    if (auto_reconfig) begin
++                        auto_reconfig <= 1'b0;
++                        state         <= S_RECONFIG;
+                     end else begin
+                         state <= S_DONE;
+                     end
+                 end
+ 
+                 S_RECONFIG: begin
++                    // NH11 (2026-05-17 silicon): the original 1-cycle pulse
++                    // (~20 ns @ 50 MHz) is below the Cyclone IV E rublock
++                    // rconfig min pulse width (~250 ns).  Hold HIGH for 16
++                    // sysclk cycles = 320 ns to clear the spec with margin.
++                    // bit_cnt is already 0 when we enter this state via
++                    // either S_LOAD_POST or S_IDLE (RECONFIG_ONLY path).
+                     ru_rconfig <= 1'b1;
+-                    // Point of no return — FPGA will reload from new page
+-                    // within ~150 ms.  Stay here; the design will be
+-                    // re-initialized before we get to S_DONE.
+-                    state <= S_DONE;
++                    if (bit_cnt == 5'd15) begin
++                        bit_cnt <= 5'd0;
++                        state   <= S_DONE;
++                    end else begin
++                        bit_cnt <= bit_cnt + 5'd1;
++                    end
+                 end
+ 
+                 S_CAP_PRE: begin
+-- 
+2.43.0
+

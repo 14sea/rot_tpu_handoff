@@ -1,0 +1,182 @@
+From 3ce00efa83371f656e223d368636293b283608c7 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 20:16:42 +0100
+Subject: [PATCH 19/19] Phase 4 firmware: epcs_remote_reconfig + mode 'r' +
+ mode 'g' tail
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the user-facing firmware glue for the now-functional
+wb_altremote_update wrapper (see prior commit for the RTL fixes
+that made S_RECONFIG actually reachable).
+
+New compilation unit remote_update.{h,c}:
+- epcs_remote_reconfig(pgm_sel) (noreturn): drain UART TX FIFO,
+  write 29-bit payload to wrapper DATA reg (PGM_SEL[23:0]=pgm_sel,
+  WD_EN=0, AP_CONFIG_SEL=0), trigger SHIFT_IN_AND_RECONFIG.
+- 29-bit shift-register layout documented per Cyclone IV Handbook
+  Vol 1 Ch 8.
+
+main.c integration:
+- New mode 'r' (standalone, no SD card needed): print mode banner +
+  trigger line, call epcs_remote_reconfig(0) to boot factory ALINX
+  from EPCS page 0.
+- mode_generate (Phase 8) tail now calls epcs_remote_reconfig(0)
+  instead of halting — closes the loop on the altremote pipeline
+  end-to-end.  Multi-slot rotation deferred to Phase 9.
+- Dispatcher menu updated: r=reconfig.
+
+Stage2 ELF: 17148 → 17424 B (+276 B for the new function + strings).
+IMEM 32 KB has plenty of headroom (54% used).
+
+Silicon-verified on bitstream md5 60094abc — UART capture
+diag_phase4_nh12_reconfig_ok.log shows stage2 boot → dispatcher → 'r'
+trigger → factory ALINX banner appearing on the wire.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c          | 22 ++++++++++++++---
+ sw/stage2_loader/remote_update.c | 26 ++++++++++++++++++++
+ sw/stage2_loader/remote_update.h | 42 ++++++++++++++++++++++++++++++++
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+ create mode 100644 sw/stage2_loader/remote_update.c
+ create mode 100644 sw/stage2_loader/remote_update.h
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 54132ef..76f822a 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -19,6 +19,7 @@
+ #include "crc16.h"        /* Phase 7: RBF frame CRC */
+ #include "crc32_iso.h"    /* Phase 8: edits.bin integrity CRC + xmodem CRC */
+ #include "epcs.h"         /* Phase 3: EPCS16 driver via wb_altasmi_parallel */
++#include "remote_update.h" /* Phase 4: EPCS remote-update via wb_altremote_update */
+ 
+ #define UBOOT_LOAD_ADDR   0x40000000UL
+ #define KERNEL_LOAD_ADDR  0x40000000UL
+@@ -1260,9 +1261,15 @@ static void mode_generate(void)
+     uart_puts("[rot] Phase 8 software path complete — "
+               "generated bitstream ready in SDRAM at ");
+     uart_puthex32(TPU_SCRATCH_ADDR);
+-    uart_puts(".\r\n[rot] Phases 2-4 (EPCS write + ALTREMOTE_UPDATE) "
+-              "not implemented yet; halting before any EPCS touch.\r\n");
+-    while (1) {}
++    uart_puts(".\r\n[rot] Phase 2-3 EPCS write/verify not yet wired into "
++              "mode 'g' tail; proceeding directly to Phase 4 remote reconfig.\r\n");
++
++    /* Phase 4: trigger remote-update reconfig to EPCS page 0 (factory
++     * ALINX).  In production this slot would be the freshly-written RoT
++     * page; here we close the loop on the altremote path itself. */
++    uart_puts("[rot] altremote: pgm_sel=0x000000 WD_EN=0 AP_CONFIG_SEL=0 — "
++              "triggering reconfig\r\n");
++    epcs_remote_reconfig(0);
+ }
+ 
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+@@ -1384,7 +1391,7 @@ int main(void)
+      * ROM to fall back to, so we must NOT drop into mode_uboot on timeout.
+      * Sit forever waiting for a host byte — same idle behavior as the
+      * re-prompt loop. */
+-    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe\r\n");
++    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe r=reconfig\r\n");
+     uart_puts("[stage2] CRTM locked — waiting for host command\r\n");
+     int mode;
+     while ((mode = uart_getc_timeout(3600000)) < 0) { }
+@@ -1415,6 +1422,13 @@ int main(void)
+             mode_generate();           /* Phase 8: LUT mask editor, halts pre-EPCS */
+         } else if (mode == 'P') {
+             mode_epcs_probe();         /* Phase 3: EPCS driver diagnostic */
++        } else if (mode == 'r') {
++            /* Phase 4: standalone remote-reconfig test (no SD needed). */
++            uart_puts("[stage2] Mode: remote reconfig — boot from EPCS "
++                      "page 0 (factory ALINX)\r\n");
++            uart_puts("[rot] altremote: pgm_sel=0x000000 WD_EN=0 "
++                      "AP_CONFIG_SEL=0 — triggering reconfig\r\n");
++            epcs_remote_reconfig(0);   /* noreturn */
+         } else {
+             uart_puts("[!] unknown mode byte — ignored\r\n");
+         }
+diff --git a/sw/stage2_loader/remote_update.c b/sw/stage2_loader/remote_update.c
+new file mode 100644
+index 0000000..1fb419b
+--- /dev/null
++++ b/sw/stage2_loader/remote_update.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * remote_update.c — Phase 4 EPCS remote-update trigger.
++ * See remote_update.h for protocol notes.
++ */
++#include "remote_update.h"
++
++void epcs_remote_reconfig(uint32_t pgm_sel)
++{
++    /* Drain UART TX FIFO so the caller's "triggering reconfig" line
++     * finishes before rconfig fires.  Same idiom as mode_set_baud. */
++    volatile uint32_t *uart_ctrl = (volatile uint32_t *)0xFFF50000UL;
++    while (!(uart_ctrl[0] & (1u << 18))) { /* TX_EMPTY */ }
++    for (volatile int i = 0; i < 2000; i++) { }
++
++    /* WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 — payload is just PGM_SEL. */
++    volatile uint32_t *altru_data = (volatile uint32_t *)0xF3000000UL;
++    volatile uint32_t *altru_cmd  = (volatile uint32_t *)0xF3000004UL;
++
++    altru_data[0] = pgm_sel & 0x00FFFFFFu;
++    /* SHIFT_IN_AND_RECONFIG: FSM shifts 29 bits in then pulses rconfig.
++     * Point of no return — FPGA reloads from new page in ~150 ms. */
++    altru_cmd[0]  = 0x1u;
++
++    while (1) { __asm__ volatile ("nop"); }
++}
+diff --git a/sw/stage2_loader/remote_update.h b/sw/stage2_loader/remote_update.h
+new file mode 100644
+index 0000000..b404990
+--- /dev/null
++++ b/sw/stage2_loader/remote_update.h
+@@ -0,0 +1,42 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * remote_update.h — Phase 4 firmware interface to wb_altremote_update.
++ *
++ * Drives the wb_altremote_update wrapper at 0xF3000000 (Phase 2 silicon),
++ * which is a 29-bit-shift-register FSM around the cycloneive_rublock
++ * primitive — direct-primitive path because the altremote_update
++ * megafunction strips write_param/data_in in 21.1 Lite REMOTE mode even
++ * with SUPPORT_WRITE_CHECK="1" (re-confirmed empirically 2026-05-17).
++ *
++ * Register map (from rtl/wb_altremote_update.v):
++ *   0xF3000000 DATA   (R/W) 29-bit shift payload (write side)
++ *   0xF3000004 CMD    (W)   b0=SHIFT_IN_AND_RECONFIG, b1=SHIFT_OUT_CAPTURE,
++ *                            b2=RECONFIG_ONLY, b3=RESET_TIMER
++ *   0xF3000008 STATUS (R)   b0=busy, b1=done_sticky, b5..2=state
++ *
++ * 29-bit payload layout (LSB-first per Cyclone IV Handbook Vol 1 Ch 8):
++ *   [23:0]  PGM_SEL (boot byte address)
++ *   [24]    WD_EN   (0 = watchdog disabled)
++ *   [27:25] WD_TMR  (timeout select; ignored when WD_EN=0)
++ *   [28]    AP_CONFIG_SEL (0 = factory boot next, 1 = application)
++ */
++#ifndef ROT_REMOTE_UPDATE_H
++#define ROT_REMOTE_UPDATE_H
++
++#include <stdint.h>
++
++/*
++ * Trigger a remote-update reconfig to the given EPCS byte address with
++ * WD_EN=0 and AP_CONFIG_SEL=0.  Does not return — the FPGA reloads its
++ * configuration from the target page within ~150 ms.
++ *
++ * Caller should print any final diagnostics BEFORE calling this; the
++ * function drains the UART TX FIFO immediately on entry, but no further
++ * output is guaranteed after the SHIFT_IN_AND_RECONFIG trigger.
++ *
++ * If the FSM fails to accept the trigger (busy gate) the function hangs
++ * in an infinite NOP loop rather than returning.
++ */
++void epcs_remote_reconfig(uint32_t pgm_sel) __attribute__((noreturn));
++
++#endif
+-- 
+2.43.0
+
