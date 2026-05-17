@@ -714,19 +714,65 @@ md5 `43f8578e0abf8e03bfba36c69f3b3edc` (368011 B); ELF unchanged
   termination — sequential read-then-write is now safe.  poll_wip_clear()
   can re-enter RDSR after a fast_read without getting stuck.
 
-**Carryover for next session**:
-- Phase C bytes differ between bitstreams (5145a6d7: `0x7d 0x21 0x0f
-  0x00`; 43f8578e: `0x21 0x00 0x88 0x00`).  Investigation: may be
-  off-by-one alignment or dummy-byte-vs-first-byte confusion in the
-  shift_bytes timing.  Doesn't block READ closure (bytes are non-0xff,
-  proving real flash content) but the actual addr-0 content is one of
-  these (or neither) — needs verification against a known-content
-  EPCS region (e.g. read addr 0x100000 = blank → should be all 0xff).
+**Phase D — byte-alignment probe (2026-05-17 night, patch 0017)**
+
+Hypothesis check: read addr=0x100000 (blank), addr=0 (twice), addr=0x10.
+Capture md5 `8fba57aa` at `docs/captures/diag_nh10_phase_d_alignment_probe.log`,
+3/3 deterministic across re-runs on bitstream `bc9ba066…`.
+
+Findings:
+1. **D0 addr=0x100000 → `ff ff ff ff`** ✅ — wrapper byte alignment +
+   wait_dv handshake fundamentally OK for blank flash.  Phase 3 READ
+   for "slot empty" detection is reliable on silicon.
+2. **D1 addr=0 (2nd read same boot) → `18 81 21 00`** vs Phase C
+   earlier in same boot returned `a1 00 d1 00`.  Two consecutive
+   FAST_READs of same addr return different bytes.  Likely the
+   megafunction's internal `read_add_cntr` (lpm_counter) is NOT
+   explicitly reset between operations — the second FAST_READ reads
+   bytes 4–7 instead of 0–3.  Wrapper writes `addr` input which the
+   megafunction's addr_reg loads (line 612 `(rden|wren) & not_busy`)
+   but read_add_cntr may continue from prior position.
+3. **D2 addr=0x10 → `15 80 14 3f`** — reasonable bitstream content;
+   offset arithmetic does reach the megafunction.
+4. **Cross-bitstream first-read variance**: 5145a6d7 → `7d 21 0f 00`;
+   43f8578e → `21 00 88 00`; bc9ba066 → `a1 00 d1 00`.  Even the
+   first FAST_READ from POR returns different bytes per bitstream
+   rebuild.  Combined with negative timing slack (−1.182 ns setup
+   CLOCK), this points to placement-dependent metastability in the
+   SHIFT_BYTES → am_data_valid pipeline.
+5. **Phase A also reverted to non-deterministic** — 3 fresh boots
+   all show `A2 done i=0xf4240 final=0x01 TIMEOUT`.  Earlier
+   "3/3 OK" was specifically post-NH10-flash-warm-up.  Cold boots
+   consistently hit the RDSR auto-restart issue.  Same root-cause
+   class as #4.
+
+**Phase 3 silicon status — corrected after Phase D**:
+- READ for blank flash detection (slot empty check): ✅ reliable
+- READ for content verification (SHA-256 over bitstream):
+  ⚠️ UNRELIABLE — bytes vary per bitstream + per consecutive read
+- READ termination (NH10 auto-terminate): ✅ silicon-closed
+- RDSR (epcs_read_status): ⚠️ INTERMITTENT (cold-boot dependent)
+- WRITE / ERASE: not yet HW-tested (destructive; needs user
+  authorization)
+
+**Carryover for follow-up work (after Phase 4)**:
+- (a) Firmware: pulse CTRL_RESET before each FAST_READ to reset
+  read_add_cntr.  Untested but simplest fix candidate.
+- (b) Wrapper: auto-issue megafunction reset between FAST_READs
+  (edge-detect ctrl_fast_read rising → pulse am_reset_in 1 cycle).
+- (c) SDC constraints to meet timing — deepest rework; might lift
+  the entire metastability class of bugs.
+- diag_mode_p_test.py listener cleanup race FIXED 2026-05-17 night
+  (`Listener.stop()` sets flag only; new `close()` called after join).
 - diag_mode_p_test.py classify() should add NH10 verdict to
   distinguish "READ data ok + termination ok" (full closure) from
-  "READ data ok + termination broken" (partial NH9 state).
-- diag_mode_p_test.py listener.run() Python cleanup race that truncated
-  prior NH9 capture before C4/C5 — cosmetic but should be hardened.
+  "READ data ok + termination broken" (partial NH9 state).  Defer.
+
+**Phase 4 impact**: ALTREMOTE_UPDATE rework does NOT depend on
+perfect READ alignment; can proceed against current state.  The
+READ accuracy issue needs follow-up before slot content-verification
+(SHA-256) is trusted, but that's a Phase-3-followup, not a Phase-4
+blocker.
 
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
