@@ -5,3 +5,9 @@
 # Python bytecode
 __pycache__/
 *.pyc
+
+# qmegawiz writes these error-log scratch files unconditionally
+# (even on `qmegawiz --help`).  Always junk.
+.cnxerr
+qmegawiz_errors_log.txt
+.cnx
