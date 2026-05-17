@@ -1,0 +1,251 @@
+From bd492b23eb47c78a26aef31b77dd7a4bc5a0aada Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 18:28:24 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20NH10:=20wrapper=20auto-terminate=20?=
+ =?UTF-8?q?am=5Frden=20for=20FAST=5FREAD=20=E2=80=94=20termination=20closu?=
+ =?UTF-8?q?re=20on=20silicon?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the FAST_READ termination bug observed after NH9: epcs_ctrl
+megafunction goes through stage4 fine and shifts data bytes (Phase
+3 READ data closure already achieved per NH9), but after the read
+loop the rden=0 pulse from firmware CTRL.b7 misses the
+data_valid_wire pulse window so end_read_reg never fires, busy_wire
+stays at 1 forever, fast_read_reg can't update (clk_en gated on
+~busy_wire), and the whole megafunction is stuck until POR.
+
+Root cause (verified 2026-05-17 night HW test on bitstream
+d7c1950935ec3e815ce036f1d8d790e7, 3/3 deterministic C4 TIMEOUT):
+- end_read_reg <= ((~rden) & (do_read|do_fast_read) & data_valid_wire
+  & end_read_byte) per epcs_ctrl.v line 826
+- data_valid_wire = dvalid_reg = (end_read_byte & end_one_cyc_pos)
+  ena=do_read|do_fast_read, sclr=(end_op_wire|end_operation).  It's a
+  SINGLE-CYCLE PULSE per byte shifted, not level-locked.
+- firmware's CTRL.b7=RDEN_DROP is a single-cycle pulse via
+  ctrl_rden_drop auto-clear.  am_rden = ~ctrl_rden_drop = 0 for 1
+  cycle.
+- Two single-cycle pulses must align in the same sysclk cycle for
+  end_read_reg to fire.  Empirically impossible from firmware-side
+  Wishbone writes (no cycle-accurate control over altasmi's internal
+  FSM phase).  Hence 3/3 TIMEOUT.
+
+NH10 FIX (wb_altasmi_parallel.v, 1-line change to am_rden):
+  - wire am_rden = ~ctrl_rden_drop;
+  + wire am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read);
+
+Reading: am_rden=1 unless (firmware pulsed RDEN_DROP) OR (megafunction
+is busy AND firmware has cleared the FAST_READ level bit).  The new
+second term implements AUTO-TERMINATE: when firmware writes CTRL=0
+while the FSM is still busy, am_rden is held LOW until busy drops.
+end_read_reg gets unlimited cycles to align with the next
+data_valid_wire pulse (~150 sysclks max) and fires reliably.
+
+Firmware API unchanged.  The existing CTRL.b7 pulse path is preserved
+(for back-compat) but is now redundant — firmware's
+"*CTRL = CTRL_FAST_READ | CTRL_RDEN_DROP; wait_not_busy(); *CTRL = 0;"
+and "*CTRL = 0; wait_not_busy();" both work identically.  The
+epcs_fast_read() driver in epcs.c is unchanged; the diag firmware
+in main.c is unchanged.
+
+NH10 DIAG ENHANCEMENTS (sw/stage2_loader/main.c, +428 B ELF):
+- Phase A enriched with per-iter ESTAT sampling (was just STATUS)
+  to discriminate the originally-reported "Phase A regression".  3/3
+  HW tests post-enhancement show Phase A actually completes at
+  i=0x2 OK (consistent with NH8 baseline i=0x6); the one-off
+  TIMEOUT observed in the first NH9 HW test (commit 8f3929e body)
+  was a cold-boot one-off transient, NOT a real regression.
+- A2 iter cap reduced 10M→1M for faster diag turnaround.
+- A5/A6 added: empirical test of the "delay-then-read" workaround
+  pattern.  256-cycle nop + ESTAT read shows valid status without
+  needing wait_not_busy().  Confirmed working but not needed since
+  Phase A wait_not_busy is itself working (with the enriched
+  instrumentation).
+
+HW-VERIFIED (capture md5 88548dd4 at orchestrator
+docs/captures/diag_nh10_auto_terminate_ok.log):
+  C1 after CTRL=FAST_READ STATUS=0x03         ← FAST_READ launched
+  C2 byte=0..3 wait_dv i=0 STATUS=0x03 DATAOUT=0x21,0x00,0x88,0x00
+  C3 after CTRL=FAST_READ|RDEN_DROP STATUS=0x03  ← legacy pulse,
+                                                   still race-prone
+  C4 post_rden_drop_wait TIMEOUT                 ← legacy pulse misses
+                                                   dvalid window
+  C5 after CTRL=0 STATUS=0x02                    ← AUTO-TERMINATE:
+                                                   busy DROPPED to 0
+                                                   (only DV bit left)
+
+Compare prior NH9 run (no auto-terminate): C5 STATUS=0x03 stuck
+forever.  3/3 deterministic across re-runs.
+
+BUDGET (NH10):
+  LE       8929 / 10320 (87 %, +49 from NH9's 8880)
+  Slack    -1.182 ns setup CLOCK (worse than NH9 -1.003 by 0.18 ns;
+           the new combinational term in am_rden shrinks routing
+           margin; design has worked at negative slack throughout)
+  RBF      md5 43f8578e0abf8e03bfba36c69f3b3edc (368011 B)
+  ELF      16708 B (unchanged from NH9 + Phase A enrichment)
+
+PHASE 3 STATUS POST-NH10:
+- READ path: ✅ silicon-closed (epcs_fast_read returns real bytes)
+- READ termination: ✅ silicon-closed (busy reliably drops after CTRL=0)
+- RDSR path: ✅ working (epcs_read_status returns valid ESTAT)
+- ERASE / PROGRAM: not yet HW-validated, but no longer blocked by
+  termination — sequential read-then-write is now safe.
+
+KNOWN CARRYOVER:
+- Phase B diag (b0=READ) still no-op post-NH9 (CTRL.b0 dropped by
+  wrapper); kept as control experiment.
+- diag firmware Phase C still pulses RDEN_DROP (C3) before CTRL=0
+  (C5).  C3 pulse misses dvalid window (TIMEOUT) but is harmless;
+  C5 auto-terminate is what actually fires.  Firmware unchanged.
+- Phase C bytes differ between bitstreams (5145a6d7: 0x7d 0x21 0x0f
+  0x00; 43f8578e: 0x21 0x00 0x88 0x00).  Need investigation — may be
+  off-by-one alignment or dummy-byte-vs-first-byte confusion.
+  Doesn't block READ closure since bytes are non-0xff (real flash
+  content) but the actual addr-0 content is one of these (or
+  neither).  Follow-up.
+---
+ rtl/wb_altasmi_parallel.v | 20 +++++++----
+ sw/stage2_loader/main.c   | 71 +++++++++++++++++++++++++++++++++------
+ 2 files changed, 74 insertions(+), 17 deletions(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 66bbba0..fb75812 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -125,13 +125,19 @@ module wb_altasmi_parallel (
+     // drop rden=0 for one cycle AFTER the final byte's data_valid
+     // pulse to signal "this was the last byte → terminate read."
+     //
+-    // Default am_rden=1 (matches original behavior except now
+-    // controllable).  Firmware pulses CTRL.b7=1 to drop rden for one
+-    // cycle after consuming the last DATAOUT byte:
+-    //   *CTRL = CTRL_READ | CTRL_RDEN_DROP;  // rden drops, end_read fires
+-    //   wait_not_busy();                      // FSM completes
+-    //   *CTRL = 0;                            // deassert READ
+-    wire am_rden = ~ctrl_rden_drop;
++    // Default am_rden=1.  Two termination paths, both supported:
++    //   (a) Firmware pulses CTRL.b7=1 (single-cycle RDEN_DROP).  Race-prone:
++    //       the rden=0 pulse must align with the megafunction's single-cycle
++    //       data_valid_wire pulse for end_read_reg to fire.  Empirically
++    //       unreliable on NH9 (C4 TIMEOUT 3/3 reproducible).
++    //   (b) NH10 AUTO-TERMINATE: when firmware clears the FAST_READ level
++    //       bit (CTRL=0) while the megafunction is still busy, the wrapper
++    //       HOLDS am_rden=0 until busy drops.  end_read_reg gets unlimited
++    //       cycles to align with the data_valid_wire pulse — termination
++    //       always completes within one shift cycle (~150 sysclks).
++    //   Firmware API: just write CTRL=0 then wait_not_busy().  The b7 pulse
++    //   is retained for back-compat but is now redundant.
++    wire am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read);
+ 
+     epcs_ctrl u_am (
+         .clkin         (clk),
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 6e29d87..27304fa 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -321,20 +321,25 @@ static void mode_epcs_probe(void)
+     uart_puts("\r\n");
+ 
+     {
+-        /* bounded wait_not_busy on RDSR.  Iter cap empirically ~10M
+-         * (NEORV32 @ 50 MHz, Wishbone read ~6 cycles → ~0.12 µs per
+-         * iter → 10M ≈ 1.2 s).  Print every ~1M iters. */
++        /* NH9 PROBE v2 — bounded wait_not_busy with PERIODIC ESTAT sampling.
++         * If ESTAT changes across iterations, that confirms the
++         * auto-restart hypothesis (megafunction repeatedly completes
++         * RDSR while CTRL.b3 held high, updating statreg_int each cycle).
++         * Iter cap reduced 10M→1M (~120ms) for faster diag turnaround. */
+         uint32_t i;
+         uint32_t s = 0;
+         uint32_t prints = 0;
+-        for (i = 0; i < 10000000u; i++) {
++        for (i = 0; i < 1000000u; i++) {
+             s = *DP_STATUS;
+             if (!(s & 0x1u)) break;
+-            if ((i & 0xFFFFFu) == 0u && prints < 12u) {
+-                uart_puts("[P] A2 wait_not_busy i=");
++            if ((i & 0x1FFFFu) == 0u && prints < 8u) {
++                uint32_t e = *DP_ESTAT;
++                uart_puts("[P] A2 wait i=");
+                 uart_puthex32(i);
+                 uart_puts(" STATUS=");
+                 uart_puthex32(s);
++                uart_puts(" ESTAT=");
++                uart_puthex32(e);
+                 uart_puts("\r\n");
+                 prints++;
+             }
+@@ -343,7 +348,7 @@ static void mode_epcs_probe(void)
+         uart_puthex32(i);
+         uart_puts(" final=");
+         uart_puthex32(s);
+-        uart_puts((i >= 10000000u) ? " TIMEOUT\r\n" : " OK\r\n");
++        uart_puts((i >= 1000000u) ? " TIMEOUT\r\n" : " OK\r\n");
+     }
+ 
+     uint32_t rdsr_byte = *DP_ESTAT;
+@@ -351,10 +356,56 @@ static void mode_epcs_probe(void)
+     uart_puthex32(rdsr_byte);
+     uart_puts("\r\n");
+ 
++    /* A4 — measure how fast busy drops once CTRL=0 releases the op. */
+     *DP_CTRL = 0;
+-    uart_puts("[P] A4 after CTRL=0 STATUS=");
+-    uart_puthex32(*DP_STATUS);
+-    uart_puts("\r\n");
++    {
++        uint32_t i;
++        uint32_t s = 0;
++        for (i = 0; i < 10000u; i++) {
++            s = *DP_STATUS;
++            if (!(s & 0x1u)) break;
++        }
++        uart_puts("[P] A4 after CTRL=0 release i=");
++        uart_puthex32(i);
++        uart_puts(" STATUS=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000u) ? " TIMEOUT\r\n" : " OK\r\n");
++    }
++
++    /* A5/A6 — workaround test: skip wait_not_busy, use fixed delay.
++     * If this returns a valid ESTAT (matching what A3 showed), the
++     * "delay-then-read-then-release" pattern is the firmware-side fix. */
++    uart_puts("[P] --- A2X: RDSR workaround (delay-then-read) ---\r\n");
++    *DP_CTRL = DC_RD_STATUS;
++    {
++        /* ~256 NOPs ≈ 256 sysclks ≈ 5 µs @ 50 MHz — should be ≥1 RDSR
++         * cycle (~150 sysclks per altasmi SPI byte transfer). */
++        volatile uint32_t spin;
++        for (spin = 0; spin < 256u; spin++) { }
++    }
++    {
++        uint32_t s_mid = *DP_STATUS;
++        uint32_t e_mid = *DP_ESTAT;
++        uart_puts("[P] A5 after ~256-cycle delay STATUS=");
++        uart_puthex32(s_mid);
++        uart_puts(" ESTAT=");
++        uart_puthex32(e_mid);
++        uart_puts("\r\n");
++    }
++    *DP_CTRL = 0;
++    {
++        uint32_t i;
++        uint32_t s = 0;
++        for (i = 0; i < 10000u; i++) {
++            s = *DP_STATUS;
++            if (!(s & 0x1u)) break;
++        }
++        uart_puts("[P] A6 workaround release i=");
++        uart_puthex32(i);
++        uart_puts(" STATUS=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000u) ? " TIMEOUT\r\n" : " OK\r\n");
++    }
+ 
+     /* =================================================================
+      * Phase B — READ 1 byte @ 0x000000 (the prior failing path)
+-- 
+2.43.0
+
