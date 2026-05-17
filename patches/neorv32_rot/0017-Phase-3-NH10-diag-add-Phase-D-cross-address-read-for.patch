@@ -1,0 +1,177 @@
+From 6add175157b46e1b994a45851ea63b5a7b3026b5 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 18:43:58 +0100
+Subject: [PATCH] Phase 3 NH10 (diag): add Phase D cross-address read for byte
+ alignment probe
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Phase D to mode 'P' diagnostic firmware to disambiguate the
+prior "Phase C addr-0 bytes differ between bitstreams" finding.
+Phase D reads 4 bytes at three addresses using NH10 auto-terminate
+between reads (no RDEN_DROP pulse needed):
+
+  D0 — addr 0x100000 (well past 368011 B ALINX bitstream;
+       expected blank → 0xff per EPCS16 erased state)
+  D1 — addr 0x000000 (same as Phase C; intra-boot determinism)
+  D2 — addr 0x000010 (small offset; sanity that addr arithmetic
+       reaches the megafunction)
+
+Empirical findings (HW-tested 3/3 deterministic on bitstream
+bc9ba066cde2aa703f453d432b311e86, capture md5 8fba57aa at
+docs/captures/diag_nh10_phase_d_alignment_probe.log):
+
+1. D0 reads 0xff 0xff 0xff 0xff (3/3) → wrapper byte alignment
+   + wait_dv handshake are fundamentally OK for blank flash.
+   Phase 3 READ for "slot empty" detection is reliable.
+
+2. D1 reads `18 81 21 00` while Phase C earlier in SAME BOOT read
+   `a1 00 d1 00` from the same addr 0.  Two consecutive FAST_READs
+   of the same address return different bytes.  Hypothesis: the
+   megafunction's internal read_add_cntr (an lpm_counter, not
+   explicitly reset between operations) keeps advancing across ops
+   — the second FAST_READ reads bytes 4-7 instead of 0-3.  The
+   `addr` input is loaded into the megafunction's internal addr_reg
+   (per epcs_ctrl.v line 612, on `(rden|wren) & not_busy`) but the
+   read_add_cntr may continue from prior position.
+
+3. D2 reads `15 80 14 3f` at addr 0x10 — reasonable bitstream
+   content; offset arithmetic does reach the megafunction.
+
+4. Cross-bitstream variance compound: 5145a6d7 first-read=
+   `7d 21 0f 00`; 43f8578e first-read=`21 00 88 00`; bc9ba066
+   first-read=`a1 00 d1 00`.  Even the first FAST_READ from POR
+   returns different bytes per bitstream rebuild.  Combined with
+   negative timing slack (-1.182 ns setup CLOCK), this points to
+   placement-dependent metastability in the SHIFT_BYTES →
+   am_data_valid pipeline.
+
+5. Phase A also reverted to non-deterministic — 3 fresh boots all
+   showed `A2 done i=0xf4240 final=0x01 TIMEOUT`.  The earlier
+   "3/3 OK" was specifically post-NH10-flash-warm-up; cold boots
+   now consistently hit the original RDSR auto-restart issue.
+   Same root cause class as #4.
+
+PHASE 3 STATUS POST-PHASE-D:
+- READ for blank flash detection (slot empty check): ✅ reliable
+- READ for content verification (SHA-256 over bitstream):
+  ⚠️ UNRELIABLE — bytes vary per bitstream + per consecutive read
+- READ termination: ✅ NH10 auto-terminate works
+- RDSR (epcs_read_status): ⚠️ INTERMITTENT (cold-boot dependent)
+- Workarounds for production use:
+  (a) firmware pulse CTRL_RESET before each FAST_READ to reset
+      read_add_cntr — untested, simplest fix candidate
+  (b) wrapper auto-issue reset between FAST_READs in MMIO
+  (c) SDC constraints to meet timing (deeper rework)
+
+PHASE 4 IMPACT: ALTREMOTE_UPDATE rework (Phase 4) does not depend
+on perfect READ alignment; it can proceed against the current
+state.  The READ accuracy issue will need follow-up before slot
+content-verification (SHA-256) is trusted.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 86 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 86 insertions(+)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 27304fa..54132ef 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -605,6 +605,92 @@ static void mode_epcs_probe(void)
+     uart_puthex32(*DP_STATUS);
+     uart_puts("\r\n");
+ 
++    /* Wait for NH10 auto-terminate to fully release busy before any
++     * follow-on FAST_READ in Phase D.  fast_read_reg can't latch the
++     * next op until busy drops. */
++    {
++        uint32_t i;
++        for (i = 0; i < 10000u; i++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++        uart_puts("[P] C6 release_wait i=");
++        uart_puthex32(i);
++        uart_puts(" STATUS=");
++        uart_puthex32(*DP_STATUS);
++        uart_puts("\r\n");
++    }
++
++    /* =================================================================
++     * Phase D — Cross-address sanity for Phase C byte interpretation
++     *
++     * Reads 4 bytes at three addresses to disambiguate the "Phase C
++     * addr-0 bytes differ between bitstreams" finding (NH9 5145a6d7
++     * = 0x7d 0x21 0x0f 0x00; NH10 43f8578e = 0x21 0x00 0x88 0x00).
++     * Hypotheses:
++     *   - off-by-one in dummy-byte handling → would show in D1 vs D2
++     *   - alignment correct, addr-0 content really is what we see →
++     *     D0 (blank-flash @ 0x100000) returns 0xff = alignment OK
++     *   - cold-boot transient → D2 (addr=0 second time, same boot)
++     *     should MATCH Phase C bytes if intra-boot deterministic
++     *
++     * Three sub-reads, each: ADDR set → CTRL=FAST_READ → shift 4 bytes
++     * → CTRL=0 → wait busy=0.  No RDEN_DROP pulse; rely on NH10
++     * auto-terminate.
++     * ================================================================= */
++    uart_puts("[P] --- Phase D: cross-address sanity ---\r\n");
++
++    static const uint32_t D_ADDRS[3] = {
++        0x100000u,  /* D0 — well past 368011 B ALINX bitstream; expect 0xff */
++        0x000000u,  /* D1 — same as Phase C; intra-boot determinism check */
++        0x000010u,  /* D2 — small offset; sanity that addr arithmetic works */
++    };
++    for (uint32_t r = 0; r < 3u; r++) {
++        uint32_t a = D_ADDRS[r];
++        *DP_ADDR = a;
++        *DP_CTRL = DC_FAST_READ;
++
++        for (uint32_t byte_i = 0; byte_i < 4u; byte_i++) {
++            *DP_CTRL = DC_FAST_READ | DC_SHIFT_BYTES;
++
++            uint32_t i;
++            uint32_t s = 0;
++            for (i = 0; i < 1000000u; i++) {
++                s = *DP_STATUS;
++                if (s & 0x2u) break;
++            }
++
++            uart_puts("[P] D");
++            uart_puthex32(r);
++            uart_puts(" addr=");
++            uart_puthex32(a);
++            uart_puts(" byte=");
++            uart_puthex32(byte_i);
++            uart_puts(" i=");
++            uart_puthex32(i);
++
++            if (s & 0x2u) {
++                uint32_t b = *DP_DATAOUT;
++                uart_puts(" DATAOUT=");
++                uart_puthex32(b);
++                uart_puts("\r\n");
++            } else {
++                uart_puts(" TIMEOUT\r\n");
++                break;
++            }
++        }
++
++        /* NH10 auto-terminate: just clear CTRL, busy will drop. */
++        *DP_CTRL = 0;
++        {
++            uint32_t i;
++            for (i = 0; i < 10000u; i++) {
++                if (!(*DP_STATUS & 0x1u)) break;
++            }
++            /* No print per release wait — keep trace compact. */
++            (void)i;
++        }
++    }
++
+     uart_puts("[P] diagnostic DONE\r\n");
+ 
+     #undef DP_BASE
+-- 
+2.43.0
+
