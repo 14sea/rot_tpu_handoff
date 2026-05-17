@@ -906,12 +906,76 @@ instead of `if (am_data_valid)`):
 - 0024 NH16 firmware Phase F (phantom-discard variant; ELF 18024 →
   18568 B)
 
+**NH17 attempted same session — PARTIAL** (patch 0025, bitstream
+`9344bb83…`, capture `diag_phase3_nh17_byte_event_pipeline_race.log`
+md5 `176343c3…`).  Wrapper change: 24-bit `am_read_addr_d` register
++ `am_byte_event = (am_read_addr != am_read_addr_d)` as the
+latched_dataout load trigger (instead of am_data_valid).  Reset
+alignment via ctrl_reset clears am_read_addr_d to 0 to match
+megafunction's read_add_reg=0 post-reset.  LE 8941/10320 (+2 vs
+NH16, regs +24 matches expected).
+
+**RTL is doing something different**: Phase F phantom changed from
+always-0xff (NH16) to 0xff (op 0) then 0x00 (op 1+).  Proves
+byte_event IS firing per increment.
+
+**But still captures non-real bytes**: REAL=0xff for all addrs.
+Diagnosis via static audit:
+- `dataout` port (= am_dataout in wrapper) = `read_data_reg[7:0]`
+  (line 1730), enabled ONLY when `(do_read|do_fast_read) &
+  stage_cntr=2'b10 & end_one_cyc_pos & end_read_byte` (line 1226).
+- During pre-amble (stage_cntr ≠ 2'b10), read_data_reg is NOT
+  updated.  It's reset-cleared to 0 by NH13 reset stretcher.
+- NH17's byte_event fires on first read_add_reg increment, BUT at
+  that moment read_data_reg may still hold reset value (0) or
+  residual from prior op — so wrapper latches stale value.
+
+**Op 0 phantom=0xff** = residual from prior Phase E's last byte
+captured in read_data_reg before NH13 reset (but read_add_reg got
+reset; data_reg only resets on reset signal which has same path).
+Actually after NH13's 16-cycle stretcher, BOTH read_data_reg AND
+read_add_reg reset.  Op 0 phantom=0xff remains unexplained — perhaps
+from FAST_READ pre-amble's first 8 SCK cycles shifting MISO float
+into read_data_reg via a different path.  Op 1+ phantom=0x00 fits
+the "reset cleared, no stage4 yet" model.
+
+**Architectural conclusion**: wrapper-layer per-byte trigger
+(NH17) cannot escape the megafunction's internal pipeline timing
+race.  read_data_reg, read_add_reg, dvalid_reg all have different
+clock edges and gating conditions designed for an internal HardCopy
+controller, NOT for external MMIO sampling.  Each wrapper-layer fix
+trades one race for another.
+
+**Recommended next step**: Plan B — replace the altasmi_parallel
+megafunction with a hand-written SPI master driving cycloneive_asmiblock
+directly (~200-400 LE, 2-3 h initial, full silicon-validation across
+multiple sessions).  Falsification budget for wrapper-layer
+patches in this Quartus toolchain is exhausted.
+
+**Validated this session**: NH15 latch-lock for byte-0 determinism
+across boots; NH17 per-byte event detector for the byte-event
+strobe; both useful primitives even if neither closes content-read
+on their own.  Phase 3 still partial-closure (blank-flash detect ✅,
+READ termination ✅, byte 0 deterministic ✅, real content read 🔴).
+
+**Patches stacked this session** (0022–0025):
+- 0022 NH15 wrapper RTL (latch-lock)
+- 0023 NH15 firmware Phase E (one-byte-per-op)
+- 0024 NH16-fw firmware Phase F (phantom-discard, refuted)
+- 0025 NH17 wrapper RTL (per-byte event detector, partial)
+
+**Captures** (`docs/captures/`):
+- `diag_phase3_nh15_latch_lock_phantom.log` (`649d2383…`)
+- `diag_phase3_nh16_fw_level_lock_refuted.log` (`4a463636…`)
+- `diag_phase3_nh17_byte_event_pipeline_race.log` (`176343c3…`)
+
 **Next session candidates** (preserve choice, do not pre-commit):
-- NH17 RTL: trigger on am_read_addr increments instead of am_data_valid.
-- Phase 9 destructive multi-slot work (orthogonal to content-read).
-- Phase 6 SD-card mode 't' bring-up (needs SD card hardware; SHA verify
-  would currently mostly read 0xff or racey bytes — premature).
-- Plan B megafunction-bypass (hand-write SPI master against asmiblock).
+- **Plan B** (RECOMMENDED): hand-write SPI master against
+  cycloneive_asmiblock primitive.  Megafunction-bypass.
+- Phase 6 SD-card mode 't' with PARTIAL Phase 3 (just blank-flash
+  detect; full SHA verify deferred until Plan B).
+- Phase 9 destructive multi-slot (orthogonal — tests AP_CONFIG_SEL=1
+  reconfig boot path; does NOT depend on content-read).
 
 Discipline note: this session's pattern matches prior NH8/NH11/NH13
 falsifications — wrapper-layer fixes keep getting partial credit but
