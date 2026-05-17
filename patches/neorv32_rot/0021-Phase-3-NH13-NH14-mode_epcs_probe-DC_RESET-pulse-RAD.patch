@@ -1,0 +1,149 @@
+From d8587eb60cbc003860b14c25375b6c02727d3cb8 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 20:55:57 +0100
+Subject: [PATCH 21/21] =?UTF-8?q?Phase=203=20NH13+NH14:=20mode=5Fepcs=5Fpr?=
+ =?UTF-8?q?obe=20=E2=80=94=20DC=5FRESET=20pulse=20+=20RADDR=20probe?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two diagnostic firmware changes for Phase 3 content-read investigation.
+
+NH13 firmware side: pulse DC_RESET (new) before each FAST_READ in
+Phase C and Phase D, with 32 sw-iter delay to let the wrapper's NH13
+RTL stretcher (16-cycle ctrl_reset_active) deassert before the next
+CTRL=FAST_READ.  Implements the "reset between operations" intent.
+
+NH14: print *DP_RADDR (the megafunction's read_address output, NH7
+patch 0012 wired this to MMIO 0x18) at several checkpoints —
+mode_epcs_probe entry, before/after Phase C ADDR write, after Phase C
+CTRL=0, before/after each Phase D ADDR write.
+
+Empirical findings (capture diag_phase3_nh14_raddr_probe.log,
+bitstream md5 5e9e0b2c372cb4715f95108089a7ebac):
+- POR RADDR=0 (clean)
+- DC_RESET correctly resets RADDR to 0 between ops (NH13 stretcher
+  is working as designed)
+- *DP_ADDR writes do NOT update RADDR — addr_reg → read_address
+  linkage is broken at the megafunction interface, OR addr only loads
+  into read_add_cntr at fast_read assertion (not at addr write)
+- Phase C 4-byte read advances RADDR to 0x81E85 = 532613 — the
+  megafunction streams flash continuously while rden=1; SHIFT_BYTES
+  latches one byte at the current stream position (non-deterministic
+  vs requested addr)
+- Phase D D1 addr=0 bytes still differ from Phase C addr=0 bytes in
+  same boot, despite both having the NH13 reset pulse
+
+Conclusion: Phase 3 content-read accuracy is a deeper wrapper
+SHIFT_BYTES ↔ data_valid handshake redesign + addr→pre-amble
+verification.  Deferred to Phase 9-class scope.  This patch lands as
+diagnostic/defensive; NH13 stretcher is spec-correct, NH14 probe is
+essential for future investigation.
+
+Blank-flash detect (D0 addr=0x100000 → ff/ff/ff/ff 3/3) still works
+correctly — wrapper byte alignment + wait_dv handshake fundamentally
+OK for "is this address blank?" question.  So Phase 3 partial silicon
+closure from prior session (NH9+NH10) stands.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 46 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 76f822a..855bb50 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -293,11 +293,18 @@ static void mode_epcs_probe(void)
+     #define DP_STATUS  ((volatile uint32_t *)(DP_BASE + 0x0C))
+     #define DP_DATAOUT ((volatile uint32_t *)(DP_BASE + 0x10))
+     #define DP_ESTAT   ((volatile uint32_t *)(DP_BASE + 0x14))
++    /* NH14: read_address output of the megafunction (NH7 wired to MMIO).
++     * Probe to distinguish (a) megafunction loads addr per-op vs (b)
++     * read_add_cntr accumulates across ops vs (c) addr never loads at all. */
++    #define DP_RADDR   ((volatile uint32_t *)(DP_BASE + 0x18))
+ 
+     /* CTRL bits (from epcs.c + NH8 v3 wrapper) */
+     #define DC_READ        (1u << 0)
+     #define DC_RD_STATUS   (1u << 3)
+     #define DC_SHIFT_BYTES (1u << 4)
++    #define DC_RESET       (1u << 6)   /* NH13: 1-cycle pulse; wrapper NH13
++                                          stretches to 16 cycles for the
++                                          megafunction ≥250 ns reset spec */
+     #define DC_RDEN_DROP   (1u << 7)   /* NH8 v3: drops rden for 1 cycle */
+     #define DC_FAST_READ   (1u << 8)   /* NH9: opcode 0x0B + 24-bit addr + 1 dummy byte */
+ 
+@@ -309,6 +316,8 @@ static void mode_epcs_probe(void)
+     /* ---- Step P0: STATUS at idle (no CTRL writes yet) ---- */
+     uart_puts("[P] s0 idle STATUS=");
+     uart_puthex32(*DP_STATUS);
++    uart_puts(" RADDR=");
++    uart_puthex32(*DP_RADDR);
+     uart_puts("\r\n");
+ 
+     /* =================================================================
+@@ -539,9 +548,24 @@ static void mode_epcs_probe(void)
+      * ================================================================= */
+     uart_puts("[P] --- Phase C: FAST_READ 4B @0 ---\r\n");
+ 
++    /* NH13: pulse DC_RESET before each FAST_READ so the megafunction's
++     * internal read_add_cntr starts from addr (instead of accumulating
++     * across operations).  Wrapper stretches this to 16 sysclk cycles
++     * (320 ns) to clear the megafunction's 250 ns reset spec.  Sw delay
++     * ensures stretcher deasserts before the next CTRL=FAST_READ. */
++    *DP_CTRL = DC_RESET;
++    for (volatile int i = 0; i < 32; i++) { /* stretcher delay */ }
++
++    /* NH14: RADDR before ADDR write — is megafunction's counter cleared? */
++    uart_puts("[P] C-pre-addr RADDR=");
++    uart_puthex32(*DP_RADDR);
++    uart_puts("\r\n");
++
+     *DP_ADDR = 0x000000u;
+     uart_puts("[P] C0 ADDR=0 STATUS=");
+     uart_puthex32(*DP_STATUS);
++    uart_puts(" RADDR=");
++    uart_puthex32(*DP_RADDR);
+     uart_puts("\r\n");
+ 
+     *DP_CTRL = DC_FAST_READ;
+@@ -604,6 +628,8 @@ static void mode_epcs_probe(void)
+     *DP_CTRL = 0;
+     uart_puts("[P] C5 after CTRL=0 STATUS=");
+     uart_puthex32(*DP_STATUS);
++    uart_puts(" RADDR=");
++    uart_puthex32(*DP_RADDR);
+     uart_puts("\r\n");
+ 
+     /* Wait for NH10 auto-terminate to fully release busy before any
+@@ -647,7 +673,27 @@ static void mode_epcs_probe(void)
+     };
+     for (uint32_t r = 0; r < 3u; r++) {
+         uint32_t a = D_ADDRS[r];
++
++        /* NH13: pulse DC_RESET between iterations (and on the first
++         * iteration) — see Phase C comment for rationale. */
++        *DP_CTRL = DC_RESET;
++        for (volatile int i = 0; i < 32; i++) { /* stretcher delay */ }
++
++        /* NH14: RADDR before+after each ADDR write per D-iter. */
++        uart_puts("[P] D");
++        uart_puthex32(r);
++        uart_puts(" pre-addr RADDR=");
++        uart_puthex32(*DP_RADDR);
++        uart_puts("\r\n");
++
+         *DP_ADDR = a;
++
++        uart_puts("[P] D");
++        uart_puthex32(r);
++        uart_puts(" post-addr RADDR=");
++        uart_puthex32(*DP_RADDR);
++        uart_puts("\r\n");
++
+         *DP_CTRL = DC_FAST_READ;
+ 
+         for (uint32_t byte_i = 0; byte_i < 4u; byte_i++) {
+-- 
+2.43.0
+
