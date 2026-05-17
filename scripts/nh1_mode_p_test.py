@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
-# scripts/nh1_mode_p_test.py
+# scripts/nh1_mode_p_test.py — LEGACY (NH1 era, 2026-05-17 night)
 #
-# NH1 hypothesis HW test wrapper.  Validates patch 0009 (Phase 3 NH1
-# wait_not_busy two-phase fix) by running the listener-first cycle:
-# start UART listener → flash bitstream → wait for stage2 boot →
-# send 'P' → parse output for mode 'P' completion markers.
+# ⚠️  DEPRECATED — kept for historical reference only.
 #
-# Listener-first ordering matches [[feedback-uart-listener-first]]:
-# pyserial opens /dev/ttyUSB0 BEFORE openFPGALoader fires, so the
-# stage2 banner burst right after reconfig is not lost.
+# Original purpose: validate patch 0009 (Phase 3 NH1 wait_not_busy
+# two-phase fix) on the *production* mode 'P' code path which prints
+# "[stage2] Mode: EPCS probe — read 64 B @0x000000", expects 4 hex
+# rows + "probe DONE" as success markers.
+#
+# Why deprecated:
+#   - NH1 was refuted (3/3 byte-identical hang) and patch 0009 was
+#     retained only as defensive.
+#   - This script's EXPECTED_OLD_MD5 hardcodes the original pre-NH1
+#     bitstream md5 fcfd8122 and refuses to test anything newer.
+#   - The production mode 'P' code path itself hangs in wait_not_busy
+#     because the qmegawiz altasmi_parallel READ FSM has a structural
+#     deadlock — see docs/captures/diag_baseline_hang.log and patches
+#     0011-0013 commit messages for the full investigation.
+#   - All subsequent investigation switched to the diagnostic mode 'P'
+#     introduced by patch 0010 (STATUS-trace), which has its own
+#     listener wrapper at scripts/diag_mode_p_test.py.
+#
+# Use scripts/diag_mode_p_test.py for any current testing.
+# This file is kept so prior commit messages that reference it still
+# resolve, and so the original NH1 test methodology is preserved as
+# a reasoning trail.
 #
 # Verdicts (also reflected in exit code):
 #   0 NH1_CONFIRMED      entry banner + 4 hex rows + RDSR + "probe DONE"
