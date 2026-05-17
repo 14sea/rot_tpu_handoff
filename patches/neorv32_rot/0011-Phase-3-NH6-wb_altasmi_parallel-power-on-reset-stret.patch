@@ -1,0 +1,119 @@
+From 5590ea1f7e819167501d62098469232d695240be Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 14:53:44 +0100
+Subject: [PATCH] Phase 3 NH6: wb_altasmi_parallel power-on reset stretcher for
+ altasmi
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase 3 mode 'P' STATUS-trace diagnostic (patch 0010 + HW test
+2026-05-17 evening, UART capture md5 d9330cae...) showed: Phase A
+RDSR (opcode 0x05) completes cleanly in 6 iters, but Phase B READ
+(opcode 0x03) sees STATUS=0x03 (busy=1, data_valid=1) the cycle
+CTRL=READ is written.  busy_wire stays at 1 across 10M poll iters,
+and am_data_valid is level-held (not pulsed) — the wrapper's
+flag_data_valid latch re-asserts the cycle after every
+dataout_read_req strobe.
+
+Paper audit of wb_altasmi_parallel.v found the root cause: the
+megafunction's reset input is driven ONLY by the firmware-issued
+ctrl_reset pulse.  At power-up rst_n deasserts → ctrl_reset stays
+0 forever (until firmware writes CTRL.b6=1, which never happens
+during normal boot).  Per Altera altasmi_parallel documentation,
+reset must be asserted ≥250 ns at power-up to initialize the
+megafunction's internal FIFO depth counters and FSM.  Without that
+init pulse, the FIFO counters power up in an undefined state that
+the megafunction interprets as "data is already ready" for
+multi-byte-shift opcodes (READ, WRITE) but happens to be ignored
+by the single-byte RDSR path — explaining why Phase A worked.
+
+This patch adds a synchronous 31-cycle power-on reset stretcher
+gated by a 5-bit saturating counter.  The stretched signal is
+ORed with firmware-driven ctrl_reset and fed to epcs_ctrl.reset.
+31 cycles @ 50 MHz = 620 ns, 2.5× the spec minimum of 250 ns.
+
+  reg [4:0] am_por_cnt;
+  wire am_por_done = &am_por_cnt;
+  always @(posedge clk or negedge rst_n) begin
+      if (!rst_n)             am_por_cnt <= 5'd0;
+      else if (!am_por_done)  am_por_cnt <= am_por_cnt + 5'd1;
+  end
+  wire am_reset_in = ctrl_reset | ~am_por_done;
+  epcs_ctrl u_am ( .reset(am_reset_in), ... );
+
+Resource cost: 5 logic registers + counter increment + OR gate.
+Negligible vs current LE 85 %.
+
+Phase 3 closure criterion (pre-HW expectation): Phase B READ
+would succeed with this fix — busy clears, data_valid pulses
+per-byte, DATAOUT yields real flash content at 0x000000.
+
+POST-HW TEST REFUTED (2026-05-17 evening, bitstream md5
+aa41f714cb5675fb2ef616a324ad354): trace md5 d9330cae —
+byte-identical to the diagnostic baseline `f931e805` capture
+(see docs/captures/diag_baseline_hang.log).  Phase B still hangs
+at CTRL=READ pre-amble with STATUS=0x03.  NH6 reset stretcher had
+ZERO observable effect on FSM behavior.  Root cause is NOT
+"missing POR reset" — turned out to be a structural deadlock in
+the qmegawiz output's READ FSM (stage_cntr freezes off 2'b10 in
+stage4 because FSM clk_en gates on ~end_read; end_read only
+fires at stage 2'b10 → chicken-and-egg).  See plan.md Phase 3
+NH8 v3 section + reference-rublock-complexity.md
+§"Structural deadlock".
+
+Patch retained as DEFENSIVE: the altasmi datasheet does call for
+a ≥250 ns power-up reset.  This stretcher provides it (620 ns
+@ 50 MHz) regardless of whether it fixed the current bug.
+Removing it would be a spec regression.
+
+Cumulative refuted-list this hypothesis added to: NH1 (firmware
+race, prior session) + NH4 (shift_bytes pulse, this diag) + NH5
+(chip mismatch, mostly, since RDSR works) + NH6 (this patch).
+NH2/NH3/NH7/NH8 also refuted in subsequent patches; all 4
+hypotheses landed at the same byte-identical hang signature.
+---
+ rtl/wb_altasmi_parallel.v | 22 +++++++++++++++++++++-
+ 1 file changed, 21 insertions(+), 1 deletion(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 8df2090..97f1bfb 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -67,12 +67,32 @@ module wb_altasmi_parallel (
+     wire        am_illegal_erase;
+     wire        am_illegal_write;
+ 
++    // ── Power-on reset stretcher (NH6 fix) ────────────────────────────
++    // altasmi_parallel spec: reset must be asserted ≥250 ns at power-up
++    // to initialize the megafunction (FIFO counters, internal FSM).
++    // Without this, am_data_valid is level-held high during pre-amble on
++    // READ-class opcodes — exactly the symptom captured by patch 0010's
++    // diagnostic STATUS-trace (Phase A RDSR works, Phase B READ hangs at
++    // pre-amble with STATUS=0x03 across 10M poll iters).
++    //
++    // Stretch the megafunction's reset for 31 cycles after rst_n
++    // deasserts (= 620 ns @ 50 MHz, 2.5× the spec minimum), then OR
++    // with the firmware-issued ctrl_reset pulse so firmware can still
++    // request a soft-reset on demand.
++    reg [4:0] am_por_cnt;
++    wire am_por_done = &am_por_cnt;  // saturates at 5'b11111
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n)             am_por_cnt <= 5'd0;
++        else if (!am_por_done)  am_por_cnt <= am_por_cnt + 5'd1;
++    end
++    wire am_reset_in = ctrl_reset | ~am_por_done;
++
+     // Generated by qmegawiz from rtl/ip/epcs_ctrl.v (altasmi_parallel
+     // wrapper, EPCS16, Cyclone IV E, USE_ASMIBLOCK=ON — drives the
+     // dedicated AS pins DCLK/nCSO/ASDO/DATA0 automatically).
+     epcs_ctrl u_am (
+         .clkin         (clk),
+-        .reset         (ctrl_reset),
++        .reset         (am_reset_in),
+         .addr          (addr_reg),
+         .datain        (datain_reg),
+         .rden          (1'b1),
+-- 
+2.43.0
+

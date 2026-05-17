@@ -1,0 +1,137 @@
+From 325f3cffda87a2d2cd2b24557823a08336db15af Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 14:59:53 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20NH7:=20connect=20altasmi=20read=5Fa?=
+ =?UTF-8?q?ddress=20=E2=80=94=20fix=20synthesis-time=20pruning?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CANDIDATE root cause of mode 'P' READ hang (3/3 byte-identical
+across 4 bitstreams).  See "POST-HW TEST" section below — this
+turned out to be PARTIAL, not the full root cause.
+
+Found by reading neorv32_demo.map.rpt "Registers Removed During
+Synthesis" section after patch 0011 (NH6 reset stretcher) failed
+to change the trace:
+
+  wb_altasmi_parallel|epcs_ctrl|...|end_read_reg
+      ; Stuck at GND due to stuck port data_in
+  wb_altasmi_parallel|epcs_ctrl|...|add_rollover_reg
+      ; Lost fanout
+  wb_altasmi_parallel|epcs_ctrl|...|read_add_cntr|counter_reg_bit[0..24]
+      ; Lost fanout
+
+Three closely-related megafunction-internal registers were optimized
+away by Quartus:
+  - read_add_cntr: 25-bit READ-address counter
+  - add_rollover_reg: end-of-address detector
+  - end_read_reg: signals READ FSM completion (→ deasserts busy_wire)
+
+The pruning cascade started from the wrapper's
+`.read_address ()` empty connection on line 91.  Quartus saw "no
+one reads read_address" → pruned read_add_cntr (lost fanout) →
+add_rollover_reg lost fanout → end_read_reg.data_in becomes
+constant 0 → end_read_reg stuck at GND → optimized away.  Net
+effect: the altasmi READ state machine has no completion detector,
+so busy_wire stays high forever after a READ opcode is issued.
+
+This matches every empirical observation:
+- Phase A RDSR works: uses a different megafunction internal FSM
+  (read_status_reg path) that is not affected by the prune.
+- Phase B READ hangs at pre-amble: read_add_cntr is gone, FSM
+  cannot advance past pre-amble.
+- 3/3 byte-identical capture (md5 d9330cae...) across pre-NH1,
+  NH1, diagnostic, and NH6-stretcher bitstreams: the qmegawiz
+  output epcs_ctrl.v is identical in all four; pruning is
+  deterministic.
+- The NH6 reset stretcher had zero effect: the missing registers
+  cannot be brought back by a reset; they're not in the bitstream.
+
+Fix: connect .read_address(am_read_addr) and surface am_read_addr
+over MMIO 0x18 (RADDR register).  The MMIO read prevents the
+"lost fanout" cascade.  Secondary benefit: runtime diagnostic of
+READ progress — firmware can now poll read_address to see how
+far the megafunction has advanced.
+
+Phase 3 closure criterion (pre-HW expectation): with this fix,
+map.rpt would show read_add_cntr, add_rollover_reg, end_read_reg
+NOT in the "Registers Removed During Synthesis" list, and HW
+test would show Phase B READ completing.
+
+POST-HW TEST PARTIAL — REFUTED AS SOLE FIX (2026-05-17 evening,
+bitstream md5 011a4c374764cb32a500495f52206430): map.rpt shows
+read_add_cntr fully restored (24 regs, 49 LEs — visible at
+hierarchy `epcs_ctrl_altasmi_parallel_0ot2_component|lpm_counter:
+read_add_cntr`) BUT end_read_reg + add_rollover_reg + counter
+bit[24] are STILL pruned ("Stuck at GND" / "Lost fanout").
+Connecting read_address[23:0] surfaces the 24-bit address counter
+but the 25th rollover bit and the end-of-read register prune from
+a separate path — the hardwired `.rden(1'b1)` on line 78 of
+wb_altasmi_parallel.v.
+
+HW trace (docs/captures/diag_baseline_hang.log, md5 d9330cae):
+byte-identical to NH6 result.  Phase B still hangs at STATUS=0x03.
+
+Actual root cause was identified in the next patch (NH8):
+end_read_reg.data_in = (~rden) & do_read & data_valid_wire &
+end_read_byte — with rden hardwired to 1, ~rden is constant 0,
+end_read_reg input is permanently 0, FSM cannot fire end-of-read,
+stage4 deadlock per epcs_ctrl.v line 377 FSM clk_en gate.
+
+Patch retained as DEFENSIVE: read_add_cntr restoration is
+spec-correct (without it, multi-byte reads cannot track address
+progression even if the FSM deadlock is otherwise fixed).  Also
+gives runtime address sniff via MMIO 0x18.  No revert.
+
+Patch 0011 (NH6 reset stretcher) also retained as defensive.
+---
+ rtl/wb_altasmi_parallel.v | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 97f1bfb..59a8834 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -28,6 +28,11 @@
+ //                       b3=illegal_write_sticky (clears on reset)
+ //   0x10  DATAOUT (R)   [7:0]    latched altasmi.dataout (reading clears DV)
+ //   0x14  ESTAT   (R)   [7:0]    altasmi.status_out (latest read_status result)
++//   0x18  RADDR   (R)   [23:0]   altasmi.read_address (live read-address
++//                                counter; primary purpose: prevent
++//                                synthesis pruning of read_add_cntr →
++//                                end_read_reg; secondary purpose: runtime
++//                                diagnostic of READ progress)
+ 
+ module wb_altasmi_parallel (
+     input         clk,
+@@ -66,6 +71,9 @@ module wb_altasmi_parallel (
+     wire [7:0]  am_status_out;
+     wire        am_illegal_erase;
+     wire        am_illegal_write;
++    wire [23:0] am_read_addr;       // NH7 fix: must be connected so Quartus
++                                    // doesn't prune read_add_cntr →
++                                    // end_read_reg.  Surfaced over MMIO 0x18.
+ 
+     // ── Power-on reset stretcher (NH6 fix) ────────────────────────────
+     // altasmi_parallel spec: reset must be asserted ≥250 ns at power-up
+@@ -108,7 +116,7 @@ module wb_altasmi_parallel (
+         .status_out    (am_status_out),
+         .illegal_erase (am_illegal_erase),
+         .illegal_write (am_illegal_write),
+-        .read_address  ()  // diagnostic-only; not surfaced over MMIO
++        .read_address  (am_read_addr)
+     );
+ 
+     // ── Sticky flags + dataout latch ──────────────────────────────────
+@@ -194,6 +202,7 @@ module wb_altasmi_parallel (
+                             dataout_read_req <= 1'b1;
+                         end
+                         8'h14: xbus_dat_r <= {24'd0, am_status_out};
++                        8'h18: xbus_dat_r <= {8'd0, am_read_addr};
+                         default: xbus_dat_r <= 32'd0;
+                     endcase
+                 end
+-- 
+2.43.0
+

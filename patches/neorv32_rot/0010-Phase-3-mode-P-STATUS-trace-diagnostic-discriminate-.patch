@@ -1,0 +1,292 @@
+From 36f084a971256d6d6b3f7d67e3e1ccb6e1d667a3 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 14:35:53 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203:=20mode=20'P'=20STATUS-trace=20diagno?=
+ =?UTF-8?q?stic=20=E2=80=94=20discriminate=20NH2/NH3/NH4/NH5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces mode_epcs_probe with an inline diagnostic that bypasses epcs.c
+and instruments every step of the EPCS READ handshake.  Goal: discriminate
+the NH2/NH3/NH4/NH5 hypotheses for the deterministic mode 'P' hang in a
+SINGLE HW test.
+
+Background: Phase 3 night-2026-05-17.  NH1 (firmware busy-poll race) was
+refuted on HW — patch 0009 produced a different bitstream (md5
+871f1ecc...) but the mode 'P' UART capture is byte-identical (md5
+d8dbe639..., 340 B, 3/3 reproducible) to the pre-NH1 bitstream
+(fcfd8122...).  Patch 0009 retained as defensive hardening.  A5
+(asmi_access port missing) was also retracted: the port doesn't exist
+in Quartus 21.1 Lite's altasmi_parallel for Cyclone IV E, and the
+169123 critical-warnings on AS pins are cosmetic (asmiblock atom IS
+placed at AS pins per fit.rpt Pin Info Table).  Firmware A1-A4 still
+verified clean.
+
+Remaining live hypotheses:
+  NH2 — cycloneive_rublock primitive contends with asmiblock at the
+        device architecture level (rublock claims AS pins or related
+        config-pin resources during user mode).
+  NH3 — JTAG-volatile load leaves AS-pin mux / EPCS-config-controller
+        state different from EPCS cold-boot, breaking altasmi handshake.
+  NH4 — shift_bytes 1-cycle pulse is too narrow for altasmi's internal
+        FSM sync flops between CTRL.shift_bytes and the AS-pin SCK toggle.
+  NH5 — EPCS chip part-number mismatch.  EPCS_TYPE="EPCS16" selects
+        opcodes (0x03 READ, 0x05 RDSR, ...) that the actual flash on
+        AX301 may not implement — landed commands but no response.
+
+The diagnostic runs two phases in one mode 'P' invocation:
+  Phase A — RDSR.  Simplest opcode, no shift_bytes pulse.  Tests the
+            megafunction ↔ AS-pin layer with the minimum protocol.
+  Phase B — READ 1B @ 0x000000.  The actual failing path, but with
+            STATUS dumps after every CTRL write + bounded waits +
+            periodic STATUS prints during each wait loop.
+
+Both waits use a 10M-iter cap (~1.2 s @ 50 MHz Wishbone), so a stuck
+state appears as TIMEOUT in the trace instead of an infinite hang.
+
+Interpretation (post-hoc, from the captured trace):
+  - Phase-A RDSR busy never falls (A2 TIMEOUT with STATUS=0x01):
+        megafunction-to-AS layer is broken → NH2 or NH3.
+  - illegal_erase/illegal_write sticky (STATUS bits 2 or 3 set):
+        flash rejected the opcode → NH5 (chip mismatch).
+  - Phase-A OK but Phase-B busy stuck:
+        READ-opcode-specific failure → NH5 (no 0x03 support on this chip)
+        or NH3 (READ pre-amble sensitive to JTAG-volatile state).
+  - Phase-A OK, Phase-B busy normal, B4 dv_wait TIMEOUT with STATUS=0
+        (idle, no DV no busy):
+        shift_bytes pulse didn't land → NH4 (pulse too narrow) or NH3.
+  - Phase-B B5 DATAOUT prints with a real byte value:
+        diagnostic itself works — the original epcs.c path must have a
+        bug this diagnostic happens to dodge.  Re-audit epcs.c vs this
+        inline code.
+
+Stage2 size: 14480 → 15332 B (+852 B for diagnostic prints).  IMEM is
+32 K (bumped in patch 0003) so fits with plenty of headroom.
+
+Cross-tests still pass: test_lutcodec_c 127/127 + test_edits_bin 5/5
+(diagnostic only changes mode 'P' handler; codec + edits path
+unaffected).
+---
+ sw/stage2_loader/main.c | 198 +++++++++++++++++++++++++++++++++++-----
+ 1 file changed, 177 insertions(+), 21 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index d8229ae..2b0fd3e 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -260,34 +260,190 @@ static void dump_words(uint32_t addr, int n)
+  */
+ #define EPCS_PROBE_BYTES   64u
+ 
++/* Diagnostic mode 'P' (post-NH1-refutation): inline STATUS-trace probe.
++ *
++ * Bypasses epcs.c entirely.  Goal: in ONE HW test, capture enough of the
++ * altasmi state machine's reaction to each CTRL write that we can
++ * discriminate NH2/NH3/NH4/NH5 (see reference-rublock-complexity.md
++ * §"after retraction + NH1 HW test").
++ *
++ * Phase A — RDSR path (no shift_bytes).  If this works the megafunction
++ * ↔ AS-pin layer is healthy and the hang is shift_bytes- or read-opcode-
++ * specific.  If RDSR busy stays high or DV never asserts after RDSR,
++ * the failure is at the megafunction-to-flash interface (NH2/NH3/NH5).
++ *
++ * Phase B — single-byte READ at addr 0.  STATUS sampled after every
++ * CTRL write.  Both wait_not_busy and wait_data_valid replaced with
++ * bounded iter loops; STATUS printed periodically during the wait.
++ *
++ * Classification (interpret the trace post-hoc):
++ *   - Phase-A RDSR busy never falls          → NH2/NH3 (arb/pin-mux layer)
++ *   - illegal_erase or illegal_write sticky  → NH5 (opcode rejected — chip mismatch)
++ *   - Phase-A OK, Phase-B busy stuck high    → NH2/NH3 on READ path
++ *   - Phase-A OK, busy normal, DV never      → NH4 (shift_bytes pulse) or NH3
++ *   - Phase-B succeeds (DV asserts, byte 0)  → diagnostic itself is wrong;
++ *                                              re-examine epcs.c vs this code
++ */
+ static void mode_epcs_probe(void)
+ {
+-    uart_puts("[stage2] Mode: EPCS probe — read 64 B @0x000000\r\n");
+-
+-    uint8_t buf[EPCS_PROBE_BYTES];
+-    epcs_read(0x000000, sizeof(buf), buf);
+-
+-    for (uint32_t row = 0; row < sizeof(buf); row += 16) {
+-        uart_puthex32(row);
+-        uart_puts(":");
+-        for (uint32_t col = 0; col < 16; col++) {
+-            uart_putc(' ');
+-            uint8_t b = buf[row + col];
+-            const char hex[] = "0123456789abcdef";
+-            uart_putc(hex[b >> 4]);
+-            uart_putc(hex[b & 0xF]);
++    #define DP_BASE    0xF2000000UL
++    #define DP_CTRL    ((volatile uint32_t *)(DP_BASE + 0x00))
++    #define DP_ADDR    ((volatile uint32_t *)(DP_BASE + 0x04))
++    #define DP_STATUS  ((volatile uint32_t *)(DP_BASE + 0x0C))
++    #define DP_DATAOUT ((volatile uint32_t *)(DP_BASE + 0x10))
++    #define DP_ESTAT   ((volatile uint32_t *)(DP_BASE + 0x14))
++
++    /* CTRL bits (from epcs.c) */
++    #define DC_READ        (1u << 0)
++    #define DC_RD_STATUS   (1u << 3)
++    #define DC_SHIFT_BYTES (1u << 4)
++
++    /* STATUS bits (from epcs.c — wrapper concat {ill_w, ill_e, dv, busy}) */
++    /* STATUS_BUSY=b0, STATUS_DV=b1, STATUS_ILL_ERASE=b2, STATUS_ILL_WRITE=b3 */
++
++    uart_puts("[P] diagnostic STATUS-trace probe v1\r\n");
++
++    /* ---- Step P0: STATUS at idle (no CTRL writes yet) ---- */
++    uart_puts("[P] s0 idle STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    /* =================================================================
++     * Phase A — RDSR (no shift_bytes, simplest opcode path)
++     * ================================================================= */
++    uart_puts("[P] --- Phase A: RDSR ---\r\n");
++
++    *DP_CTRL = DC_RD_STATUS;
++    uart_puts("[P] A1 after CTRL=RD_STATUS STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    {
++        /* bounded wait_not_busy on RDSR.  Iter cap empirically ~10M
++         * (NEORV32 @ 50 MHz, Wishbone read ~6 cycles → ~0.12 µs per
++         * iter → 10M ≈ 1.2 s).  Print every ~1M iters. */
++        uint32_t i;
++        uint32_t s = 0;
++        uint32_t prints = 0;
++        for (i = 0; i < 10000000u; i++) {
++            s = *DP_STATUS;
++            if (!(s & 0x1u)) break;
++            if ((i & 0xFFFFFu) == 0u && prints < 12u) {
++                uart_puts("[P] A2 wait_not_busy i=");
++                uart_puthex32(i);
++                uart_puts(" STATUS=");
++                uart_puthex32(s);
++                uart_puts("\r\n");
++                prints++;
++            }
+         }
+-        uart_puts("\r\n");
++        uart_puts("[P] A2 done i=");
++        uart_puthex32(i);
++        uart_puts(" final=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000000u) ? " TIMEOUT\r\n" : " OK\r\n");
+     }
+ 
+-    uint8_t st = epcs_read_status();
+-    uart_puts("[epcs] RDSR=0x");
++    uint32_t rdsr_byte = *DP_ESTAT;
++    uart_puts("[P] A3 ESTAT=");
++    uart_puthex32(rdsr_byte);
++    uart_puts("\r\n");
++
++    *DP_CTRL = 0;
++    uart_puts("[P] A4 after CTRL=0 STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    /* =================================================================
++     * Phase B — READ 1 byte @ 0x000000 (the failing path)
++     * ================================================================= */
++    uart_puts("[P] --- Phase B: READ 1B @0 ---\r\n");
++
++    *DP_ADDR = 0x000000u;
++    uart_puts("[P] B0 ADDR=0 STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    *DP_CTRL = DC_READ;
++    uart_puts("[P] B1 after CTRL=READ STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
+     {
+-        const char hex[] = "0123456789abcdef";
+-        uart_putc(hex[st >> 4]);
+-        uart_putc(hex[st & 0xF]);
++        uint32_t i;
++        uint32_t s = 0;
++        uint32_t prints = 0;
++        for (i = 0; i < 10000000u; i++) {
++            s = *DP_STATUS;
++            if (!(s & 0x1u)) break;
++            if ((i & 0xFFFFFu) == 0u && prints < 12u) {
++                uart_puts("[P] B2 pre-amble wait i=");
++                uart_puthex32(i);
++                uart_puts(" STATUS=");
++                uart_puthex32(s);
++                uart_puts("\r\n");
++                prints++;
++            }
++        }
++        uart_puts("[P] B2 done i=");
++        uart_puthex32(i);
++        uart_puts(" final=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000000u) ? " TIMEOUT\r\n" : " OK\r\n");
+     }
+-    uart_puts(" probe DONE\r\n");
++
++    *DP_CTRL = DC_READ | DC_SHIFT_BYTES;
++    uart_puts("[P] B3 after CTRL=READ|SHIFT_BYTES STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    {
++        /* bounded wait_data_valid.  Same iter scale as wait_not_busy. */
++        uint32_t i;
++        uint32_t s = 0;
++        uint32_t prints = 0;
++        for (i = 0; i < 10000000u; i++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++            if ((i & 0xFFFFFu) == 0u && prints < 12u) {
++                uart_puts("[P] B4 dv_wait i=");
++                uart_puthex32(i);
++                uart_puts(" STATUS=");
++                uart_puthex32(s);
++                uart_puts("\r\n");
++                prints++;
++            }
++        }
++        uart_puts("[P] B4 done i=");
++        uart_puthex32(i);
++        uart_puts(" final=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000000u) ? " TIMEOUT\r\n" : " OK\r\n");
++
++        if (s & 0x2u) {
++            uint32_t b = *DP_DATAOUT;
++            uart_puts("[P] B5 DATAOUT=");
++            uart_puthex32(b);
++            uart_puts("\r\n");
++        }
++    }
++
++    *DP_CTRL = 0;
++    uart_puts("[P] B6 after CTRL=0 STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    uart_puts("[P] diagnostic DONE\r\n");
++
++    #undef DP_BASE
++    #undef DP_CTRL
++    #undef DP_ADDR
++    #undef DP_STATUS
++    #undef DP_DATAOUT
++    #undef DP_ESTAT
++    #undef DC_READ
++    #undef DC_RD_STATUS
++    #undef DC_SHIFT_BYTES
+ }
+ 
+ /* Mode 'u': Load U-Boot (original behavior) */
+-- 
+2.43.0
+

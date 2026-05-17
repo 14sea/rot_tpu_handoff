@@ -1,0 +1,101 @@
+From 59ed2d9673b6c4f066733777abae511c87a1e9af Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 16:04:27 +0100
+Subject: [PATCH 2/2] Phase 3 NH8 v3 (diag firmware): B5b/B5c steps exercising
+ CTRL.b7
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Diagnostic-firmware extension to patch 0010's mode_epcs_probe.
+Adds two post-DATAOUT-read steps that exercise the CTRL.b7
+ctrl_rden_drop pulse introduced by patch 0013:
+
+  B5b — write CTRL = READ | RDEN_DROP, snapshot STATUS
+  B5c — bounded 10M-iter wait for busy=0 (with periodic STATUS
+        print every ~256k iters); reports OK or TIMEOUT with the
+        final STATUS value
+
+Splits cleanly from the wrapper-only NH8 v3 (patch 0013).  Reason
+for split: wrapper RTL change is a hardware-interface extension
+useful for any future EPCS code path; the firmware steps are a
+diagnostic instrumentation on top of patch 0010's STATUS-trace
+probe specifically.  Logically two concerns, now two patches.
+
+POST-HW TEST RESULT — same as patch 0013 (see its commit message
++ docs/captures/diag_nh8v3_rden_pulse_noop.log md5 b33a3230):
+B5b shows STATUS=0x03 immediately after the rden_drop pulse
+(no change from B6 baseline).  B5c bounded wait TIMEOUT with
+final STATUS=0x03 (busy never deasserts after the firmware
+pulse).  Confirms the single-cycle rden=0 window misses the
+megafunction's stage_cntr=2'b10 window for end_read_reg to fire.
+
+Stage2 ELF: 15332 → 15544 B (+212 B for the new diag prints +
+bounded wait counter).
+
+Patch retained: B5b/B5c are the empirical evidence record that
+the firmware-pulse approach was tested and refuted.  Without
+them, the trace would look identical to baseline diagnostic and
+the refutation wouldn't be visible in the capture.  Future
+session needs these to confirm whether megafunction regen
+actually changes B5b/B5c behavior — until then, they show the
+deadlock.
+
+Companion patch: 0013 (NH8 v3 wrapper RTL — adds CTRL.b7 +
+ctrl_rden_drop + am_rden).  This patch (0014) DEPENDS on 0013;
+the CTRL_RDEN_DROP bit literal in main.c (1u << 7) only works
+when wb_altasmi_parallel.v actually wires that bit through.
+---
+ sw/stage2_loader/main.c | 26 +++++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 2b0fd3e..8a0a05d 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -293,10 +293,11 @@ static void mode_epcs_probe(void)
+     #define DP_DATAOUT ((volatile uint32_t *)(DP_BASE + 0x10))
+     #define DP_ESTAT   ((volatile uint32_t *)(DP_BASE + 0x14))
+ 
+-    /* CTRL bits (from epcs.c) */
++    /* CTRL bits (from epcs.c + NH8 v3 wrapper) */
+     #define DC_READ        (1u << 0)
+     #define DC_RD_STATUS   (1u << 3)
+     #define DC_SHIFT_BYTES (1u << 4)
++    #define DC_RDEN_DROP   (1u << 7)   /* NH8 v3: drops rden for 1 cycle */
+ 
+     /* STATUS bits (from epcs.c — wrapper concat {ill_w, ill_e, dv, busy}) */
+     /* STATUS_BUSY=b0, STATUS_DV=b1, STATUS_ILL_ERASE=b2, STATUS_ILL_WRITE=b3 */
+@@ -428,6 +429,29 @@ static void mode_epcs_probe(void)
+         }
+     }
+ 
++    /* NH8 v3: pulse rden_drop to terminate the read.  This is the last
++     * byte (we asked for 1), so drop rden for one cycle to fire
++     * end_read_reg → busy_wire deasserts → operation completes. */
++    *DP_CTRL = DC_READ | DC_RDEN_DROP;
++    uart_puts("[P] B5b after CTRL=READ|RDEN_DROP STATUS=");
++    uart_puthex32(*DP_STATUS);
++    uart_puts("\r\n");
++
++    /* Bounded wait for busy=0 after rden drop. */
++    {
++        uint32_t i;
++        uint32_t s = 0;
++        for (i = 0; i < 10000000u; i++) {
++            s = *DP_STATUS;
++            if (!(s & 0x1u)) break;
++        }
++        uart_puts("[P] B5c post_rden_drop_wait i=");
++        uart_puthex32(i);
++        uart_puts(" final=");
++        uart_puthex32(s);
++        uart_puts((i >= 10000000u) ? " TIMEOUT\r\n" : " OK\r\n");
++    }
++
+     *DP_CTRL = 0;
+     uart_puts("[P] B6 after CTRL=0 STATUS=");
+     uart_puthex32(*DP_STATUS);
+-- 
+2.43.0
+
