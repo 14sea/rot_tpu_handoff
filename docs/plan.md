@@ -310,6 +310,344 @@ NH1 is now also a claim — but it's expressed as a *hypothesis under
 HW test*, not a confirmed root cause, with explicit refutation
 criteria.
 
+**Diagnostic STATUS-trace probe applied + HW-tested 2026-05-17 evening**:
+patch `0010-Phase-3-mode-P-STATUS-trace-diagnostic-discriminate-.patch`
+replaces `mode_epcs_probe` with an inline diagnostic that bypasses
+`epcs.c` and instruments every step of the EPCS handshake.  Phase A
+exercises the simplest opcode (RDSR — no shift_bytes) and Phase B
+exercises the failing READ path with bounded waits + periodic STATUS
+prints.  Wrapper: `scripts/diag_mode_p_test.py` (forked from
+`nh1_mode_p_test.py`; parses `[P]` tag trace + classifies NH outcomes).
+
+**HW test result (2026-05-17 evening, diagnostic bitstream md5
+`f931e805de66cf13c5a386f5cfb06c67`, 368011 B, third distinct build
+after `fcfd8122…` and `871f1ecc…`)**:
+UART capture md5 `d9330cae7e1effbc39447fc1345ad39a`, 1510 B at
+`/tmp/diag_mode_p.log`.  Stage2 returned to dispatcher after the
+bounded waits — FPGA no longer left in a hung state.
+
+Phase A (RDSR):
+```
+[P] A1 after CTRL=RD_STATUS STATUS=0x00000001   (busy=1, no DV)
+[P] A2 done i=0x00000006 final=0x00000000 OK    (busy fell in 6 iters)
+[P] A3 ESTAT=0x00000000                         (no WIP, no flags)
+[P] A4 after CTRL=0 STATUS=0x00000000
+```
+→ Megafunction ↔ AS-pin layer is functional.  RDSR opcode (0x05)
+lands, flash responds, busy clears cleanly.
+
+Phase B (READ 1B @0):
+```
+[P] B1 after CTRL=READ STATUS=0x00000003        (busy=1, DV=1 ?!)
+[P] B2 done i=0x00989680 final=0x00000003 TIMEOUT
+                                                (busy stuck 10M iters,
+                                                 STATUS=0x03 throughout)
+[P] B3 after CTRL=READ|SHIFT_BYTES STATUS=0x00000003
+[P] B4 done i=0x00000000 final=0x00000003 OK   (DV bit was already set)
+[P] B5 DATAOUT=0x000000ff                       (likely phantom byte)
+```
+→ **READ pre-amble hangs**: `busy_wire` asserts and never clears.
+This precisely matches the production-path symptom: `epcs_read()`
+writes `CTRL_READ`, calls `wait_not_busy()`, spins forever in the
+second `while (am_status() & STATUS_BUSY) { }`.  The diagnostic
+"succeeds" only because its bounded iter cap returns; the DATAOUT
+byte (`0xff`) and `B4 OK` are artifacts of `STATUS_DV` having been
+asserted at the moment `CTRL=READ` was written (B1), so the dv_wait
+short-circuits without any real shift.
+
+**Hypothesis verdict ledger after this run**:
+
+| ID | Hypothesis | Verdict | Evidence |
+|----|-----------|---------|----------|
+| NH1 | firmware busy-poll race | refuted (prior) | 3/3 byte-identical with patch 0009 applied |
+| NH2 | rublock-vs-asmiblock arch contention | live | consistent: hangs on READ-class, not on RDSR |
+| NH3 | JTAG-volatile pin-state mismatch | live | same: pre-amble fails to complete |
+| NH4 | shift_bytes pulse too narrow | **refuted** | failure is upstream of shift_bytes pulse |
+| NH5 | EPCS chip part-number mismatch | mostly refuted | RDSR (0x05) works on this chip; READ (0x03) is universal across EPCS family — would only fit a 4-byte-addr EPCQ-A clone |
+| NH6 | wrapper `flag_data_valid` mis-asserted on CTRL=READ rising edge | **NEW (live)** | STATUS=0x03 (DV=1) appears with no shift_bytes pulse — wrapper RTL bug or megafunction-level DV-during-preamble |
+
+**What this discriminates from the prior session**:
+- Old observation: "wait_data_valid hangs forever, 51-byte capture."
+- New, much sharper observation: "wait_not_busy() hangs in the pre-
+  amble — busy_wire is permanently asserted after CTRL=READ".  The
+  prior reading was misled by the production `epcs_read()` masking
+  pre-amble busy-stuck as a dv-never-asserts symptom (because
+  firmware never got past wait_not_busy to even reach wait_data_valid).
+
+**Next-step priority (in cost-vs-information order)**:
+1. **NH6 wrapper audit** (free, paper-only): re-read
+   `wb_altasmi_parallel.v` STATUS-register concat + `flag_data_valid`
+   latching logic.  Looking for any path where the `read` level
+   transitions to 1 directly clocks `flag_data_valid` to 1 without
+   gating on `am_data_valid` rising-edge.  Also check whether the
+   megafunction's `data_valid` is held by altasmi during pre-amble
+   (legitimate but the wrapper should clear it before READ).
+2. **NH2 static check** (free, paper-only): grep cycloneiii_rublock
+   primitive doc / behavioral model for any path that claims
+   `nCSO`/`ASDO`/`DCLK`/`DATA0` during user mode (independent of
+   reset_timer).  rublock OPERATION_MODE="REMOTE" is set; that mode
+   may park config controller in a state that owns AS pins until a
+   reconfig command.
+3. **NH3 destructive test** (medium cost, overwrites factory ALINX):
+   `openFPGALoader -f diagnostic.rbf` to EPCS, power-cycle the
+   board, observe whether READ pre-amble now completes.  Definitive
+   discriminator between NH2 and NH3.  Recommend only after NH6/NH2
+   paper checks.
+4. **NH5 visual check** (free): inspect AX301 silk-screen near U?
+   for actual EPCS chip part number; cross-ref opcode subset.
+
+Discipline note: this diagnostic adheres to
+[[feedback-empirical-over-plan-claims]] — the patch refutes NH1/NH4,
+narrows NH5, and surfaces NH6 from a *single* HW test rather than
+chained inferences.  No claim is escalated to confirmed root cause
+yet; NH2/NH3/NH6 remain live hypotheses.
+
+**2026-05-17 evening continuation — NH6/NH7/NH8 iterated, structural
+deadlock identified, megafunction regen required**.
+
+After the diagnostic STATUS-trace pinpointed CTRL=READ pre-amble as
+the hang, a five-iteration wrapper-RTL audit + HW-test cycle ran:
+
+| Patch | Hypothesis | Bitstream md5 | Capture md5 (size) | HW result | Verdict |
+|-------|------------|---------------|--------------------|-----------|---------|
+| 0010 baseline | diagnostic STATUS-trace probe (reference) | `f931e805` | `d9330cae` (1510 B) | stage4 deadlock — B2 TIMEOUT @ STATUS=0x03 across 10M iters | reference signature |
+| 0011 NH6 | POR reset stretcher for altasmi | `aa41f714` | `d9330cae` (1510 B) | byte-identical to baseline | refuted (spec-correct, retained as defensive) |
+| 0012 NH7 | Connect `read_address` MMIO 0x18 → restore `read_add_cntr` | `011a4c37` | `d9330cae` (1510 B) | byte-identical to baseline (`read_add_cntr` restored in netlist; `end_read_reg` still pruned) | partial — not the sole fix |
+| 0013 NH8 v1 | `am_rden = ~dataout_read_req` (per-byte ack on DATAOUT read) | `bdee9496` | `d9330cae` (1510 B) | byte-identical to baseline | refuted (rden-drop window misaligned with `data_valid_wire`) |
+| 0013 NH8 v2 | `am_rden = 1'b0` (constant 0) | `891efece` | **`cd860075` (1413 B)** | **B1 STATUS=0x00 immediately** — FSM aborts before any byte shifts | mechanism confirmed but unusable (operation never produces data) |
+| 0013 NH8 v3 | `am_rden = ~ctrl_rden_drop` (firmware-pulsed via CTRL.b7) | `1787cd8a` | `b33a3230` (1630 B) | same STATUS=0x03 hang body + B5b/B5c showing rden_drop pulse no-op | refuted by timing analysis |
+| (prior) production NH1 | `wait_not_busy()` two-phase wait | `871f1ecc` | `d8dbe639` (340 B) | production `epcs_read()` hang in `wait_data_valid()` | refuted 3/3 |
+
+Captures live at `docs/captures/{diag_baseline_hang,diag_nh8v2_rden0_fsm_abort,diag_nh8v3_rden_pulse_noop,prod_modeP_hang}.log` with full md5 + reproduction recipe.
+
+**Power-cycle sanity check**: AX301 power-cycled mid-sequence between
+NH8 v1 and v2.  Only difference in trace was the pre-flash factory
+ALINX timestamp `2010-3-17 14:19:33` — body byte-identical.
+**NH3 (JTAG-volatile vs cold-boot pin-state) refuted decisively.**
+
+**Structural deadlock identified by deep read of `rtl/ip/epcs_ctrl.v`**:
+
+- Line 745: `dvalid_reg` is level-locked once set; only cleared by
+  `wire_dvalid_reg_sclr = end_op_wire | end_operation`.
+- Line 1736: `end_op_wire` requires `(do_read & end_read)` to fire
+  for the read branch.
+- Line 813: `end_read_reg <= (~rden) & do_read & data_valid_wire &
+  end_read_byte`.
+- Line 803: `end_read_byte` requires `stage_cntr_q == 2'b10`.
+- Line 377: FSM clk_en has `~(stage4_wire & ~end_read)` term → if
+  in stage4 with `~end_read`, FSM is **frozen** (stage_cntr cannot
+  advance back to 2'b10).
+
+This is a chicken-and-egg:
+
+1. FSM enters stage4 with rden=1.
+2. stage_cntr drifts to some non-2'b10 state.
+3. dvalid_reg level-locks from a moment when stage_cntr WAS at 2'b10.
+4. Firmware drops rden (NH8 v3 pulse): `(~rden)` becomes 1, but at
+   that cycle stage_cntr is no longer 2'b10, so end_read_byte=0,
+   end_read_reg cannot fire.
+5. Without end_read, FSM clk_en stays 0, stage_cntr never returns
+   to 2'b10.  Permanent stuck state.
+
+Wrapper-RTL fixes alone cannot rescue this — the FSM's deadlock is
+structural in the qmegawiz output.  **The wrapper's "shift_bytes
+per byte + rden=1" protocol is incompatible with this megafunction
+configuration.**
+
+**Phase 3 closure path = Phase 4 megafunction rework**.  The next
+session should regenerate `altasmi_parallel` via qmegawiz with at
+least `port_fast_read=PORT_USED` enabled (currently `PORT_UNUSED`).
+Fast read has a different FSM branch (`end_fast_read` vs `end_read`
+in `end_op_wire`) that may avoid the stage4 deadlock.  If that
+doesn't yield, the fallback is hand-writing a SPI master against
+the `cycloneive_asmiblock` primitive directly (skip the
+megafunction entirely; ~200–400 LE, 2–3 h estimated).
+
+**Patches retained in stack** (all spec-correct, none harmful):
+
+- 0010 diagnostic mode 'P' STATUS-trace probe (essential debug tool)
+- 0011 NH6 POR reset stretcher (altasmi spec compliance)
+- 0012 NH7 read_address MMIO 0x18 (prevents read_add_cntr pruning;
+  enables future runtime address sniff)
+- 0013 NH8 v3 firmware-controlled rden via CTRL.b7 (foundation for
+  the proper end-of-read protocol once megafunction is regen'd)
+
+**Cumulative empirical findings** (refuted hypotheses worth not
+re-testing):
+
+| ID | Status |
+|----|--------|
+| NH1 firmware busy-poll race | refuted (3/3 byte-identical) |
+| NH3 JTAG-volatile pin-state | refuted (power-cycle no change) |
+| NH4 shift_bytes pulse width | refuted (failure upstream) |
+| NH5 EPCS chip mismatch | mostly refuted (RDSR opcode 0x05 works) |
+| NH6 wrapper POR reset missing | refuted (POR added, no behavior change) |
+| NH7 read_add_cntr pruned | partial (restored at synthesis, didn't unstick) |
+| NH8 v1/v2/v3 rden polarity | refuted (deadlock is structural, not rden alone) |
+
+Discipline maintained ([[feedback-empirical-over-plan-claims]]):
+every "this is the fix" claim was tested before committing; when
+the test refuted the claim, plan.md was updated rather than the
+claim being defended.
+
+**Untested combinations (intentionally deferred, recorded for
+session-handoff transparency)**:
+
+- *Production `epcs_read()` mode 'P' path with patches 0011-0013
+  applied*.  Not tested this session.  Rationale: the production
+  path also calls into the same `epcs_ctrl` megafunction READ FSM
+  that the diagnostic exercises; the stage4 deadlock identified
+  is in the megafunction itself, not in firmware sequencing.
+  Running production `epcs_read()` against the NH8 v3 wrapper
+  would hit the same deadlock at the first `wait_not_busy()` in
+  `epcs_read()` (which is what the prior session's
+  `prod_modeP_hang.log` md5 d8dbe639 already shows).  No new
+  information.  Re-test only after the megafunction is regen'd
+  (Phase 4 megafunction rework) — at that point both diagnostic
+  AND production paths should be re-validated.
+- *Diagnostic mode 'P' with patch 0013 applied but firmware
+  CTRL_RDEN_DROP step skipped*.  Not tested.  Would behave
+  identically to baseline (`d9330cae`) since am_rden defaults to
+  1 when no firmware pulse arrives — i.e. functionally same as
+  NH8 v1 / NH7 stack.  No new information.
+- *Mode 'P' on a different EPCS chip*.  AX301 board's actual
+  flash chip part number was never visually inspected (NH5 sub-
+  question).  If next session yields a working FSM but reads
+  return garbage, this is the remaining live variable.
+
+**2026-05-17 night — NH9: megafunction regen with port_fast_read=PORT_USED
+applied, statically verified, HW test PENDING.**
+
+Per the path-forward in [[reference-rublock-complexity]] §"Path forward",
+the altasmi_parallel megafunction was regenerated via qmegawiz silent
+mode with `PORT_FAST_READ STRING "PORT_USED"` added to the Retrieval
+info block.  Workflow: edit `rtl/ip/epcs_ctrl.v` Retrieval info → run
+`cd rtl/ip && qmegawiz -silent epcs_ctrl.v` → it rewrites the body in
+place.  Silent regen succeeded; new module has `input fast_read;` (line
+74), `fast_read_reg` (line 829, latches on `(~busy_wire) & rden_wire`),
+`do_fast_read` driver (line 1737), and the stage3 do_wait_dummyclk
+FSM-unlock at line 383 OR-term.  clearbox_defparam updated to reflect
+port_fast_read=PORT_USED.
+
+**Empirical surprise**: qmegawiz 21.1 Lite treats `read` and `fast_read`
+as a mutex.  When PORT_FAST_READ=PORT_USED was added, qmegawiz silently
+**removed** the `read` USED_PORT entry from the Retrieval info AND
+dropped the `read` input port from the module — `do_read` became tied
+to `1'b0` internally.  Re-adding the `read` USED_PORT to Retrieval info
+and re-running qmegawiz silent did NOT help; qmegawiz stripped it
+again on every regen.  Implication: this megafunction can use plain
+READ XOR FAST_READ, never both.  Adopted FAST_READ as the canonical
+read path; removed the `.read(ctrl_read)` connection from
+`wb_altasmi_parallel.v` and deleted the now-broken `epcs_read()` from
+`epcs.c`.  CTRL.b0 in the wrapper is now reserved (was `read`).
+CTRL.b8 holds the new `fast_read` level bit.
+
+Discoveries during the FSM audit (recorded since prior memory got it
+partially wrong):
+- `end_fast_read` is literally `= end_read_reg` (line 1740), so end-of-op
+  termination semantics are IDENTICAL between READ and FAST_READ.
+  The fast_read-only advantage is the **stage3 do_wait_dummyclk
+  OR-unlock** at line 383, NOT a different stage4 termination branch.
+- The diag trace (STATUS=0x03 stuck after CTRL=READ) is at the
+  **pre-amble**, not at stage4 data-shift as prior memory claimed.
+  busy_wire = (do_read | do_fast_read | ...) stays high for the whole
+  operation; "wait_not_busy after CTRL=READ" would always hang.  The
+  diag firmware's bounded loop reveals this; production `epcs_read()`
+  hangs on the same condition.
+
+Build artifacts:
+- **Bitstream md5 `5145a6d7c5362390d2086acb64dec627`** (9th distinct
+  build), 368011 B, at `/home/test/neorv32_rot/output/neorv32_demo.rbf`.
+- **Stage2 ELF 16256 B** (+712 B from NH8 v3's 15544 B; Phase C diag
+  + new `epcs_fast_read()` driver).
+- **LE budget 8880 / 10320 (86 %)** — +58 LE from NH8 v3's 8822
+  (fast_read_reg + read_add_cntr counter restoration + Phase C diag).
+- **map.rpt Registers Removed**: only `read_add_cntr|counter_reg_bit[24]`
+  (unused upper bit of 25-bit counter; address space is 24-bit so b24
+  has no fanout).  Critically, the registers that were pruned in prior
+  builds — `end_read_reg`, `add_rollover_reg`, `read_add_cntr|
+  counter_reg_bit[0..24]` — are now all preserved through synthesis.
+  Per the success criterion, **end_read_reg + end_fast_read alias both
+  alive at synthesis**.
+
+Code changes (uncommitted in neorv32_rot, to be packaged as patch 0015):
+- `rtl/ip/epcs_ctrl.v` — qmegawiz silent regen output (full body
+  rewritten); +164/-99 lines net.
+- `rtl/wb_altasmi_parallel.v` — add `ctrl_fast_read` reg + CTRL.b8,
+  wire `.fast_read()`, remove dropped `.read()`/`ctrl_read`.
+- `sw/stage2_loader/epcs.c` — add `epcs_fast_read()`, add
+  `CTRL_RDEN_DROP` + `CTRL_FAST_READ` macros, delete `epcs_read()`.
+- `sw/stage2_loader/epcs.h` — replace `epcs_read()` declaration with
+  `epcs_fast_read()`.
+- `sw/stage2_loader/main.c` — add Phase C (FAST_READ 4B + RDEN_DROP
+  termination) to mode 'P' inline diagnostic.
+
+Diag script `scripts/diag_mode_p_test.py` updated with Phase C
+parsing (C2_BYTE_RE, C4_RE) and three new verdicts:
+- `NH9_FAST_READ_OK` — bytes ≠ 0xff read; phase 3 closure achieved.
+- `NH9_PHANTOM_FF` — DV asserted but all bytes 0xff (data-path issue).
+- `NH9_FAST_READ_HANG` — Phase C also hangs (fall back to Plan B:
+  hand-write SPI master against cycloneive_asmiblock primitive).
+
+**HW test result (2026-05-17 night)**: ✅ **NH9_FAST_READ_OK** —
+real EPCS bytes returned via FAST_READ.
+
+Capture (md5 `9d80d60c…`, 2487 B at
+`docs/captures/diag_nh9_fast_read_ok.log`):
+```
+[P] --- Phase C: FAST_READ 4B @0 ---
+[P] C0 ADDR=0 STATUS=0x00000000
+[P] C1 after CTRL=FAST_READ STATUS=0x00000003       ← busy + DV asserted
+[P] C2 byte=0 wait_dv i=0x0 STATUS=0x03 DATAOUT=0x7d   ← real ALINX byte 0
+[P] C2 byte=1 wait_dv i=0x0 STATUS=0x03 DATAOUT=0x21   ← real ALINX byte 1
+[P] C2 byte=2 wait_dv i=0x0 STATUS=0x03 DATAOUT=0x0f
+[P] C2 byte=3 wait_dv i=0x0 STATUS=0x03 DATAOUT=0x00
+[P] C3 after CTRL=FAST_READ|RDEN_DROP STATUS=0x00000003
+```
+
+Bitstream actually flashed: md5 `5145a6d7c5362390d2086acb64dec627`
+(post-P1 NH9 with updated Phase B trace text; functionally identical
+to the original NH9 build `df477575`).
+
+**Findings from HW test**:
+1. Phase C FAST_READ pre-amble (opcode 0x0B + 24-bit addr + 1 dummy
+   byte) completes correctly.  wait_dv terminates at `i=0` for every
+   byte — `data_valid_wire` asserts inside one Wishbone-read polling
+   cycle of `shift_bytes` going high.  Wrapper's DV latch is sound.
+2. Bytes are real (≠ 0xff phantom).  AX301 flash chip is alive,
+   asmiblock physical pin path is healthy on this silicon, and the
+   stage3 `do_wait_dummyclk` FSM-unlock at epcs_ctrl.v line 383 is
+   the actual path that breaks the pre-amble deadlock.
+3. **Side-effect regression — Phase A RDSR now hangs.**  Prior
+   bitstreams: `[P] A2 done i=0x6 final=0x0 OK`.  NH9: `[P] A2 done
+   i=0x989680 final=0x1 TIMEOUT` — busy_wire stays at 1 forever after
+   `CTRL=RD_STATUS`.  Hypothesis: the `read` port removal also altered
+   the read_status FSM completion path (likely because end_op_wire has
+   branches gated on `(do_read | do_fast_read)`-style terms; with
+   `do_read = 1'b0`, the stat path now has a different completion
+   precondition).  Need to re-audit epcs_ctrl.v line ~1736 end_op_wire
+   for read_status branches and verify the NH9 regen didn't break
+   them.  Impact: `epcs_read_status()` (used by `poll_wip_clear` for
+   erase/program completion polling) is now broken.  Not blocking
+   READ closure; needed for write/erase Phase.
+4. Listener bug in `diag_mode_p_test.py`: errored out with `'NoneType'
+   object cannot be interpreted as an integer` after capturing through
+   C3.  Cosmetic — verdict classification still ran on the snapshot
+   buffer.  C4/C5/DONE markers not captured (likely printed by FPGA
+   but listener was closed).  Fix: harden `Listener.run()` cleanup
+   in a follow-up commit.
+
+**Verdict-determined next steps**:
+- (a) Wire production callers (sd_boot, future write paths) to
+  `epcs_fast_read()` since `epcs_read()` is gone.
+- (b) Debug Phase A RDSR regression — paper audit of epcs_ctrl.v
+  end_op_wire stat branches.  If fixable in wrapper, do that;
+  otherwise the read_status path may need its own port enable
+  parameter (PORT_READ_STATUS is already PORT_USED so it's at the
+  megafunction level).
+- (c) Phase 4 ALTREMOTE_UPDATE rework can now proceed against a
+  silicon-validated EPCS read path.
+
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
 **Phase 4.1 finding** (2026-05-17 afternoon, see [[reference-rublock-
