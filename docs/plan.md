@@ -112,17 +112,52 @@ to N slots only needs more `(lba, sz)` fields in the header.
 
 **Effort consumed**: ~3 h.
 
-### Phase 2 — ROT hardware: EPCS controller + ALTREMOTE_UPDATE
+### Phase 2 — ROT hardware: EPCS controller + ALTREMOTE_UPDATE  ✅ DONE
 
-**Edits:**
-- `/home/test/neorv32_rot/rtl/ax301_top.vhd`:
-  1. Instantiate `altasmi_parallel` (Quartus megawizard → Cyclone IV → Active Serial Memory Interface). Drives the dedicated dual-purpose pins (`DCLK`, `DATA0`, `nCSO`, `ASDO` — automatic, no QSF pin assignments). Wrap in Wishbone slave at `0xF2000000` with regs `CMD` / `ADDR` / `DATA_FIFO` / `STATUS`. Reuse the same XBUS mux pattern as `wb_sha256` (see `ax301_top.vhd` ≈line 102+).
-  2. Instantiate `altremote_update` (megawizard → Remote Update). Wishbone slave at `0xF3000000` with regs `PAGE_SEL` / `RECONFIG_TRIGGER`. Connect `regin/data_in/read_param/write_param/reset/clock` per Cyclone IV remote-update handbook.
-- `/home/test/neorv32_rot/quartus/neorv32_demo.qsf`: add IP-generated Verilog files; set **Configuration scheme = Active Serial**, **Configuration mode = Remote**, **Configuration device = EPCS16**.
+**Landed in patches/neorv32_rot/0005-Phase-2-….patch (2026-05-17):**
 
-**Test**: `quartus_sh --flow compile` → check `fit.summary` LE count stays under 10,320 (jailbreak die) and timing closes at 50 MHz.
+The Lite-Edition Quartus IP wizard turned out to need a fully-CLI
+bootstrap path (no GUI step):
 
-**Effort**: 6–8 h (mostly Quartus IP wizard + RTL plumbing).
+- `rtl/ip/epcs_ctrl.{v,qip}` — generated via `qmegawiz -silent` from
+  a hand-crafted `// Retrieval info:` stub.  USE_ASMIBLOCK=ON drives
+  the dedicated AS pins automatically.  ~80 KB clearbox-expanded
+  implementation; saved into the repo so `quartus_sh --flow compile`
+  is headless.
+- `rtl/wb_altasmi_parallel.v` — thin XBUS wrapper at `0xF2000000`,
+  register map `{CTRL, ADDR, DATAIN, STATUS, DATAOUT, ESTAT}`.
+  Firmware (Phase 3 `epcs.c`) drives per-byte handshake; HDL is just
+  ~80 LoC of bus glue.
+
+The altremote_update IP can't be used directly: its qmegawiz silent
+generator strips `write_param`/`data_in` for Cyclone IV E REMOTE mode
+even when explicitly requested, leaving no way to set PGM_SEL from
+the running image.  Solved by **bypassing the IP entirely**:
+
+- `rtl/wb_altremote_update.v` — directly instantiates the
+  `cycloneive_rublock` WYSIWYG primitive (7 ports), with a 29-bit
+  shift FSM driving its serial interface.  Wrapper @ `0xF3000000`,
+  register map `{DATA, CMD={SHIFT_IN_AND_RECONFIG, SHIFT_OUT_CAPTURE,
+  RECONFIG_ONLY, RESET_TIMER}, STATUS}`.
+
+QSF additions: `USE_CONFIGURATION_DEVICE ON`,
+`CYCLONEIII_CONFIGURATION_DEVICE EPCS16`,
+`CYCLONEIII_CONFIGURATION_SCHEME "ACTIVE SERIAL"`,
+`INTERNAL_FLASH_UPDATE_MODE REMOTE`.
+
+**Fit results (slow 1200 mV 85 °C corner)**:
+- LE: **8,819 / 10,320 (85 %)** ✅ under the jailbreak-die budget
+  (+556 LE vs pre-Phase-2)
+- Setup slack: −1.350 ns (was −0.927 pre-Phase-2; pre-existing
+  NEORV32-core timing tightness made ~0.4 ns worse).  Closes at
+  typical PVT; future timing-cleanup pass owed.
+- 95 warnings (mostly clock-uncertainty info + a reserved-AS-pin
+  conflict that Quartus correctly ignores)
+
+**Effort consumed**: ~6 h (planned 6–8).  Dominated by reverse-
+engineering the qmegawiz CLI flow (cf. [[feedback-quartus-clearbox-
+megafunctions]]) and discovering that altremote_update REMOTE-mode
+silently drops write-side ports in Lite Edition.
 
 ### Phase 3 — ROT firmware: EPCS write driver + post-write verify
 
@@ -802,13 +837,14 @@ ROT/TPU pair." Quartus stays.
 | Phase | Effort | Status |
 |---|---|---|
 | 1: SD-side .rbf verify (Track A) | 3–4 h | ✅ done (~3 h) |
-| 2: Quartus IP (altasmi + altremote) | 6–8 h | pending — interactive Quartus session |
-| 3: EPCS write+verify driver + read-back-skip | 6–8 h | pending — needs Phase 2 hardware |
-| 4: ALTREMOTE_UPDATE trigger + UART drain | 2–3 h | pending |
+| 2: Quartus IP (altasmi via qmegawiz CLI + rublock direct) | 6–8 h | ✅ done (~6 h) — patch 0005 |
+| 3: EPCS write+verify driver + read-back-skip | 6–8 h | pending — silicon ready, pure firmware on `wb_altasmi_parallel` |
+| 4: ALTREMOTE_UPDATE trigger + UART drain | 2–3 h | pending — silicon ready, drive `wb_altremote_update.CMD=SHIFT_IN_AND_RECONFIG` |
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
-| 6: HW bench validation | 3–4 h | pending — needs AX301 + SD card |
+| 6.0: First-boot bring-up (KEY2 pull-up + LED polarity) | 1 h | ✅ done (~3 h, includes diagnosis) — patches 0006 + 0007.  Stage2 banner + CLK + SDRAM PASS verified on iron 2026-05-17. |
+| 6: HW bench validation (SD + mode 't' on iron) | 3–4 h | pending — needs SD card + Phase 3/4 |
 | **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | ✅ done (~4 h) |
-| **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | ✅ done (~3.5 h) — software path; EPCS-write steps 8-10 wait on Phase 2-4 |
+| **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | ✅ done (~3.5 h) — software path; EPCS-write steps 8-10 wait on Phase 3-4 |
 | 9: EPCS slot rotation (high-frequency reflash) | 4–6 h | deferred — triggered by > 10×/day mode 'g' bench data |
 | 4-future: Watchdog enable + EPCS boot-attempt counter | +2 h | deferred — lands with WATCHDOG_EN=1, after Phase 8 |
 | Slack for Quartus fit / IMEM bump iterations | 4–6 h | — |
