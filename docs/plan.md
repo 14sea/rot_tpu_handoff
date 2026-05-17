@@ -774,7 +774,64 @@ READ accuracy issue needs follow-up before slot content-verification
 (SHA-256) is trusted, but that's a Phase-3-followup, not a Phase-4
 blocker.
 
-### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
+### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  ✅ DONE (2026-05-17 night, silicon)
+
+**Closure summary** (2026-05-17 night).  Phase 4 is silicon-closed on
+AX301 (bitstream md5 `60094abc6c87914c7f9cd72fa5c62adc`).  Capture
+`docs/captures/diag_phase4_nh12_reconfig_ok.log` (md5 `613db17a…`,
+3357 B): stage2 boots → dispatcher → `'r'` command → wrapper trigger
+→ factory ALINX `2010-3-17 14:19:0` banner appears immediately, then
+ALINX runs its periodic timestamp loop for the rest of the capture.
+Matches success criterion from the original brief.
+
+**Path taken**: Plan B (direct-primitive wrapper, no megafunction).
+The "Recovery path step 1" below (qmegawiz with `SUPPORT_WRITE_CHECK="1"`
+explicit) was **empirically re-tested this session and reproduced the
+prior strip** — generator still drops `write_param`/`data_in`/`pgmout`
+from the outer module in 21.1 Lite REMOTE for Cyclone IV E even with
+the constant set in Retrieval-info.  Recovery path step 2 → fallback
+branch (hand-craft 29-bit shift sequence on existing direct-primitive
+wrapper) is what we landed.
+
+**Hypothesis ladder** (see [[reference-rublock-complexity]]):
+
+- **NH11** (rconfig pulse width): original wrapper held `rconfig` HIGH
+  for 1 sysclk cycle (~20 ns @ 50 MHz).  Cyclone IV E rublock spec
+  requires ≥250 ns.  Fix: 16-cycle hold using existing `bit_cnt` (no
+  new resources).  **Empirically refuted as load-bearing** —
+  byte-identical capture vs pre-RTL-fix proves the FSM never reached
+  S_RECONFIG to test the hold.  Kept defensively (spec-correct).
+- **NH12** (`auto_reconfig` latch — LOAD-BEARING): the bus block
+  cleared `trig_shift_in`/`trig_reconfig` one cycle after CMD write,
+  but `S_LOAD_POST` checked them ~31 cycles later (after the 29-bit
+  shift sequence) and always saw 0 → fell through to S_DONE.
+  SHIFT_IN_AND_RECONFIG never actually fired rconfig.  Fix: latch the
+  intent into `auto_reconfig` at S_IDLE entry, consume in S_LOAD_POST.
+
+**Patches landed**: `patches/neorv32_rot/0018-Phase-4-NH11-NH12-…`
+(wrapper RTL) + `0019-Phase-4-firmware-…` (epcs_remote_reconfig +
+mode 'r' + mode 'g' tail).  19-patch stack still applies cleanly.
+
+**No WD-suicide on this hardware**.  Stage2 was alive for ~4 s of idle
+during the test waiting for `'r'`; no autonomous reconfig.  The prior
+session's WD-suicide hypothesis (~500 ms timeout) does NOT reproduce
+on this AX301 board with current bitstream — consistent with the
+recent re-characterization in [[project-phase-status]].
+
+**Open follow-ups for Phase 9 (slot rotation)**:
+- Multi-slot EPCS layout: factory ALINX at page 0 today; future RoT
+  bitstream + TPU bitstream at higher pages would need a destructive
+  EPCS programming flow to populate.
+- `epcs_remote_reconfig(pgm_sel)` accepts arbitrary byte address; only
+  page 0 has been silicon-validated.  Other pages need EPCS-populated
+  bitstreams.
+- AP_CONFIG_SEL=1 path not yet exercised (boot the "application" image
+  vs the "factory" image).
+
+---
+
+**Original Phase 4 narrative** (kept as historical record — the path
+of falsifications that led to NH11/NH12).
 
 **Phase 4.1 finding** (2026-05-17 afternoon, see [[reference-rublock-
 complexity]]): the plan-v5 estimate "2–3 h, drive
