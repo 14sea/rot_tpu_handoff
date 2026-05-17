@@ -40,7 +40,7 @@ BITSTREAM    = "/home/test/neorv32_rot/output/neorv32_demo.rbf"
 STAGE2_ELF   = "/home/test/neorv32_rot/sw/stage2_loader/main.elf"
 # Diagnostic + NH6 bitstreams known to embed patch 0010's instrumented
 # mode 'P'.  Prefix match is heuristic (any rebuild produces a new md5).
-EXPECTED_DIAG_MD5_PREFIXES = ("f931e805", "aa41f714", "011a4c37", "bdee9496", "891efece", "1787cd8a", "df477575", "5145a6d7", "43f8578e")
+EXPECTED_DIAG_MD5_PREFIXES = ("f931e805", "aa41f714", "011a4c37", "bdee9496", "891efece", "1787cd8a", "df477575", "5145a6d7", "43f8578e", "bc9ba066")
 OFL_LOADER   = os.path.expanduser(
     "~/see_neorv32_run_linux/tools/openFPGALoader/build/openFPGALoader")
 
@@ -104,9 +104,21 @@ class Listener(threading.Thread):
                     f.flush()
 
     def stop(self):
+        # Set the flag and let run() exit naturally on the next loop
+        # iteration (within ~100 ms via ser.read timeout).  Closing
+        # self.ser here would race the in-flight read() and produce
+        # "'NoneType' object cannot be interpreted as an integer".
         self.stop_flag.set()
+
+    def close(self):
+        # Call AFTER join() to release the serial port without racing
+        # the listener thread.
         if self.ser:
-            self.ser.close()
+            try:
+                self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
     def snapshot(self) -> bytes:
         with self.buf_lock:
@@ -393,7 +405,7 @@ def main():
         if r.returncode != 0:
             print(f"  [FAIL] openFPGALoader rc={r.returncode}", flush=True)
             print(f"  stderr: {r.stderr[-500:]}", flush=True)
-            listener.stop()
+            listener.stop(); listener.join(timeout=1.0); listener.close()
             sys.exit(2)
         print("  flash OK", flush=True)
     else:
@@ -402,14 +414,14 @@ def main():
     print("\n=== Wait for stage2 boot ===", flush=True)
     if not listener.wait_for(BANNER_MARK, args.boot_timeout):
         print(f"  [FAIL] no stage2 banner within {args.boot_timeout}s", flush=True)
-        listener.stop()
+        listener.stop(); listener.join(timeout=1.0); listener.close()
         sys.exit(3)
     print("  banner seen", flush=True)
 
     if not listener.wait_for(CRTM_LOCKED, args.boot_timeout):
         print(f"  [FAIL] CRTM locked marker not seen within {args.boot_timeout}s",
               flush=True)
-        listener.stop()
+        listener.stop(); listener.join(timeout=1.0); listener.close()
         sys.exit(4)
     print("  CRTM locked → dispatcher ready", flush=True)
 
@@ -422,7 +434,7 @@ def main():
     saw_entry = listener.wait_for(DIAG_ENTRY, 3.0)
     if not saw_entry:
         print("  [FAIL] [P] diagnostic entry banner not seen", flush=True)
-        listener.stop()
+        listener.stop(); listener.join(timeout=1.0); listener.close()
         sys.exit(5)
     print("  diagnostic entry seen", flush=True)
 
@@ -431,6 +443,7 @@ def main():
     time.sleep(0.5)
     listener.stop()
     listener.join(timeout=1.0)
+    listener.close()
 
     final = listener.snapshot()
 
