@@ -1,0 +1,57 @@
+From 6fba52af5db7a59bd8507b2630b8a993b7a32115 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 00:46:17 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=206.0:=20KEY2=20weak=20pull-up=20?=
+ =?UTF-8?q?=E2=80=94=20un-stick=20first-boot=20reset?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AX301 has no external pull-up on the KEY2 input.  Without one, the pin
+floats below the input threshold, so `rstn_int <= KEY2 and por_cnt(3)`
+in ax301_top.vhd is permanently 0 — the NEORV32 CPU never comes out of
+reset and stage2 produces no UART output.
+
+First hit during Phase 6 silicon bring-up (2026-05-17): JTAG-loaded
+host bitstream was silent on /dev/ttyUSB0 despite blinky / uart-blinker
+test bitstreams running fine on the same board.  Bypassing KEY2 in RTL
+(`rstn_int <= por_cnt(3)`) confirmed the root cause; this commit ships
+the proper one-line QSF fix (internal Cyclone IV weak pull-up).
+
+After the fix, listener-first JTAG SRAM load of the host bitstream
+yields the expected boot trace:
+
+    [stage2] ready - RV32IMAC NEORV32 loader
+    [stage2] CLK=0x02faf080
+    [stage2] SDRAM word-write test...
+    [stage2] SDRAM test PASS
+    [stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud …
+    [stage2] CRTM locked — waiting for host command
+
+(Listener must be open BEFORE openFPGALoader returns; stage2 drains the
+boot burst then idles inside uart_getc_timeout(3600000) — opening cat
+afterwards catches an idle line and looks like silence.)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ quartus/neorv32_demo.qsf | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/quartus/neorv32_demo.qsf b/quartus/neorv32_demo.qsf
+index a22f192..e849f54 100644
+--- a/quartus/neorv32_demo.qsf
++++ b/quartus/neorv32_demo.qsf
+@@ -90,6 +90,10 @@ set_global_assignment -name SDC_FILE neorv32_demo.sdc
+ # ── Pin assignments (AX301 board) ────────────────────────────────────────────
+ set_location_assignment PIN_E1  -to CLOCK
+ set_location_assignment PIN_E16 -to KEY2
++# AX301 has no external pull-up on KEY2 — without this, the pin floats
++# low and rstn_int (KEY2 & por_cnt(3)) is wedged at 0, so the CPU is in
++# permanent reset (Phase 6 bring-up finding 2026-05-17).
++set_instance_assignment -name WEAK_PULL_UP_RESISTOR ON -to KEY2
+ set_location_assignment PIN_M2  -to RXD
+ set_location_assignment PIN_G1  -to TXD
+ set_location_assignment PIN_G15 -to LED[0]
+-- 
+2.43.0
+

@@ -1,0 +1,2690 @@
+From 1ae124441a66a1e1bb05f4a472a53f4df65bf81e Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sat, 16 May 2026 23:55:36 +0100
+Subject: [PATCH] Phase 2: EPCS controller + remote-update via
+ cycloneive_rublock direct
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+ROT host bitstream now exposes two new Wishbone XBUS slaves:
+
+  0xF2000000  wb_altasmi_parallel  — EPCS16 controller wrapping the
+                                     qmegawiz-generated epcs_ctrl
+                                     (altasmi_parallel, USE_ASMIBLOCK=ON
+                                     so the dedicated AS pins are driven
+                                     automatically).  Thin register-map:
+                                     firmware drives the byte-level
+                                     handshake (CTRL/ADDR/DATAIN/STATUS/
+                                     DATAOUT/ESTAT).
+
+  0xF3000000  wb_altremote_update  — 29-bit shift FSM directly
+                                     instantiating cycloneive_rublock,
+                                     bypassing the Lite-Edition
+                                     altremote_update IP (which strips
+                                     write_param/data_in for Cyclone IV E
+                                     in REMOTE mode and refuses param
+                                     overrides via qmegawiz silent).
+
+QSF additions: USE_CONFIGURATION_DEVICE ON, CYCLONEIII_CONFIGURATION_*
+= EPCS16/Active Serial, INTERNAL_FLASH_UPDATE_MODE = REMOTE, plus the
+new VERILOG_FILE + QIP_FILE entries.
+
+IP bootstrap is CLI-only: rtl/ip/epcs_ctrl.v hand-crafted with the
+// Retrieval info: header → qmegawiz -silent regenerates the 80 KB
+clearbox-expanded implementation.  No GUI step required.
+
+Fit: 8,819 / 10,320 LE (85 %); +556 LE vs pre-Phase-2.  Setup slack
+slow 85C -1.350 ns (was -0.927 pre-Phase-2; pre-existing NEORV32-core
+timing tightness — not introduced by this commit, ~0.4 ns worse).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ quartus/neorv32_demo.qsf  |   17 +
+ rtl/ax301_top.vhd         |  103 +-
+ rtl/ip/epcs_ctrl.qip      |    4 +
+ rtl/ip/epcs_ctrl.v        | 1974 +++++++++++++++++++++++++++++++++++++
+ rtl/wb_altasmi_parallel.v |  184 ++++
+ rtl/wb_altremote_update.v |  278 ++++++
+ 6 files changed, 2552 insertions(+), 8 deletions(-)
+ create mode 100644 rtl/ip/epcs_ctrl.qip
+ create mode 100644 rtl/ip/epcs_ctrl.v
+ create mode 100644 rtl/wb_altasmi_parallel.v
+ create mode 100644 rtl/wb_altremote_update.v
+
+diff --git a/quartus/neorv32_demo.qsf b/quartus/neorv32_demo.qsf
+index 64562d2..a22f192 100644
+--- a/quartus/neorv32_demo.qsf
++++ b/quartus/neorv32_demo.qsf
+@@ -76,6 +76,13 @@ set_global_assignment -name VERILOG_FILE ../rtl/wb_sdram_ctrl.v
+ set_global_assignment -name VERILOG_FILE ../rtl/sdram_ctrl.v
+ set_global_assignment -name VERILOG_FILE ../rtl/wb_sha256.v
+ set_global_assignment -name VERILOG_FILE ../rtl/sha256/sha256_core.v
++set_global_assignment -name VERILOG_FILE ../rtl/wb_altasmi_parallel.v
++set_global_assignment -name VERILOG_FILE ../rtl/wb_altremote_update.v
++
++# ── Phase 2 IP: EPCS controller (altasmi_parallel, qmegawiz silent) ─────────
++# Generated via:  cd ../rtl/ip && qmegawiz -silent epcs_ctrl.v
++# Source-of-truth Retrieval info lives at the bottom of epcs_ctrl.v itself.
++set_global_assignment -name QIP_FILE ../rtl/ip/epcs_ctrl.qip
+ 
+ # ── Timing constraint ────────────────────────────────────────────────────────
+ set_global_assignment -name SDC_FILE neorv32_demo.sdc
+@@ -149,6 +156,16 @@ set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+ set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
+ set_global_assignment -name NUM_PARALLEL_PROCESSORS ALL
+ 
++# ── Remote-update / EPCS configuration (Phase 2) ────────────────────────────
++# Active Serial boot from EPCS16 with remote-update support so the running
++# host bitstream can self-reconfigure via altremote_update (page 1 = target).
++# Quartus 21.1 uses CYCLONEIII_* assignment names for the Cyclone IV E
++# family (no separate CYCLONEIV_* aliases registered in this build).
++set_global_assignment -name USE_CONFIGURATION_DEVICE ON
++set_global_assignment -name CYCLONEIII_CONFIGURATION_DEVICE EPCS16
++set_global_assignment -name CYCLONEIII_CONFIGURATION_SCHEME "ACTIVE SERIAL"
++set_global_assignment -name INTERNAL_FLASH_UPDATE_MODE "REMOTE"
++
+ # ── CE10 timing push: exploit extra LEs for placement/routing headroom ──────
+ set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 4.0
+diff --git a/rtl/ax301_top.vhd b/rtl/ax301_top.vhd
+index 7aff475..fb821ec 100644
+--- a/rtl/ax301_top.vhd
++++ b/rtl/ax301_top.vhd
+@@ -116,13 +116,60 @@ architecture rtl of ax301_top is
+     );
+   end component;
+ 
+-  -- XBUS mux: SHA range at 0xF10xxxxx, everything else to SDRAM bridge
+-  signal sha_range  : std_ulogic;
++  -- ── wb_altasmi_parallel (EPCS controller, base 0xF2000000) ─────────────
++  component wb_altasmi_parallel is
++    port (
++      clk        : in  std_ulogic;
++      rst_n      : in  std_ulogic;
++      xbus_adr   : in  std_ulogic_vector(31 downto 0);
++      xbus_dat_w : in  std_ulogic_vector(31 downto 0);
++      xbus_sel   : in  std_ulogic_vector(3 downto 0);
++      xbus_we    : in  std_ulogic;
++      xbus_stb   : in  std_ulogic;
++      xbus_cyc   : in  std_ulogic;
++      xbus_dat_r : out std_ulogic_vector(31 downto 0);
++      xbus_ack   : out std_ulogic;
++      xbus_err   : out std_ulogic
++    );
++  end component;
++
++  -- ── wb_altremote_update (remote-reconfig, base 0xF3000000) ─────────────
++  component wb_altremote_update is
++    port (
++      clk        : in  std_ulogic;
++      rst_n      : in  std_ulogic;
++      xbus_adr   : in  std_ulogic_vector(31 downto 0);
++      xbus_dat_w : in  std_ulogic_vector(31 downto 0);
++      xbus_sel   : in  std_ulogic_vector(3 downto 0);
++      xbus_we    : in  std_ulogic;
++      xbus_stb   : in  std_ulogic;
++      xbus_cyc   : in  std_ulogic;
++      xbus_dat_r : out std_ulogic_vector(31 downto 0);
++      xbus_ack   : out std_ulogic;
++      xbus_err   : out std_ulogic
++    );
++  end component;
++
++  -- XBUS mux: SHA @0xF10xxxxx, ASMI @0xF20xxxxx, REMOTE @0xF30xxxxx, else SDRAM
++  signal sha_range    : std_ulogic;
++  signal asmi_range   : std_ulogic;
++  signal remote_range : std_ulogic;
++  signal periph_range : std_ulogic;  -- any of the F1x/F2x/F3x slaves
++
+   signal sha_stb    : std_ulogic;
++  signal asmi_stb   : std_ulogic;
++  signal remote_stb : std_ulogic;
+   signal sdram_stb  : std_ulogic;
++
+   signal sha_dat    : std_ulogic_vector(31 downto 0);
+   signal sha_ack    : std_ulogic;
+   signal sha_err    : std_ulogic;
++  signal asmi_dat   : std_ulogic_vector(31 downto 0);
++  signal asmi_ack   : std_ulogic;
++  signal asmi_err   : std_ulogic;
++  signal remote_dat : std_ulogic_vector(31 downto 0);
++  signal remote_ack : std_ulogic;
++  signal remote_err : std_ulogic;
+   signal sdram_dat  : std_ulogic_vector(31 downto 0);
+   signal sdram_ack  : std_ulogic;
+   signal sdram_err  : std_ulogic;
+@@ -240,13 +287,23 @@ begin
+   LED(3) <= not dbg_leds(3);
+ 
+   -- ── Wishbone → SDRAM bridge ───────────────────────────────────────────────
+-  -- ── XBUS mux (SHA vs SDRAM) ───────────────────────────────────────────
+-  sha_range  <= '1' when xbus_adr(31 downto 20) = x"F10" else '0';
++  -- ── XBUS mux (SHA / ASMI / REMOTE / SDRAM) ────────────────────────────
++  sha_range    <= '1' when xbus_adr(31 downto 20) = x"F10" else '0';
++  asmi_range   <= '1' when xbus_adr(31 downto 20) = x"F20" else '0';
++  remote_range <= '1' when xbus_adr(31 downto 20) = x"F30" else '0';
++  periph_range <= sha_range or asmi_range or remote_range;
++
+   sha_stb    <= xbus_stb and sha_range;
+-  sdram_stb  <= xbus_stb and (not sha_range);
+-  xbus_ack   <= sha_ack or sdram_ack;
+-  xbus_err   <= sha_err or sdram_err;
+-  xbus_dat_i <= sha_dat when sha_ack = '1' else sdram_dat;
++  asmi_stb   <= xbus_stb and asmi_range;
++  remote_stb <= xbus_stb and remote_range;
++  sdram_stb  <= xbus_stb and (not periph_range);
++
++  xbus_ack   <= sha_ack or asmi_ack or remote_ack or sdram_ack;
++  xbus_err   <= sha_err or asmi_err or remote_err or sdram_err;
++  xbus_dat_i <= sha_dat    when sha_ack    = '1' else
++                asmi_dat   when asmi_ack   = '1' else
++                remote_dat when remote_ack = '1' else
++                sdram_dat;
+ 
+   wb_sha256_inst: wb_sha256
+   port map (
+@@ -263,6 +320,36 @@ begin
+     xbus_err   => sha_err
+   );
+ 
++  wb_altasmi_inst: wb_altasmi_parallel
++  port map (
++    clk        => CLOCK,
++    rst_n      => rstn_int,
++    xbus_adr   => xbus_adr,
++    xbus_dat_w => xbus_dat_o,
++    xbus_sel   => xbus_sel,
++    xbus_we    => xbus_we,
++    xbus_stb   => asmi_stb,
++    xbus_cyc   => xbus_cyc,
++    xbus_dat_r => asmi_dat,
++    xbus_ack   => asmi_ack,
++    xbus_err   => asmi_err
++  );
++
++  wb_altremote_inst: wb_altremote_update
++  port map (
++    clk        => CLOCK,
++    rst_n      => rstn_int,
++    xbus_adr   => xbus_adr,
++    xbus_dat_w => xbus_dat_o,
++    xbus_sel   => xbus_sel,
++    xbus_we    => xbus_we,
++    xbus_stb   => remote_stb,
++    xbus_cyc   => xbus_cyc,
++    xbus_dat_r => remote_dat,
++    xbus_ack   => remote_ack,
++    xbus_err   => remote_err
++  );
++
+   wb_sdram_inst: wb_sdram_ctrl
+   port map (
+     clk        => CLOCK,
+diff --git a/rtl/ip/epcs_ctrl.qip b/rtl/ip/epcs_ctrl.qip
+new file mode 100644
+index 0000000..a8c33c1
+--- /dev/null
++++ b/rtl/ip/epcs_ctrl.qip
+@@ -0,0 +1,4 @@
++set_global_assignment -name IP_TOOL_NAME "ALTASMI_PARALLEL"
++set_global_assignment -name IP_TOOL_VERSION "21.1"
++set_global_assignment -name IP_GENERATED_DEVICE_FAMILY "{Cyclone IV E}"
++set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) "epcs_ctrl.v"]
+diff --git a/rtl/ip/epcs_ctrl.v b/rtl/ip/epcs_ctrl.v
+new file mode 100644
+index 0000000..9697c03
+--- /dev/null
++++ b/rtl/ip/epcs_ctrl.v
+@@ -0,0 +1,1974 @@
++// megafunction wizard: %ALTASMI_PARALLEL%
++// GENERATION: STANDARD
++// VERSION: WM1.0
++// MODULE: ALTASMI_PARALLEL 
++
++// ============================================================
++// File Name: epcs_ctrl.v
++// Megafunction Name(s):
++// 			ALTASMI_PARALLEL
++//
++// Simulation Library Files(s):
++// 			
++// ============================================================
++// ************************************************************
++// THIS IS A WIZARD-GENERATED FILE. DO NOT EDIT THIS FILE!
++//
++// 21.1.0 Build 842 10/21/2021 SJ Lite Edition
++// ************************************************************
++
++
++//Copyright (C) 2021  Intel Corporation. All rights reserved.
++//Your use of Intel Corporation's design tools, logic functions 
++//and other software and tools, and any partner logic 
++//functions, and any output files from any of the foregoing 
++//(including device programming or simulation files), and any 
++//associated documentation or information are expressly subject 
++//to the terms and conditions of the Intel Program License 
++//Subscription Agreement, the Intel Quartus Prime License Agreement,
++//the Intel FPGA IP License Agreement, or other applicable license
++//agreement, including, without limitation, that your use is for
++//the sole purpose of programming logic devices manufactured by
++//Intel and sold by Intel or its authorized distributors.  Please
++//refer to the applicable agreement for further details, at
++//https://fpgasoftware.intel.com/eula.
++
++
++//altasmi_parallel CBX_AUTO_BLACKBOX="ALL" DATA_WIDTH="STANDARD" DEVICE_FAMILY="Cyclone IV E" ENABLE_SIM="FALSE" EPCS_TYPE="EPCS16" FLASH_RSTPIN="FALSE" PAGE_SIZE=256 PORT_BULK_ERASE="PORT_UNUSED" PORT_DIE_ERASE="PORT_UNUSED" PORT_EN4B_ADDR="PORT_UNUSED" PORT_EX4B_ADDR="PORT_UNUSED" PORT_FAST_READ="PORT_UNUSED" PORT_ILLEGAL_ERASE="PORT_USED" PORT_ILLEGAL_WRITE="PORT_USED" PORT_RDID_OUT="PORT_UNUSED" PORT_READ_ADDRESS="PORT_USED" PORT_READ_DUMMYCLK="PORT_UNUSED" PORT_READ_RDID="PORT_UNUSED" PORT_READ_SID="PORT_UNUSED" PORT_READ_STATUS="PORT_USED" PORT_SECTOR_ERASE="PORT_USED" PORT_SECTOR_PROTECT="PORT_UNUSED" PORT_SHIFT_BYTES="PORT_USED" PORT_WREN="PORT_USED" PORT_WRITE="PORT_USED" USE_ASMIBLOCK="ON" USE_EAB="ON" WRITE_DUMMY_CLK=0 addr busy clkin data_valid datain dataout illegal_erase illegal_write rden read read_address read_status reset sector_erase shift_bytes status_out wren write INTENDED_DEVICE_FAMILY="Cyclone IV E" ALTERA_INTERNAL_OPTIONS=SUPPRESS_DA_RULE_INTERNAL=C106
++//VERSION_BEGIN 21.1 cbx_a_gray2bin 2021:10:21:11:02:24:SJ cbx_a_graycounter 2021:10:21:11:02:24:SJ cbx_altasmi_parallel 2021:10:21:11:02:24:SJ cbx_altdpram 2021:10:21:11:02:24:SJ cbx_altera_counter 2021:10:21:11:02:24:SJ cbx_altera_syncram 2021:10:21:11:02:24:SJ cbx_altera_syncram_nd_impl 2021:10:21:11:02:24:SJ cbx_altsyncram 2021:10:21:11:02:24:SJ cbx_arriav 2021:10:21:11:02:24:SJ cbx_cyclone 2021:10:21:11:02:24:SJ cbx_cycloneii 2021:10:21:11:02:24:SJ cbx_fifo_common 2021:10:21:11:02:24:SJ cbx_lpm_add_sub 2021:10:21:11:02:24:SJ cbx_lpm_compare 2021:10:21:11:02:24:SJ cbx_lpm_counter 2021:10:21:11:02:24:SJ cbx_lpm_decode 2021:10:21:11:02:24:SJ cbx_lpm_mux 2021:10:21:11:02:24:SJ cbx_mgl 2021:10:21:11:11:47:SJ cbx_nadder 2021:10:21:11:02:24:SJ cbx_nightfury 2021:10:21:11:02:24:SJ cbx_scfifo 2021:10:21:11:02:24:SJ cbx_stratix 2021:10:21:11:02:24:SJ cbx_stratixii 2021:10:21:11:02:24:SJ cbx_stratixiii 2021:10:21:11:02:24:SJ cbx_stratixv 2021:10:21:11:02:24:SJ cbx_util_mgl 2021:10:21:11:02:24:SJ cbx_zippleback 2021:10:21:11:02:24:SJ  VERSION_END
++// synthesis VERILOG_INPUT_VERSION VERILOG_2001
++// altera message_off 10463
++
++
++//synthesis_resources = a_graycounter 4 cycloneive_asmiblock 1 lpm_compare 2 lpm_counter 3 lut 56 mux21 1 reg 138 
++//synopsys translate_off
++`timescale 1 ps / 1 ps
++//synopsys translate_on
++(* ALTERA_ATTRIBUTE = {"SUPPRESS_DA_RULE_INTERNAL=C106"} *)
++module  epcs_ctrl_altasmi_parallel_0ot2
++	( 
++	addr,
++	busy,
++	clkin,
++	data_valid,
++	datain,
++	dataout,
++	illegal_erase,
++	illegal_write,
++	rden,
++	read,
++	read_address,
++	read_status,
++	reset,
++	sector_erase,
++	shift_bytes,
++	status_out,
++	wren,
++	write) /* synthesis synthesis_clearbox=2 */;
++	input   [23:0]  addr;
++	output   busy;
++	input   clkin;
++	output   data_valid;
++	input   [7:0]  datain;
++	output   [7:0]  dataout;
++	output   illegal_erase;
++	output   illegal_write;
++	input   rden;
++	input   read;
++	output   [23:0]  read_address;
++	input   read_status;
++	input   reset;
++	input   sector_erase;
++	input   shift_bytes;
++	output   [7:0]  status_out;
++	input   wren;
++	input   write;
++`ifndef ALTERA_RESERVED_QIS
++// synopsys translate_off
++`endif
++	tri0   [7:0]  datain;
++	tri0   read;
++	tri0   read_status;
++	tri0   reset;
++	tri0   sector_erase;
++	tri0   shift_bytes;
++	tri1   wren;
++	tri0   write;
++`ifndef ALTERA_RESERVED_QIS
++// synopsys translate_on
++`endif
++
++	wire  [2:0]   wire_addbyte_cntr_q;
++	wire  [2:0]   wire_gen_cntr_q;
++	wire  [1:0]   wire_stage_cntr_q;
++	wire  [1:0]   wire_wrstage_cntr_q;
++	wire  wire_sd2_data0out;
++	reg	add_msb_reg;
++	wire	wire_add_msb_reg_ena;
++	reg	add_rollover_reg;
++	wire	[23:0]	wire_addr_reg_d;
++	reg	[23:0]	addr_reg;
++	wire	[23:0]	wire_addr_reg_ena;
++	wire	[7:0]	wire_asmi_opcode_reg_d;
++	reg	[7:0]	asmi_opcode_reg;
++	wire	[7:0]	wire_asmi_opcode_reg_ena;
++	reg	buf_empty_reg;
++	reg	busy_det_reg;
++	reg	clr_read_reg;
++	reg	clr_read_reg2;
++	reg	clr_rstat_reg;
++	reg	clr_write_reg;
++	reg	clr_write_reg2;
++	reg	cnt_bfend_reg;
++	reg	do_wrmemadd_reg;
++	reg	dvalid_reg;
++	wire	wire_dvalid_reg_ena;
++	wire	wire_dvalid_reg_sclr;
++	reg	dvalid_reg2;
++	reg	end1_cyc_reg;
++	reg	end1_cyc_reg2;
++	reg	end_op_hdlyreg;
++	reg	end_op_reg;
++	reg	end_pgwrop_reg;
++	wire	wire_end_pgwrop_reg_ena;
++	reg	end_rbyte_reg;
++	wire	wire_end_rbyte_reg_ena;
++	wire	wire_end_rbyte_reg_sclr;
++	reg	end_read_reg;
++	reg	ill_erase_reg;
++	reg	ill_write_reg;
++	reg	illegal_write_prot_reg;
++	reg	max_cnt_reg;
++	reg	maxcnt_shift_reg;
++	reg	maxcnt_shift_reg2;
++	reg	ncs_reg;
++	wire	wire_ncs_reg_sclr;
++	wire	[7:0]	wire_pgwrbuf_dataout_d;
++	reg	[7:0]	pgwrbuf_dataout;
++	wire	[7:0]	wire_pgwrbuf_dataout_ena;
++	wire	[23:0]	wire_read_add_reg_d;
++	reg	[23:0]	read_add_reg;
++	wire	[23:0]	wire_read_add_reg_ena;
++	reg	read_bufdly_reg;
++	wire	[7:0]	wire_read_data_reg_d;
++	reg	[7:0]	read_data_reg;
++	wire	[7:0]	wire_read_data_reg_ena;
++	wire	[7:0]	wire_read_dout_reg_d;
++	reg	[7:0]	read_dout_reg;
++	wire	[7:0]	wire_read_dout_reg_ena;
++	reg	read_reg;
++	wire	wire_read_reg_ena;
++	reg	read_status_reg;
++	wire	wire_read_status_reg_ena;
++	reg	sec_erase_reg;
++	wire	wire_sec_erase_reg_ena;
++	reg	shftpgwr_data_reg;
++	reg	shift_op_reg;
++	reg	stage2_reg;
++	reg	stage3_dly_reg;
++	reg	stage3_reg;
++	reg	stage4_reg;
++	reg	start_wrpoll_reg;
++	wire	wire_start_wrpoll_reg_ena;
++	reg	start_wrpoll_reg2;
++	wire	[7:0]	wire_statreg_int_d;
++	reg	[7:0]	statreg_int;
++	wire	[7:0]	wire_statreg_int_ena;
++	wire	[7:0]	wire_statreg_out_d;
++	reg	[7:0]	statreg_out;
++	wire	[7:0]	wire_statreg_out_ena;
++	reg	write_prot_reg;
++	wire	wire_write_prot_reg_ena;
++	reg	write_reg;
++	wire	wire_write_reg_ena;
++	reg	write_rstat_reg;
++	wire  wire_cmpr4_aeb;
++	wire  wire_cmpr5_aeb;
++	wire  [8:0]   wire_pgwr_data_cntr_q;
++	wire  [8:0]   wire_pgwr_read_cntr_q;
++	wire  [24:0]   wire_read_add_cntr_q;
++	wire	wire_mux211_dataout;
++	wire  [7:0]   wire_scfifo3_q;
++	wire  add_rollover;
++	wire  addr_overdie;
++	wire  addr_overdie_pos;
++	wire  [23:0]  addr_reg_overdie;
++	wire  [7:0]  b4addr_opcode;
++	wire  be_write_prot;
++	wire  [7:0]  berase_opcode;
++	wire  bp0_wire;
++	wire  bp1_wire;
++	wire  bp2_wire;
++	wire  bp3_wire;
++	wire  buf_empty;
++	wire  busy_wire;
++	wire  clkin_wire;
++	wire  clr_addmsb_wire;
++	wire  clr_endrbyte_wire;
++	wire  clr_read_wire;
++	wire  clr_read_wire2;
++	wire  clr_rstat_wire;
++	wire  clr_sid_wire;
++	wire  clr_write_wire;
++	wire  clr_write_wire2;
++	wire  cnt_bfend_wire_in;
++	wire  data0out_wire;
++	wire  data_valid_wire;
++	wire  [3:0]  datain_wire;
++	wire  [3:0]  dataout_wire;
++	wire  [7:0]  derase_opcode;
++	wire  do_4baddr;
++	wire  do_bulk_erase;
++	wire  do_die_erase;
++	wire  do_ex4baddr;
++	wire  do_fast_read;
++	wire  do_fread_epcq;
++	wire  do_freadwrv_polling;
++	wire  do_memadd;
++	wire  do_polling;
++	wire  do_read;
++	wire  do_read_nonvolatile;
++	wire  do_read_rdid;
++	wire  do_read_sid;
++	wire  do_read_stat;
++	wire  do_read_volatile;
++	wire  do_sec_erase;
++	wire  do_sec_prot;
++	wire  do_secprot_wren;
++	wire  do_sprot_polling;
++	wire  do_sprot_rstat;
++	wire  do_wait_dummyclk;
++	wire  do_wren;
++	wire  do_write;
++	wire  do_write_polling;
++	wire  do_write_rstat;
++	wire  do_write_volatile;
++	wire  do_write_volatile_rstat;
++	wire  do_write_volatile_wren;
++	wire  do_write_wren;
++	wire  dummy_read_buf;
++	wire  end1_cyc_gen_cntr_wire;
++	wire  end1_cyc_normal_in_wire;
++	wire  end1_cyc_reg_in_wire;
++	wire  end_add_cycle;
++	wire  end_add_cycle_mux_datab_wire;
++	wire  end_fast_read;
++	wire  end_one_cyc_pos;
++	wire  end_one_cycle;
++	wire  end_op_wire;
++	wire  end_operation;
++	wire  end_ophdly;
++	wire  end_pgwr_data;
++	wire  end_read;
++	wire  end_read_byte;
++	wire  end_wrstage;
++	wire  [7:0]  exb4addr_opcode;
++	wire  [7:0]  fast_read_opcode;
++	wire  fast_read_wire;
++	wire  freadwrv_sdoin;
++	wire  ill_erase_wire;
++	wire  ill_write_wire;
++	wire  illegal_erase_b4out_wire;
++	wire  illegal_write_b4out_wire;
++	wire  in_operation;
++	wire  load_opcode;
++	wire  [4:0]  mask_prot;
++	wire  [4:0]  mask_prot_add;
++	wire  [4:0]  mask_prot_check;
++	wire  [4:0]  mask_prot_comp_ntb;
++	wire  [4:0]  mask_prot_comp_tb;
++	wire  memadd_sdoin;
++	wire  ncs_reg_ena_wire;
++	wire  not_busy;
++	wire  oe_wire;
++	wire  [8:0]  page_size_wire;
++	wire  [8:0]  pagewr_buf_not_empty;
++	wire  [7:0]  prot_wire;
++	wire  rden_wire;
++	wire  [7:0]  rdid_opcode;
++	wire  [7:0]  rdummyclk_opcode;
++	wire  reach_max_cnt;
++	wire  read_buf;
++	wire  read_bufdly;
++	wire  [7:0]  read_data_reg_in_wire;
++	wire  [7:0]  read_opcode;
++	wire  read_rdid_wire;
++	wire  read_sid_wire;
++	wire  read_status_wire;
++	wire  read_wire;
++	wire  [7:0]  rflagstat_opcode;
++	wire  [7:0]  rnvdummyclk_opcode;
++	wire  [7:0]  rsid_opcode;
++	wire  rsid_sdoin;
++	wire  [7:0]  rstat_opcode;
++	wire  scein_wire;
++	wire  sdoin_wire;
++	wire  sec_erase_wire;
++	wire  sec_protect_wire;
++	wire  [7:0]  secprot_opcode;
++	wire  secprot_sdoin;
++	wire  [7:0]  serase_opcode;
++	wire  shift_bytes_wire;
++	wire  shift_opcode;
++	wire  shift_opdata;
++	wire  shift_pgwr_data;
++	wire  st_busy_wire;
++	wire  stage2_wire;
++	wire  stage3_wire;
++	wire  stage4_wire;
++	wire  start_frpoll;
++	wire  start_poll;
++	wire  start_sppoll;
++	wire  start_wrpoll;
++	wire  to_sdoin_wire;
++	wire  [7:0]  wren_opcode;
++	wire  wren_wire;
++	wire  [7:0]  write_opcode;
++	wire  write_prot_true;
++	wire  write_sdoin;
++	wire  write_wire;
++	wire  [7:0]  wrvolatile_opcode;
++
++	a_graycounter   addbyte_cntr
++	( 
++	.aclr(reset),
++	.clk_en((((((wire_stage_cntr_q[1] & wire_stage_cntr_q[0]) & end_one_cyc_pos) & (((((((do_read_sid | do_write) | do_sec_erase) | do_die_erase) | do_read_rdid) | do_read) | do_fast_read) | do_read_nonvolatile)) | addr_overdie) | end_operation)),
++	.clock((~ clkin_wire)),
++	.q(wire_addbyte_cntr_q),
++	.qbin(),
++	.sclr((end_operation | addr_overdie))
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.cnt_en(1'b1),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		addbyte_cntr.width = 3,
++		addbyte_cntr.lpm_type = "a_graycounter";
++	a_graycounter   gen_cntr
++	( 
++	.aclr(reset),
++	.clk_en((((((in_operation & (~ end_ophdly)) & (~ clr_rstat_wire)) & (~ clr_sid_wire)) | do_wait_dummyclk) | addr_overdie)),
++	.clock(clkin_wire),
++	.q(wire_gen_cntr_q),
++	.qbin(),
++	.sclr(((end1_cyc_reg_in_wire | addr_overdie) | do_wait_dummyclk))
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.cnt_en(1'b1),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		gen_cntr.width = 3,
++		gen_cntr.lpm_type = "a_graycounter";
++	a_graycounter   stage_cntr
++	( 
++	.aclr(reset),
++	.clk_en(((((((((((((((in_operation & end_one_cycle) & (~ (stage3_wire & (~ end_add_cycle)))) & (~ (stage4_wire & (~ end_read)))) & (~ (stage4_wire & (~ end_fast_read)))) & (~ ((((do_write | do_sec_erase) | do_die_erase) | do_bulk_erase) & write_prot_true))) & (~ (do_write & (~ pagewr_buf_not_empty[8])))) & (~ (stage3_wire & st_busy_wire))) & (~ ((do_write & shift_pgwr_data) & (~ end_pgwr_data)))) & (~ (stage2_wire & do_wren))) & (~ ((((stage3_wire & (do_sec_erase | do_die_erase)) & (~ do_wren)) & (~ do_read_stat)) & (~ do_read_rdid)))) & (~ (stage3_wire & ((do_write_volatile | do_read_volatile) | do_read_nonvolatile)))) | ((stage3_wire & do_fast_read) & do_wait_dummyclk)) | addr_overdie) | end_ophdly)),
++	.clock(clkin_wire),
++	.q(wire_stage_cntr_q),
++	.qbin(),
++	.sclr((end_operation | addr_overdie))
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.cnt_en(1'b1),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		stage_cntr.width = 2,
++		stage_cntr.lpm_type = "a_graycounter";
++	a_graycounter   wrstage_cntr
++	( 
++	.aclr(reset),
++	.clk_en((((((((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) & (~ write_prot_true)) | do_4baddr) | do_ex4baddr) & end_wrstage) & (~ st_busy_wire)) | clr_write_wire2)),
++	.clock((~ clkin_wire)),
++	.q(wire_wrstage_cntr_q),
++	.qbin(),
++	.sclr(clr_write_wire2)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.cnt_en(1'b1),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		wrstage_cntr.width = 2,
++		wrstage_cntr.lpm_type = "a_graycounter";
++	cycloneive_asmiblock   sd2
++	( 
++	.data0out(wire_sd2_data0out),
++	.dclkin(clkin_wire),
++	.oe(oe_wire),
++	.scein(scein_wire),
++	.sdoin((sdoin_wire | datain_wire[0])));
++	// synopsys translate_off
++	initial
++		add_msb_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) add_msb_reg <= 1'b0;
++		else if  (wire_add_msb_reg_ena == 1'b1) 
++			if (clr_addmsb_wire == 1'b1) add_msb_reg <= 1'b0;
++			else  add_msb_reg <= addr_reg[23];
++	assign
++		wire_add_msb_reg_ena = ((((((((do_read | do_fast_read) | do_write) | do_sec_erase) | do_die_erase) & (~ (((do_write | do_sec_erase) | do_die_erase) & (~ do_memadd)))) & wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]) | clr_addmsb_wire);
++	// synopsys translate_off
++	initial
++		add_rollover_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) add_rollover_reg <= 1'b0;
++		else  add_rollover_reg <= (wire_read_add_cntr_q[21] | clr_read_wire2);
++	// synopsys translate_off
++	initial
++		addr_reg[0:0] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[0:0] <= 1'b0;
++		else if  (wire_addr_reg_ena[0:0] == 1'b1)   addr_reg[0:0] <= wire_addr_reg_d[0:0];
++	// synopsys translate_off
++	initial
++		addr_reg[1:1] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[1:1] <= 1'b0;
++		else if  (wire_addr_reg_ena[1:1] == 1'b1)   addr_reg[1:1] <= wire_addr_reg_d[1:1];
++	// synopsys translate_off
++	initial
++		addr_reg[2:2] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[2:2] <= 1'b0;
++		else if  (wire_addr_reg_ena[2:2] == 1'b1)   addr_reg[2:2] <= wire_addr_reg_d[2:2];
++	// synopsys translate_off
++	initial
++		addr_reg[3:3] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[3:3] <= 1'b0;
++		else if  (wire_addr_reg_ena[3:3] == 1'b1)   addr_reg[3:3] <= wire_addr_reg_d[3:3];
++	// synopsys translate_off
++	initial
++		addr_reg[4:4] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[4:4] <= 1'b0;
++		else if  (wire_addr_reg_ena[4:4] == 1'b1)   addr_reg[4:4] <= wire_addr_reg_d[4:4];
++	// synopsys translate_off
++	initial
++		addr_reg[5:5] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[5:5] <= 1'b0;
++		else if  (wire_addr_reg_ena[5:5] == 1'b1)   addr_reg[5:5] <= wire_addr_reg_d[5:5];
++	// synopsys translate_off
++	initial
++		addr_reg[6:6] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[6:6] <= 1'b0;
++		else if  (wire_addr_reg_ena[6:6] == 1'b1)   addr_reg[6:6] <= wire_addr_reg_d[6:6];
++	// synopsys translate_off
++	initial
++		addr_reg[7:7] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[7:7] <= 1'b0;
++		else if  (wire_addr_reg_ena[7:7] == 1'b1)   addr_reg[7:7] <= wire_addr_reg_d[7:7];
++	// synopsys translate_off
++	initial
++		addr_reg[8:8] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[8:8] <= 1'b0;
++		else if  (wire_addr_reg_ena[8:8] == 1'b1)   addr_reg[8:8] <= wire_addr_reg_d[8:8];
++	// synopsys translate_off
++	initial
++		addr_reg[9:9] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[9:9] <= 1'b0;
++		else if  (wire_addr_reg_ena[9:9] == 1'b1)   addr_reg[9:9] <= wire_addr_reg_d[9:9];
++	// synopsys translate_off
++	initial
++		addr_reg[10:10] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[10:10] <= 1'b0;
++		else if  (wire_addr_reg_ena[10:10] == 1'b1)   addr_reg[10:10] <= wire_addr_reg_d[10:10];
++	// synopsys translate_off
++	initial
++		addr_reg[11:11] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[11:11] <= 1'b0;
++		else if  (wire_addr_reg_ena[11:11] == 1'b1)   addr_reg[11:11] <= wire_addr_reg_d[11:11];
++	// synopsys translate_off
++	initial
++		addr_reg[12:12] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[12:12] <= 1'b0;
++		else if  (wire_addr_reg_ena[12:12] == 1'b1)   addr_reg[12:12] <= wire_addr_reg_d[12:12];
++	// synopsys translate_off
++	initial
++		addr_reg[13:13] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[13:13] <= 1'b0;
++		else if  (wire_addr_reg_ena[13:13] == 1'b1)   addr_reg[13:13] <= wire_addr_reg_d[13:13];
++	// synopsys translate_off
++	initial
++		addr_reg[14:14] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[14:14] <= 1'b0;
++		else if  (wire_addr_reg_ena[14:14] == 1'b1)   addr_reg[14:14] <= wire_addr_reg_d[14:14];
++	// synopsys translate_off
++	initial
++		addr_reg[15:15] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[15:15] <= 1'b0;
++		else if  (wire_addr_reg_ena[15:15] == 1'b1)   addr_reg[15:15] <= wire_addr_reg_d[15:15];
++	// synopsys translate_off
++	initial
++		addr_reg[16:16] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[16:16] <= 1'b0;
++		else if  (wire_addr_reg_ena[16:16] == 1'b1)   addr_reg[16:16] <= wire_addr_reg_d[16:16];
++	// synopsys translate_off
++	initial
++		addr_reg[17:17] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[17:17] <= 1'b0;
++		else if  (wire_addr_reg_ena[17:17] == 1'b1)   addr_reg[17:17] <= wire_addr_reg_d[17:17];
++	// synopsys translate_off
++	initial
++		addr_reg[18:18] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[18:18] <= 1'b0;
++		else if  (wire_addr_reg_ena[18:18] == 1'b1)   addr_reg[18:18] <= wire_addr_reg_d[18:18];
++	// synopsys translate_off
++	initial
++		addr_reg[19:19] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[19:19] <= 1'b0;
++		else if  (wire_addr_reg_ena[19:19] == 1'b1)   addr_reg[19:19] <= wire_addr_reg_d[19:19];
++	// synopsys translate_off
++	initial
++		addr_reg[20:20] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[20:20] <= 1'b0;
++		else if  (wire_addr_reg_ena[20:20] == 1'b1)   addr_reg[20:20] <= wire_addr_reg_d[20:20];
++	// synopsys translate_off
++	initial
++		addr_reg[21:21] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[21:21] <= 1'b0;
++		else if  (wire_addr_reg_ena[21:21] == 1'b1)   addr_reg[21:21] <= wire_addr_reg_d[21:21];
++	// synopsys translate_off
++	initial
++		addr_reg[22:22] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[22:22] <= 1'b0;
++		else if  (wire_addr_reg_ena[22:22] == 1'b1)   addr_reg[22:22] <= wire_addr_reg_d[22:22];
++	// synopsys translate_off
++	initial
++		addr_reg[23:23] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) addr_reg[23:23] <= 1'b0;
++		else if  (wire_addr_reg_ena[23:23] == 1'b1)   addr_reg[23:23] <= wire_addr_reg_d[23:23];
++	assign
++		wire_addr_reg_d = {((({23{not_busy}} & addr[23:1]) | ({23{stage3_wire}} & addr_reg[22:0])) | ({23{addr_overdie}} & addr_reg_overdie[23:1])), ((not_busy & addr[0]) | (addr_overdie & addr_reg_overdie[0]))};
++	assign
++		wire_addr_reg_ena = {24{((((rden_wire | wren_wire) & not_busy) | (stage4_wire & addr_overdie)) | (stage3_wire & ((((do_write | do_sec_erase) | do_die_erase) & do_memadd) | (do_read | do_fast_read))))}};
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[0:0] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[0:0] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[0:0] == 1'b1)   asmi_opcode_reg[0:0] <= wire_asmi_opcode_reg_d[0:0];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[1:1] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[1:1] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[1:1] == 1'b1)   asmi_opcode_reg[1:1] <= wire_asmi_opcode_reg_d[1:1];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[2:2] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[2:2] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[2:2] == 1'b1)   asmi_opcode_reg[2:2] <= wire_asmi_opcode_reg_d[2:2];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[3:3] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[3:3] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[3:3] == 1'b1)   asmi_opcode_reg[3:3] <= wire_asmi_opcode_reg_d[3:3];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[4:4] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[4:4] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[4:4] == 1'b1)   asmi_opcode_reg[4:4] <= wire_asmi_opcode_reg_d[4:4];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[5:5] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[5:5] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[5:5] == 1'b1)   asmi_opcode_reg[5:5] <= wire_asmi_opcode_reg_d[5:5];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[6:6] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[6:6] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[6:6] == 1'b1)   asmi_opcode_reg[6:6] <= wire_asmi_opcode_reg_d[6:6];
++	// synopsys translate_off
++	initial
++		asmi_opcode_reg[7:7] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) asmi_opcode_reg[7:7] <= 1'b0;
++		else if  (wire_asmi_opcode_reg_ena[7:7] == 1'b1)   asmi_opcode_reg[7:7] <= wire_asmi_opcode_reg_d[7:7];
++	assign
++		wire_asmi_opcode_reg_d = {(((((((((((((((((({7{(load_opcode & do_read_sid)}} & rsid_opcode[7:1]) | ({7{(load_opcode & do_read_rdid)}} & rdid_opcode[7:1])) | ({7{(((load_opcode & do_sec_prot) & (~ do_wren)) & (~ do_read_stat))}} & secprot_opcode[7:1])) | ({7{(load_opcode & do_read)}} & read_opcode[7:1])) | ({7{(load_opcode & do_fast_read)}} & fast_read_opcode[7:1])) | ({7{((((load_opcode & do_read_volatile) & (~ do_write_volatile)) & (~ do_wren)) & (~ do_read_stat))}} & rdummyclk_opcode[7:1])) | ({7{((((load_opcode & do_write_volatile) & (~ do_read_volatile)) & (~ do_wren)) & (~ do_read_stat))}} & wrvolatile_opcode[7:1])) | ({7{(load_opcode & do_read_nonvolatile)}} & rnvdummyclk_opcode[7:1])) | ({7{(load_opcode & ((do_write & (~ do_read_stat)) & (~ do_wren)))}} & write_opcode[7:1])) | ({7{((load_opcode & do_read_stat) & (~ do_polling))}} & rstat_opcode[7:1])) | ({7{((load_opcode & do_read_stat) & do_polling)}} & rflagstat_opcode[7:1])) | ({7{(((load_opcode & do_sec_erase) & (~ do_wren)) & (~ do_read_stat))}} & serase_opcode[7:1])) | ({7{(((load_opcode & do_die_erase) & (~ do_wren)) & (~ do_read_stat))}} & derase_opcode[7:1])) | ({7{(((load_opcode & do_bulk_erase) & (~ do_wren)) & (~ do_read_stat))}} & berase_opcode[7:1])) | ({7{(load_opcode & do_wren)}} & wren_opcode[7:1])) | ({7{(load_opcode & ((do_4baddr & (~ do_read_stat)) & (~ do_wren)))}} & b4addr_opcode[7:1])) | ({7{(load_opcode & ((do_ex4baddr & (~ do_read_stat)) & (~ do_wren)))}} & exb4addr_opcode[7:1])) | ({7{shift_opcode}} & asmi_opcode_reg[6:0])), ((((((((((((((((((load_opcode & do_read_sid) & rsid_opcode[0]) | ((load_opcode & do_read_rdid) & rdid_opcode[0])) | ((((load_opcode & do_sec_prot) & (~ do_wren)) & (~ do_read_stat)) & secprot_opcode[0])) | ((load_opcode & do_read) & read_opcode[0])) | ((load_opcode & do_fast_read) & fast_read_opcode[0])) | (((((load_opcode & do_read_volatile) & (~ do_write_volatile)) & (~ do_wren)) & (~ do_read_stat)) & rdummyclk_opcode[0])) | (((((load_opcode & do_write_volatile) & (~ do_read_volatile)) & (~ do_wren)) & (~ do_read_stat
++)) & wrvolatile_opcode[0])) | ((load_opcode & do_read_nonvolatile) & rnvdummyclk_opcode[0])) | ((load_opcode & ((do_write & (~ do_read_stat)) & (~ do_wren))) & write_opcode[0])) | (((load_opcode & do_read_stat) & (~ do_polling)) & rstat_opcode[0])) | (((load_opcode & do_read_stat) & do_polling) & rflagstat_opcode[0])) | ((((load_opcode & do_sec_erase) & (~ do_wren)) & (~ do_read_stat)) & serase_opcode[0])) | ((((load_opcode & do_die_erase) & (~ do_wren)) & (~ do_read_stat)) & derase_opcode[0])) | ((((load_opcode & do_bulk_erase) & (~ do_wren)) & (~ do_read_stat)) & berase_opcode[0])) | ((load_opcode & do_wren) & wren_opcode[0])) | ((load_opcode & ((do_4baddr & (~ do_read_stat)) & (~ do_wren))) & b4addr_opcode[0])) | ((load_opcode & ((do_ex4baddr & (~ do_read_stat)) & (~ do_wren))) & exb4addr_opcode[0]))};
++	assign
++		wire_asmi_opcode_reg_ena = {8{(load_opcode | shift_opcode)}};
++	// synopsys translate_off
++	initial
++		buf_empty_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) buf_empty_reg <= 1'b0;
++		else  buf_empty_reg <= wire_cmpr5_aeb;
++	// synopsys translate_off
++	initial
++		busy_det_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) busy_det_reg <= 1'b0;
++		else  busy_det_reg <= (~ busy_wire);
++	// synopsys translate_off
++	initial
++		clr_read_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) clr_read_reg <= 1'b0;
++		else  clr_read_reg <= ((do_read_sid | do_sec_prot) | (end_operation & (do_read | do_fast_read)));
++	// synopsys translate_off
++	initial
++		clr_read_reg2 = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) clr_read_reg2 <= 1'b0;
++		else  clr_read_reg2 <= clr_read_reg;
++	// synopsys translate_off
++	initial
++		clr_rstat_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) clr_rstat_reg <= 1'b0;
++		else  clr_rstat_reg <= end_operation;
++	// synopsys translate_off
++	initial
++		clr_write_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) clr_write_reg <= 1'b0;
++		else  clr_write_reg <= (((((((((((((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) | do_4baddr) | do_ex4baddr) & wire_wrstage_cntr_q[1]) & (~ wire_wrstage_cntr_q[0])) & end_operation) | write_prot_true) | (do_write & (~ pagewr_buf_not_empty[8]))) | (((((((~ do_write) & (~ do_sec_erase)) & (~ do_bulk_erase)) & (~ do_die_erase)) & (~ do_4baddr)) & (~ do_ex4baddr)) & end_operation)) | do_read_sid) | do_sec_prot) | do_read) | do_fast_read);
++	// synopsys translate_off
++	initial
++		clr_write_reg2 = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) clr_write_reg2 <= 1'b0;
++		else  clr_write_reg2 <= clr_write_reg;
++	// synopsys translate_off
++	initial
++		cnt_bfend_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) cnt_bfend_reg <= 1'b0;
++		else  cnt_bfend_reg <= cnt_bfend_wire_in;
++	// synopsys translate_off
++	initial
++		do_wrmemadd_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) do_wrmemadd_reg <= 1'b0;
++		else  do_wrmemadd_reg <= (wire_wrstage_cntr_q[1] & wire_wrstage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		dvalid_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) dvalid_reg <= 1'b0;
++		else if  (wire_dvalid_reg_ena == 1'b1) 
++			if (wire_dvalid_reg_sclr == 1'b1) dvalid_reg <= 1'b0;
++			else  dvalid_reg <= (end_read_byte & end_one_cyc_pos);
++	assign
++		wire_dvalid_reg_ena = (do_read | do_fast_read),
++		wire_dvalid_reg_sclr = (end_op_wire | end_operation);
++	// synopsys translate_off
++	initial
++		dvalid_reg2 = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) dvalid_reg2 <= 1'b0;
++		else  dvalid_reg2 <= dvalid_reg;
++	// synopsys translate_off
++	initial
++		end1_cyc_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end1_cyc_reg <= 1'b0;
++		else  end1_cyc_reg <= end1_cyc_reg_in_wire;
++	// synopsys translate_off
++	initial
++		end1_cyc_reg2 = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end1_cyc_reg2 <= 1'b0;
++		else  end1_cyc_reg2 <= end_one_cycle;
++	// synopsys translate_off
++	initial
++		end_op_hdlyreg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end_op_hdlyreg <= 1'b0;
++		else  end_op_hdlyreg <= end_operation;
++	// synopsys translate_off
++	initial
++		end_op_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end_op_reg <= 1'b0;
++		else  end_op_reg <= end_op_wire;
++	// synopsys translate_off
++	initial
++		end_pgwrop_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end_pgwrop_reg <= 1'b0;
++		else if  (wire_end_pgwrop_reg_ena == 1'b1) 
++			if (clr_write_wire == 1'b1) end_pgwrop_reg <= 1'b0;
++			else  end_pgwrop_reg <= buf_empty;
++	assign
++		wire_end_pgwrop_reg_ena = (((cnt_bfend_reg & do_write) & shift_pgwr_data) | clr_write_wire);
++	// synopsys translate_off
++	initial
++		end_rbyte_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end_rbyte_reg <= 1'b0;
++		else if  (wire_end_rbyte_reg_ena == 1'b1) 
++			if (wire_end_rbyte_reg_sclr == 1'b1) end_rbyte_reg <= 1'b0;
++			else  end_rbyte_reg <= (((do_read | do_fast_read) & wire_stage_cntr_q[1]) & (~ wire_stage_cntr_q[0]));
++	assign
++		wire_end_rbyte_reg_ena = (((wire_gen_cntr_q[2] & (~ wire_gen_cntr_q[1])) & wire_gen_cntr_q[0]) | clr_endrbyte_wire),
++		wire_end_rbyte_reg_sclr = (clr_endrbyte_wire | addr_overdie);
++	// synopsys translate_off
++	initial
++		end_read_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) end_read_reg <= 1'b0;
++		else  end_read_reg <= ((((~ rden_wire) & (do_read | do_fast_read)) & data_valid_wire) & end_read_byte);
++	// synopsys translate_off
++	initial
++		ill_erase_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) ill_erase_reg <= 1'b0;
++		else  ill_erase_reg <= illegal_erase_b4out_wire;
++	// synopsys translate_off
++	initial
++		ill_write_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) ill_write_reg <= 1'b0;
++		else  ill_write_reg <= illegal_write_b4out_wire;
++	// synopsys translate_off
++	initial
++		illegal_write_prot_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) illegal_write_prot_reg <= 1'b0;
++		else  illegal_write_prot_reg <= do_write;
++	// synopsys translate_off
++	initial
++		max_cnt_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) max_cnt_reg <= 1'b0;
++		else  max_cnt_reg <= wire_cmpr4_aeb;
++	// synopsys translate_off
++	initial
++		maxcnt_shift_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) maxcnt_shift_reg <= 1'b0;
++		else  maxcnt_shift_reg <= (((reach_max_cnt & shift_bytes_wire) & wren_wire) & (~ do_write));
++	// synopsys translate_off
++	initial
++		maxcnt_shift_reg2 = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) maxcnt_shift_reg2 <= 1'b0;
++		else  maxcnt_shift_reg2 <= maxcnt_shift_reg;
++	// synopsys translate_off
++	initial
++		ncs_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) ncs_reg <= 1'b0;
++		else if  (ncs_reg_ena_wire == 1'b1) 
++			if (wire_ncs_reg_sclr == 1'b1) ncs_reg <= 1'b0;
++			else  ncs_reg <= 1'b1;
++	assign
++		wire_ncs_reg_sclr = (end_operation | addr_overdie_pos);
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[0:0] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[0:0] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[0:0] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[0:0] <= 1'b0;
++			else  pgwrbuf_dataout[0:0] <= wire_pgwrbuf_dataout_d[0:0];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[1:1] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[1:1] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[1:1] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[1:1] <= 1'b0;
++			else  pgwrbuf_dataout[1:1] <= wire_pgwrbuf_dataout_d[1:1];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[2:2] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[2:2] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[2:2] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[2:2] <= 1'b0;
++			else  pgwrbuf_dataout[2:2] <= wire_pgwrbuf_dataout_d[2:2];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[3:3] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[3:3] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[3:3] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[3:3] <= 1'b0;
++			else  pgwrbuf_dataout[3:3] <= wire_pgwrbuf_dataout_d[3:3];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[4:4] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[4:4] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[4:4] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[4:4] <= 1'b0;
++			else  pgwrbuf_dataout[4:4] <= wire_pgwrbuf_dataout_d[4:4];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[5:5] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[5:5] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[5:5] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[5:5] <= 1'b0;
++			else  pgwrbuf_dataout[5:5] <= wire_pgwrbuf_dataout_d[5:5];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[6:6] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[6:6] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[6:6] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[6:6] <= 1'b0;
++			else  pgwrbuf_dataout[6:6] <= wire_pgwrbuf_dataout_d[6:6];
++	// synopsys translate_off
++	initial
++		pgwrbuf_dataout[7:7] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) pgwrbuf_dataout[7:7] <= 1'b0;
++		else if  (wire_pgwrbuf_dataout_ena[7:7] == 1'b1) 
++			if (clr_write_wire == 1'b1) pgwrbuf_dataout[7:7] <= 1'b0;
++			else  pgwrbuf_dataout[7:7] <= wire_pgwrbuf_dataout_d[7:7];
++	assign
++		wire_pgwrbuf_dataout_d = {(({7{read_bufdly}} & wire_scfifo3_q[7:1]) | ({7{(~ read_bufdly)}} & pgwrbuf_dataout[6:0])), (read_bufdly & wire_scfifo3_q[0])};
++	assign
++		wire_pgwrbuf_dataout_ena = {8{((read_bufdly | shift_pgwr_data) | clr_write_wire)}};
++	// synopsys translate_off
++	initial
++		read_add_reg[0:0] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[0:0] <= 1'b0;
++		else if  (wire_read_add_reg_ena[0:0] == 1'b1)   read_add_reg[0:0] <= wire_read_add_reg_d[0:0];
++	// synopsys translate_off
++	initial
++		read_add_reg[1:1] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[1:1] <= 1'b0;
++		else if  (wire_read_add_reg_ena[1:1] == 1'b1)   read_add_reg[1:1] <= wire_read_add_reg_d[1:1];
++	// synopsys translate_off
++	initial
++		read_add_reg[2:2] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[2:2] <= 1'b0;
++		else if  (wire_read_add_reg_ena[2:2] == 1'b1)   read_add_reg[2:2] <= wire_read_add_reg_d[2:2];
++	// synopsys translate_off
++	initial
++		read_add_reg[3:3] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[3:3] <= 1'b0;
++		else if  (wire_read_add_reg_ena[3:3] == 1'b1)   read_add_reg[3:3] <= wire_read_add_reg_d[3:3];
++	// synopsys translate_off
++	initial
++		read_add_reg[4:4] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[4:4] <= 1'b0;
++		else if  (wire_read_add_reg_ena[4:4] == 1'b1)   read_add_reg[4:4] <= wire_read_add_reg_d[4:4];
++	// synopsys translate_off
++	initial
++		read_add_reg[5:5] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[5:5] <= 1'b0;
++		else if  (wire_read_add_reg_ena[5:5] == 1'b1)   read_add_reg[5:5] <= wire_read_add_reg_d[5:5];
++	// synopsys translate_off
++	initial
++		read_add_reg[6:6] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[6:6] <= 1'b0;
++		else if  (wire_read_add_reg_ena[6:6] == 1'b1)   read_add_reg[6:6] <= wire_read_add_reg_d[6:6];
++	// synopsys translate_off
++	initial
++		read_add_reg[7:7] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[7:7] <= 1'b0;
++		else if  (wire_read_add_reg_ena[7:7] == 1'b1)   read_add_reg[7:7] <= wire_read_add_reg_d[7:7];
++	// synopsys translate_off
++	initial
++		read_add_reg[8:8] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[8:8] <= 1'b0;
++		else if  (wire_read_add_reg_ena[8:8] == 1'b1)   read_add_reg[8:8] <= wire_read_add_reg_d[8:8];
++	// synopsys translate_off
++	initial
++		read_add_reg[9:9] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[9:9] <= 1'b0;
++		else if  (wire_read_add_reg_ena[9:9] == 1'b1)   read_add_reg[9:9] <= wire_read_add_reg_d[9:9];
++	// synopsys translate_off
++	initial
++		read_add_reg[10:10] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[10:10] <= 1'b0;
++		else if  (wire_read_add_reg_ena[10:10] == 1'b1)   read_add_reg[10:10] <= wire_read_add_reg_d[10:10];
++	// synopsys translate_off
++	initial
++		read_add_reg[11:11] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[11:11] <= 1'b0;
++		else if  (wire_read_add_reg_ena[11:11] == 1'b1)   read_add_reg[11:11] <= wire_read_add_reg_d[11:11];
++	// synopsys translate_off
++	initial
++		read_add_reg[12:12] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[12:12] <= 1'b0;
++		else if  (wire_read_add_reg_ena[12:12] == 1'b1)   read_add_reg[12:12] <= wire_read_add_reg_d[12:12];
++	// synopsys translate_off
++	initial
++		read_add_reg[13:13] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[13:13] <= 1'b0;
++		else if  (wire_read_add_reg_ena[13:13] == 1'b1)   read_add_reg[13:13] <= wire_read_add_reg_d[13:13];
++	// synopsys translate_off
++	initial
++		read_add_reg[14:14] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[14:14] <= 1'b0;
++		else if  (wire_read_add_reg_ena[14:14] == 1'b1)   read_add_reg[14:14] <= wire_read_add_reg_d[14:14];
++	// synopsys translate_off
++	initial
++		read_add_reg[15:15] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[15:15] <= 1'b0;
++		else if  (wire_read_add_reg_ena[15:15] == 1'b1)   read_add_reg[15:15] <= wire_read_add_reg_d[15:15];
++	// synopsys translate_off
++	initial
++		read_add_reg[16:16] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[16:16] <= 1'b0;
++		else if  (wire_read_add_reg_ena[16:16] == 1'b1)   read_add_reg[16:16] <= wire_read_add_reg_d[16:16];
++	// synopsys translate_off
++	initial
++		read_add_reg[17:17] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[17:17] <= 1'b0;
++		else if  (wire_read_add_reg_ena[17:17] == 1'b1)   read_add_reg[17:17] <= wire_read_add_reg_d[17:17];
++	// synopsys translate_off
++	initial
++		read_add_reg[18:18] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[18:18] <= 1'b0;
++		else if  (wire_read_add_reg_ena[18:18] == 1'b1)   read_add_reg[18:18] <= wire_read_add_reg_d[18:18];
++	// synopsys translate_off
++	initial
++		read_add_reg[19:19] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[19:19] <= 1'b0;
++		else if  (wire_read_add_reg_ena[19:19] == 1'b1)   read_add_reg[19:19] <= wire_read_add_reg_d[19:19];
++	// synopsys translate_off
++	initial
++		read_add_reg[20:20] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[20:20] <= 1'b0;
++		else if  (wire_read_add_reg_ena[20:20] == 1'b1)   read_add_reg[20:20] <= wire_read_add_reg_d[20:20];
++	// synopsys translate_off
++	initial
++		read_add_reg[21:21] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[21:21] <= 1'b0;
++		else if  (wire_read_add_reg_ena[21:21] == 1'b1)   read_add_reg[21:21] <= wire_read_add_reg_d[21:21];
++	// synopsys translate_off
++	initial
++		read_add_reg[22:22] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[22:22] <= 1'b0;
++		else if  (wire_read_add_reg_ena[22:22] == 1'b1)   read_add_reg[22:22] <= wire_read_add_reg_d[22:22];
++	// synopsys translate_off
++	initial
++		read_add_reg[23:23] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_add_reg[23:23] <= 1'b0;
++		else if  (wire_read_add_reg_ena[23:23] == 1'b1)   read_add_reg[23:23] <= wire_read_add_reg_d[23:23];
++	assign
++		wire_read_add_reg_d = {wire_read_add_cntr_q[23:0]};
++	assign
++		wire_read_add_reg_ena = {24{((end_read_byte & end_one_cyc_pos) & (~ end_operation))}};
++	// synopsys translate_off
++	initial
++		read_bufdly_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_bufdly_reg <= 1'b0;
++		else  read_bufdly_reg <= read_buf;
++	// synopsys translate_off
++	initial
++		read_data_reg[0:0] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[0:0] <= 1'b0;
++		else if  (wire_read_data_reg_ena[0:0] == 1'b1)   read_data_reg[0:0] <= wire_read_data_reg_d[0:0];
++	// synopsys translate_off
++	initial
++		read_data_reg[1:1] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[1:1] <= 1'b0;
++		else if  (wire_read_data_reg_ena[1:1] == 1'b1)   read_data_reg[1:1] <= wire_read_data_reg_d[1:1];
++	// synopsys translate_off
++	initial
++		read_data_reg[2:2] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[2:2] <= 1'b0;
++		else if  (wire_read_data_reg_ena[2:2] == 1'b1)   read_data_reg[2:2] <= wire_read_data_reg_d[2:2];
++	// synopsys translate_off
++	initial
++		read_data_reg[3:3] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[3:3] <= 1'b0;
++		else if  (wire_read_data_reg_ena[3:3] == 1'b1)   read_data_reg[3:3] <= wire_read_data_reg_d[3:3];
++	// synopsys translate_off
++	initial
++		read_data_reg[4:4] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[4:4] <= 1'b0;
++		else if  (wire_read_data_reg_ena[4:4] == 1'b1)   read_data_reg[4:4] <= wire_read_data_reg_d[4:4];
++	// synopsys translate_off
++	initial
++		read_data_reg[5:5] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[5:5] <= 1'b0;
++		else if  (wire_read_data_reg_ena[5:5] == 1'b1)   read_data_reg[5:5] <= wire_read_data_reg_d[5:5];
++	// synopsys translate_off
++	initial
++		read_data_reg[6:6] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[6:6] <= 1'b0;
++		else if  (wire_read_data_reg_ena[6:6] == 1'b1)   read_data_reg[6:6] <= wire_read_data_reg_d[6:6];
++	// synopsys translate_off
++	initial
++		read_data_reg[7:7] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_data_reg[7:7] <= 1'b0;
++		else if  (wire_read_data_reg_ena[7:7] == 1'b1)   read_data_reg[7:7] <= wire_read_data_reg_d[7:7];
++	assign
++		wire_read_data_reg_d = {read_data_reg_in_wire[7:0]};
++	assign
++		wire_read_data_reg_ena = {8{(((((do_read | do_fast_read) & wire_stage_cntr_q[1]) & (~ wire_stage_cntr_q[0])) & end_one_cyc_pos) & end_read_byte)}};
++	// synopsys translate_off
++	initial
++		read_dout_reg[0:0] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[0:0] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[0:0] == 1'b1)   read_dout_reg[0:0] <= wire_read_dout_reg_d[0:0];
++	// synopsys translate_off
++	initial
++		read_dout_reg[1:1] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[1:1] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[1:1] == 1'b1)   read_dout_reg[1:1] <= wire_read_dout_reg_d[1:1];
++	// synopsys translate_off
++	initial
++		read_dout_reg[2:2] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[2:2] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[2:2] == 1'b1)   read_dout_reg[2:2] <= wire_read_dout_reg_d[2:2];
++	// synopsys translate_off
++	initial
++		read_dout_reg[3:3] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[3:3] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[3:3] == 1'b1)   read_dout_reg[3:3] <= wire_read_dout_reg_d[3:3];
++	// synopsys translate_off
++	initial
++		read_dout_reg[4:4] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[4:4] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[4:4] == 1'b1)   read_dout_reg[4:4] <= wire_read_dout_reg_d[4:4];
++	// synopsys translate_off
++	initial
++		read_dout_reg[5:5] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[5:5] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[5:5] == 1'b1)   read_dout_reg[5:5] <= wire_read_dout_reg_d[5:5];
++	// synopsys translate_off
++	initial
++		read_dout_reg[6:6] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[6:6] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[6:6] == 1'b1)   read_dout_reg[6:6] <= wire_read_dout_reg_d[6:6];
++	// synopsys translate_off
++	initial
++		read_dout_reg[7:7] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_dout_reg[7:7] <= 1'b0;
++		else if  (wire_read_dout_reg_ena[7:7] == 1'b1)   read_dout_reg[7:7] <= wire_read_dout_reg_d[7:7];
++	assign
++		wire_read_dout_reg_d = {read_dout_reg[6:0], (data0out_wire | dataout_wire[1])};
++	assign
++		wire_read_dout_reg_ena = {8{((stage4_wire & ((do_read | do_fast_read) | do_read_sid)) | (stage3_wire & (((do_read_stat | do_read_rdid) | do_read_volatile) | do_read_nonvolatile)))}};
++	// synopsys translate_off
++	initial
++		read_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_reg <= 1'b0;
++		else if  (wire_read_reg_ena == 1'b1) 
++			if (clr_read_wire == 1'b1) read_reg <= 1'b0;
++			else  read_reg <= read;
++	assign
++		wire_read_reg_ena = (((~ busy_wire) & rden_wire) | clr_read_wire);
++	// synopsys translate_off
++	initial
++		read_status_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) read_status_reg <= 1'b0;
++		else if  (wire_read_status_reg_ena == 1'b1) 
++			if (clr_rstat_wire == 1'b1) read_status_reg <= 1'b0;
++			else  read_status_reg <= read_status;
++	assign
++		wire_read_status_reg_ena = ((~ busy_wire) | clr_rstat_wire);
++	// synopsys translate_off
++	initial
++		sec_erase_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) sec_erase_reg <= 1'b0;
++		else if  (wire_sec_erase_reg_ena == 1'b1) 
++			if (clr_write_wire == 1'b1) sec_erase_reg <= 1'b0;
++			else  sec_erase_reg <= sector_erase;
++	assign
++		wire_sec_erase_reg_ena = (((~ busy_wire) & wren_wire) | clr_write_wire);
++	// synopsys translate_off
++	initial
++		shftpgwr_data_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) shftpgwr_data_reg <= 1'b0;
++		else
++			if (end_operation == 1'b1) shftpgwr_data_reg <= 1'b0;
++			else  shftpgwr_data_reg <= (((wire_stage_cntr_q[1] & (~ wire_stage_cntr_q[0])) & wire_wrstage_cntr_q[1]) & wire_wrstage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		shift_op_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) shift_op_reg <= 1'b0;
++		else  shift_op_reg <= ((~ wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		stage2_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) stage2_reg <= 1'b0;
++		else  stage2_reg <= ((~ wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		stage3_dly_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) stage3_dly_reg <= 1'b0;
++		else  stage3_dly_reg <= (wire_stage_cntr_q[1] & wire_stage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		stage3_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) stage3_reg <= 1'b0;
++		else  stage3_reg <= (wire_stage_cntr_q[1] & wire_stage_cntr_q[0]);
++	// synopsys translate_off
++	initial
++		stage4_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) stage4_reg <= 1'b0;
++		else  stage4_reg <= (wire_stage_cntr_q[1] & (~ wire_stage_cntr_q[0]));
++	// synopsys translate_off
++	initial
++		start_wrpoll_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) start_wrpoll_reg <= 1'b0;
++		else if  (wire_start_wrpoll_reg_ena == 1'b1) 
++			if (clr_write_wire == 1'b1) start_wrpoll_reg <= 1'b0;
++			else  start_wrpoll_reg <= (wire_stage_cntr_q[1] & wire_stage_cntr_q[0]);
++	assign
++		wire_start_wrpoll_reg_ena = (((do_write_rstat & do_polling) & end_one_cycle) | clr_write_wire);
++	// synopsys translate_off
++	initial
++		start_wrpoll_reg2 = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) start_wrpoll_reg2 <= 1'b0;
++		else
++			if (clr_write_wire == 1'b1) start_wrpoll_reg2 <= 1'b0;
++			else  start_wrpoll_reg2 <= start_wrpoll_reg;
++	// synopsys translate_off
++	initial
++		statreg_int[0:0] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[0:0] <= 1'b0;
++		else if  (wire_statreg_int_ena[0:0] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[0:0] <= 1'b0;
++			else  statreg_int[0:0] <= wire_statreg_int_d[0:0];
++	// synopsys translate_off
++	initial
++		statreg_int[1:1] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[1:1] <= 1'b0;
++		else if  (wire_statreg_int_ena[1:1] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[1:1] <= 1'b0;
++			else  statreg_int[1:1] <= wire_statreg_int_d[1:1];
++	// synopsys translate_off
++	initial
++		statreg_int[2:2] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[2:2] <= 1'b0;
++		else if  (wire_statreg_int_ena[2:2] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[2:2] <= 1'b0;
++			else  statreg_int[2:2] <= wire_statreg_int_d[2:2];
++	// synopsys translate_off
++	initial
++		statreg_int[3:3] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[3:3] <= 1'b0;
++		else if  (wire_statreg_int_ena[3:3] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[3:3] <= 1'b0;
++			else  statreg_int[3:3] <= wire_statreg_int_d[3:3];
++	// synopsys translate_off
++	initial
++		statreg_int[4:4] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[4:4] <= 1'b0;
++		else if  (wire_statreg_int_ena[4:4] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[4:4] <= 1'b0;
++			else  statreg_int[4:4] <= wire_statreg_int_d[4:4];
++	// synopsys translate_off
++	initial
++		statreg_int[5:5] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[5:5] <= 1'b0;
++		else if  (wire_statreg_int_ena[5:5] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[5:5] <= 1'b0;
++			else  statreg_int[5:5] <= wire_statreg_int_d[5:5];
++	// synopsys translate_off
++	initial
++		statreg_int[6:6] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[6:6] <= 1'b0;
++		else if  (wire_statreg_int_ena[6:6] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[6:6] <= 1'b0;
++			else  statreg_int[6:6] <= wire_statreg_int_d[6:6];
++	// synopsys translate_off
++	initial
++		statreg_int[7:7] = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_int[7:7] <= 1'b0;
++		else if  (wire_statreg_int_ena[7:7] == 1'b1) 
++			if (clr_rstat_wire == 1'b1) statreg_int[7:7] <= 1'b0;
++			else  statreg_int[7:7] <= wire_statreg_int_d[7:7];
++	assign
++		wire_statreg_int_d = {read_dout_reg[7:0]};
++	assign
++		wire_statreg_int_ena = {8{(((end_operation | ((do_polling & end_one_cyc_pos) & stage3_dly_reg)) & do_read_stat) | clr_rstat_wire)}};
++	// synopsys translate_off
++	initial
++		statreg_out[0:0] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[0:0] <= 1'b0;
++		else if  (wire_statreg_out_ena[0:0] == 1'b1)   statreg_out[0:0] <= wire_statreg_out_d[0:0];
++	// synopsys translate_off
++	initial
++		statreg_out[1:1] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[1:1] <= 1'b0;
++		else if  (wire_statreg_out_ena[1:1] == 1'b1)   statreg_out[1:1] <= wire_statreg_out_d[1:1];
++	// synopsys translate_off
++	initial
++		statreg_out[2:2] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[2:2] <= 1'b0;
++		else if  (wire_statreg_out_ena[2:2] == 1'b1)   statreg_out[2:2] <= wire_statreg_out_d[2:2];
++	// synopsys translate_off
++	initial
++		statreg_out[3:3] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[3:3] <= 1'b0;
++		else if  (wire_statreg_out_ena[3:3] == 1'b1)   statreg_out[3:3] <= wire_statreg_out_d[3:3];
++	// synopsys translate_off
++	initial
++		statreg_out[4:4] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[4:4] <= 1'b0;
++		else if  (wire_statreg_out_ena[4:4] == 1'b1)   statreg_out[4:4] <= wire_statreg_out_d[4:4];
++	// synopsys translate_off
++	initial
++		statreg_out[5:5] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[5:5] <= 1'b0;
++		else if  (wire_statreg_out_ena[5:5] == 1'b1)   statreg_out[5:5] <= wire_statreg_out_d[5:5];
++	// synopsys translate_off
++	initial
++		statreg_out[6:6] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[6:6] <= 1'b0;
++		else if  (wire_statreg_out_ena[6:6] == 1'b1)   statreg_out[6:6] <= wire_statreg_out_d[6:6];
++	// synopsys translate_off
++	initial
++		statreg_out[7:7] = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) statreg_out[7:7] <= 1'b0;
++		else if  (wire_statreg_out_ena[7:7] == 1'b1)   statreg_out[7:7] <= wire_statreg_out_d[7:7];
++	assign
++		wire_statreg_out_d = {read_dout_reg[7:0]};
++	assign
++		wire_statreg_out_ena = {8{((((((((end_ophdly & do_read_stat) & (~ do_write)) & (~ do_sec_erase)) & (~ do_die_erase)) & (~ do_bulk_erase)) & (~ do_sec_prot)) & (~ do_4baddr)) & (~ do_ex4baddr))}};
++	// synopsys translate_off
++	initial
++		write_prot_reg = 0;
++	// synopsys translate_on
++	always @ ( negedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) write_prot_reg <= 1'b0;
++		else if  (wire_write_prot_reg_ena == 1'b1) 
++			if (clr_write_wire == 1'b1) write_prot_reg <= 1'b0;
++			else  write_prot_reg <= ((((do_write | do_sec_erase) & (~ mask_prot_comp_ntb[4])) & (~ prot_wire[0])) | be_write_prot);
++	assign
++		wire_write_prot_reg_ena = (((((((do_sec_erase | do_write) | do_bulk_erase) | do_die_erase) & (~ wire_wrstage_cntr_q[1])) & wire_wrstage_cntr_q[0]) & end_ophdly) | clr_write_wire);
++	// synopsys translate_off
++	initial
++		write_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) write_reg <= 1'b0;
++		else if  (wire_write_reg_ena == 1'b1) 
++			if (clr_write_wire == 1'b1) write_reg <= 1'b0;
++			else  write_reg <= write;
++	assign
++		wire_write_reg_ena = (((~ busy_wire) & wren_wire) | clr_write_wire);
++	// synopsys translate_off
++	initial
++		write_rstat_reg = 0;
++	// synopsys translate_on
++	always @ ( posedge clkin_wire or  posedge reset)
++		if (reset == 1'b1) write_rstat_reg <= 1'b0;
++		else
++			if (clr_write_wire == 1'b1) write_rstat_reg <= 1'b0;
++			else  write_rstat_reg <= ((((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) | do_4baddr) | do_ex4baddr) & (((~ wire_wrstage_cntr_q[1]) & (~ wire_wrstage_cntr_q[0])) | (wire_wrstage_cntr_q[1] & (~ wire_wrstage_cntr_q[0]))));
++	lpm_compare   cmpr4
++	( 
++	.aeb(wire_cmpr4_aeb),
++	.agb(),
++	.ageb(),
++	.alb(),
++	.aleb(),
++	.aneb(),
++	.dataa({page_size_wire[8:0]}),
++	.datab({wire_pgwr_data_cntr_q[8:0]})
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.aclr(1'b0),
++	.clken(1'b1),
++	.clock(1'b0)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		cmpr4.lpm_width = 9,
++		cmpr4.lpm_type = "lpm_compare";
++	lpm_compare   cmpr5
++	( 
++	.aeb(wire_cmpr5_aeb),
++	.agb(),
++	.ageb(),
++	.alb(),
++	.aleb(),
++	.aneb(),
++	.dataa({wire_pgwr_data_cntr_q[8:0]}),
++	.datab({wire_pgwr_read_cntr_q[8:0]})
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.aclr(1'b0),
++	.clken(1'b1),
++	.clock(1'b0)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		cmpr5.lpm_width = 9,
++		cmpr5.lpm_type = "lpm_compare";
++	lpm_counter   pgwr_data_cntr
++	( 
++	.aclr(reset),
++	.clk_en(((((shift_bytes_wire & wren_wire) & (~ reach_max_cnt)) & (~ do_write)) | clr_write_wire2)),
++	.clock(clkin_wire),
++	.cout(),
++	.eq(),
++	.q(wire_pgwr_data_cntr_q),
++	.sclr(clr_write_wire2)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.aload(1'b0),
++	.aset(1'b0),
++	.cin(1'b1),
++	.cnt_en(1'b1),
++	.data({9{1'b0}}),
++	.sload(1'b0),
++	.sset(1'b0),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		pgwr_data_cntr.lpm_direction = "UP",
++		pgwr_data_cntr.lpm_port_updown = "PORT_UNUSED",
++		pgwr_data_cntr.lpm_width = 9,
++		pgwr_data_cntr.lpm_type = "lpm_counter";
++	lpm_counter   pgwr_read_cntr
++	( 
++	.aclr(reset),
++	.clk_en((read_buf | clr_write_wire2)),
++	.clock(clkin_wire),
++	.cout(),
++	.eq(),
++	.q(wire_pgwr_read_cntr_q),
++	.sclr(clr_write_wire2)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.aload(1'b0),
++	.aset(1'b0),
++	.cin(1'b1),
++	.cnt_en(1'b1),
++	.data({9{1'b0}}),
++	.sload(1'b0),
++	.sset(1'b0),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		pgwr_read_cntr.lpm_direction = "UP",
++		pgwr_read_cntr.lpm_port_updown = "PORT_UNUSED",
++		pgwr_read_cntr.lpm_width = 9,
++		pgwr_read_cntr.lpm_type = "lpm_counter";
++	lpm_counter   read_add_cntr
++	( 
++	.aclr(reset),
++	.clk_en((((rden_wire & not_busy) | data_valid_wire) | add_rollover)),
++	.clock(clkin_wire),
++	.cout(),
++	.data({{1{1'b0}}, addr[23:0]}),
++	.eq(),
++	.q(wire_read_add_cntr_q),
++	.sclr(add_rollover),
++	.sload((rden_wire & not_busy))
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_off
++	`endif
++	,
++	.aload(1'b0),
++	.aset(1'b0),
++	.cin(1'b1),
++	.cnt_en(1'b1),
++	.sset(1'b0),
++	.updown(1'b1)
++	`ifndef FORMAL_VERIFICATION
++	// synopsys translate_on
++	`endif
++	);
++	defparam
++		read_add_cntr.lpm_direction = "UP",
++		read_add_cntr.lpm_port_updown = "PORT_UNUSED",
++		read_add_cntr.lpm_width = 25,
++		read_add_cntr.lpm_type = "lpm_counter";
++	assign		wire_mux211_dataout = (do_fast_read === 1'b1) ? end_add_cycle_mux_datab_wire : (wire_addbyte_cntr_q[1] & (~ wire_addbyte_cntr_q[0]));
++	scfifo   scfifo3
++	( 
++	.aclr(reset),
++	.almost_empty(),
++	.almost_full(),
++	.clock(clkin_wire),
++	.data({datain[7:0]}),
++	.eccstatus(),
++	.empty(),
++	.full(),
++	.q(wire_scfifo3_q),
++	.rdreq((read_buf | dummy_read_buf)),
++	.sclr(clr_write_wire2),
++	.usedw(),
++	.wrreq(((shift_bytes_wire & wren_wire) & (~ do_write))));
++	defparam
++		scfifo3.lpm_numwords = 258,
++		scfifo3.lpm_width = 8,
++		scfifo3.lpm_widthu = 9,
++		scfifo3.use_eab = "ON",
++		scfifo3.lpm_type = "scfifo";
++	assign
++		add_rollover = add_rollover_reg,
++		addr_overdie = 1'b0,
++		addr_overdie_pos = 1'b0,
++		addr_reg_overdie = {24{1'b0}},
++		b4addr_opcode = {8{1'b0}},
++		be_write_prot = ((do_bulk_erase | do_die_erase) & (((bp3_wire | bp2_wire) | bp1_wire) | bp0_wire)),
++		berase_opcode = {8{1'b0}},
++		bp0_wire = statreg_int[2],
++		bp1_wire = statreg_int[3],
++		bp2_wire = statreg_int[4],
++		bp3_wire = statreg_int[6],
++		buf_empty = buf_empty_reg,
++		busy = busy_wire,
++		busy_wire = ((((((((((((((do_read_rdid | do_read_sid) | do_read) | do_fast_read) | do_write) | do_sec_prot) | do_read_stat) | do_sec_erase) | do_bulk_erase) | do_die_erase) | do_4baddr) | do_read_volatile) | do_fread_epcq) | do_read_nonvolatile) | do_ex4baddr),
++		clkin_wire = clkin,
++		clr_addmsb_wire = (((((wire_stage_cntr_q[1] & (~ wire_stage_cntr_q[0])) & end_add_cycle) & end_one_cyc_pos) | (((~ do_read) & (~ do_fast_read)) & clr_write_wire2)) | ((((do_sec_erase | do_die_erase) & (~ do_wren)) & (~ do_read_stat)) & end_operation)),
++		clr_endrbyte_wire = (((((do_read | do_fast_read) & (~ wire_gen_cntr_q[2])) & wire_gen_cntr_q[1]) & wire_gen_cntr_q[0]) | clr_read_wire2),
++		clr_read_wire = clr_read_reg,
++		clr_read_wire2 = clr_read_reg2,
++		clr_rstat_wire = clr_rstat_reg,
++		clr_sid_wire = 1'b0,
++		clr_write_wire = clr_write_reg,
++		clr_write_wire2 = clr_write_reg2,
++		cnt_bfend_wire_in = ((wire_gen_cntr_q[2] & (~ wire_gen_cntr_q[1])) & wire_gen_cntr_q[0]),
++		data0out_wire = wire_sd2_data0out,
++		data_valid = data_valid_wire,
++		data_valid_wire = dvalid_reg2,
++		datain_wire = {{4{1'b0}}},
++		dataout = {read_data_reg[7:0]},
++		dataout_wire = {{4{1'b0}}},
++		derase_opcode = {8{1'b0}},
++		do_4baddr = 1'b0,
++		do_bulk_erase = 1'b0,
++		do_die_erase = 1'b0,
++		do_ex4baddr = 1'b0,
++		do_fast_read = 1'b0,
++		do_fread_epcq = 1'b0,
++		do_freadwrv_polling = 1'b0,
++		do_memadd = do_wrmemadd_reg,
++		do_polling = ((do_write_polling | do_sprot_polling) | do_freadwrv_polling),
++		do_read = ((((~ read_rdid_wire) & (~ read_sid_wire)) & (~ sec_protect_wire)) & read_wire),
++		do_read_nonvolatile = 1'b0,
++		do_read_rdid = 1'b0,
++		do_read_sid = 1'b0,
++		do_read_stat = ((((((((((~ do_read_nonvolatile) & (~ read_rdid_wire)) & (~ read_sid_wire)) & (~ sec_protect_wire)) & (~ (read_wire | fast_read_wire))) & (~ write_wire)) & read_status_wire) | do_write_rstat) | do_sprot_rstat) | do_write_volatile_rstat),
++		do_read_volatile = 1'b0,
++		do_sec_erase = ((((((((~ do_read_nonvolatile) & (~ read_rdid_wire)) & (~ read_sid_wire)) & (~ sec_protect_wire)) & (~ (read_wire | fast_read_wire))) & (~ write_wire)) & (~ read_status_wire)) & sec_erase_wire),
++		do_sec_prot = 1'b0,
++		do_secprot_wren = 1'b0,
++		do_sprot_polling = 1'b0,
++		do_sprot_rstat = 1'b0,
++		do_wait_dummyclk = 1'b0,
++		do_wren = ((do_write_wren | do_secprot_wren) | do_write_volatile_wren),
++		do_write = ((((((~ do_read_nonvolatile) & (~ read_rdid_wire)) & (~ read_sid_wire)) & (~ sec_protect_wire)) & (~ (read_wire | fast_read_wire))) & write_wire),
++		do_write_polling = (((((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) | do_4baddr) | do_ex4baddr) & wire_wrstage_cntr_q[1]) & (~ wire_wrstage_cntr_q[0])),
++		do_write_rstat = write_rstat_reg,
++		do_write_volatile = 1'b0,
++		do_write_volatile_rstat = 1'b0,
++		do_write_volatile_wren = 1'b0,
++		do_write_wren = ((~ wire_wrstage_cntr_q[1]) & wire_wrstage_cntr_q[0]),
++		dummy_read_buf = maxcnt_shift_reg2,
++		end1_cyc_gen_cntr_wire = ((wire_gen_cntr_q[2] & (~ wire_gen_cntr_q[1])) & (~ wire_gen_cntr_q[0])),
++		end1_cyc_normal_in_wire = ((((((((((((~ wire_stage_cntr_q[0]) & (~ wire_stage_cntr_q[1])) & (~ wire_gen_cntr_q[2])) & wire_gen_cntr_q[1]) & wire_gen_cntr_q[0]) | ((~ ((~ wire_stage_cntr_q[0]) & (~ wire_stage_cntr_q[1]))) & end1_cyc_gen_cntr_wire)) | (do_read & end_read)) | (do_fast_read & end_fast_read)) | ((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) & write_prot_true)) | (do_write & (~ pagewr_buf_not_empty[8]))) | ((do_read_stat & start_poll) & (~ st_busy_wire))) | (do_read_rdid & end_op_wire)),
++		end1_cyc_reg_in_wire = end1_cyc_normal_in_wire,
++		end_add_cycle = wire_mux211_dataout,
++		end_add_cycle_mux_datab_wire = (wire_addbyte_cntr_q[2] & wire_addbyte_cntr_q[1]),
++		end_fast_read = end_read_reg,
++		end_one_cyc_pos = end1_cyc_reg2,
++		end_one_cycle = end1_cyc_reg,
++		end_op_wire = ((((((((((((wire_stage_cntr_q[1] & (~ wire_stage_cntr_q[0])) & ((((((~ do_read) & (~ do_fast_read)) & (~ (do_write & shift_pgwr_data))) & end_one_cycle) | (do_read & end_read)) | (do_fast_read & end_fast_read))) | ((((wire_stage_cntr_q[1] & wire_stage_cntr_q[0]) & do_read_stat) & end_one_cycle) & (~ do_polling))) | ((((((do_read_rdid & end_one_cyc_pos) & wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]) & wire_addbyte_cntr_q[2]) & wire_addbyte_cntr_q[1]) & (~ wire_addbyte_cntr_q[0]))) | (((start_poll & do_read_stat) & do_polling) & (~ st_busy_wire))) | ((((~ wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]) & (do_wren | (do_4baddr | (do_ex4baddr | (do_bulk_erase & (~ do_read_stat)))))) & end_one_cycle)) | ((((do_write | do_sec_erase) | do_bulk_erase) | do_die_erase) & write_prot_true)) | ((do_write & shift_pgwr_data) & end_pgwr_data)) | (do_write & (~ pagewr_buf_not_empty[8]))) | (((((wire_stage_cntr_q[1] & wire_stage_cntr_q[0]) & do_sec_prot) & (~ do_wren)) & (~ do_read_stat)) & end_one_cycle)) | ((((((wire_stage_cntr_q[1] & wire_stage_cntr_q[0]) & (do_sec_erase | do_die_erase)) & (~ do_wren)) & (~ do_read_stat)) & end_add_cycle) & end_one_cycle)) | (((wire_stage_cntr_q[1] & wire_stage_cntr_q[0]) & end_one_cycle) & ((do_write_volatile | do_read_volatile) | (do_read_nonvolatile & wire_addbyte_cntr_q[1])))),
++		end_operation = end_op_reg,
++		end_ophdly = end_op_hdlyreg,
++		end_pgwr_data = end_pgwrop_reg,
++		end_read = end_read_reg,
++		end_read_byte = (end_rbyte_reg & (~ addr_overdie)),
++		end_wrstage = end_operation,
++		exb4addr_opcode = {8{1'b0}},
++		fast_read_opcode = {8{1'b0}},
++		fast_read_wire = 1'b0,
++		freadwrv_sdoin = 1'b0,
++		ill_erase_wire = ill_erase_reg,
++		ill_write_wire = ill_write_reg,
++		illegal_erase = ill_erase_wire,
++		illegal_erase_b4out_wire = (((do_sec_erase | do_bulk_erase) | do_die_erase) & write_prot_true),
++		illegal_write = ill_write_wire,
++		illegal_write_b4out_wire = ((do_write & write_prot_true) | (do_write & (~ pagewr_buf_not_empty[8]))),
++		in_operation = busy_wire,
++		load_opcode = (((((~ wire_stage_cntr_q[1]) & (~ wire_stage_cntr_q[0])) & (~ wire_gen_cntr_q[2])) & (~ wire_gen_cntr_q[1])) & wire_gen_cntr_q[0]),
++		mask_prot = {((((prot_wire[1] | prot_wire[2]) | prot_wire[3]) | prot_wire[4]) | prot_wire[5]), (((prot_wire[1] | prot_wire[2]) | prot_wire[3]) | prot_wire[4]), ((prot_wire[1] | prot_wire[2]) | prot_wire[3]), (prot_wire[1] | prot_wire[2]), prot_wire[1]},
++		mask_prot_add = {(mask_prot[4] & addr_reg[20]), (mask_prot[3] & addr_reg[19]), (mask_prot[2] & addr_reg[18]), (mask_prot[1] & addr_reg[17]), (mask_prot[0] & addr_reg[16])},
++		mask_prot_check = {(mask_prot[4] ^ mask_prot_add[4]), (mask_prot[3] ^ mask_prot_add[3]), (mask_prot[2] ^ mask_prot_add[2]), (mask_prot[1] ^ mask_prot_add[1]), (mask_prot[0] ^ mask_prot_add[0])},
++		mask_prot_comp_ntb = {(mask_prot_check[4] | mask_prot_comp_ntb[3]), (mask_prot_check[3] | mask_prot_comp_ntb[2]), (mask_prot_check[2] | mask_prot_comp_ntb[1]), (mask_prot_check[1] | mask_prot_comp_ntb[0]), mask_prot_check[0]},
++		mask_prot_comp_tb = {(mask_prot_add[4] | mask_prot_comp_tb[3]), (mask_prot_add[3] | mask_prot_comp_tb[2]), (mask_prot_add[2] | mask_prot_comp_tb[1]), (mask_prot_add[1] | mask_prot_comp_tb[0]), mask_prot_add[0]},
++		memadd_sdoin = add_msb_reg,
++		ncs_reg_ena_wire = (((((~ wire_stage_cntr_q[1]) & wire_stage_cntr_q[0]) & end_one_cyc_pos) | addr_overdie_pos) | end_operation),
++		not_busy = busy_det_reg,
++		oe_wire = 1'b0,
++		page_size_wire = 9'b100000000,
++		pagewr_buf_not_empty = {(pagewr_buf_not_empty[7] | wire_pgwr_data_cntr_q[8]), (pagewr_buf_not_empty[6] | wire_pgwr_data_cntr_q[7]), (pagewr_buf_not_empty[5] | wire_pgwr_data_cntr_q[6]), (pagewr_buf_not_empty[4] | wire_pgwr_data_cntr_q[5]), (pagewr_buf_not_empty[3] | wire_pgwr_data_cntr_q[4]), (pagewr_buf_not_empty[2] | wire_pgwr_data_cntr_q[3]), (pagewr_buf_not_empty[1] | wire_pgwr_data_cntr_q[2]), (pagewr_buf_not_empty[0] | wire_pgwr_data_cntr_q[1]), wire_pgwr_data_cntr_q[0]},
++		prot_wire = {((bp2_wire & bp1_wire) & bp0_wire), ((bp2_wire & bp1_wire) & (~ bp0_wire)), ((bp2_wire & (~ bp1_wire)) & bp0_wire), ((bp2_wire & (~ bp1_wire)) & (~ bp0_wire)), (((~ bp2_wire) & bp1_wire) & bp0_wire), (((~ bp2_wire) & bp1_wire) & (~ bp0_wire)), (((~ bp2_wire) & (~ bp1_wire)) & bp0_wire), (((~ bp2_wire) & (~ bp1_wire)) & (~ bp0_wire))},
++		rden_wire = rden,
++		rdid_opcode = {8{1'b0}},
++		rdummyclk_opcode = {8{1'b0}},
++		reach_max_cnt = max_cnt_reg,
++		read_address = {read_add_reg[23:0]},
++		read_buf = (((((end_one_cycle & do_write) & (~ do_read_stat)) & (~ do_wren)) & ((wire_stage_cntr_q[1] & (~ wire_stage_cntr_q[0])) | (wire_addbyte_cntr_q[1] & (~ wire_addbyte_cntr_q[0])))) & (~ buf_empty)),
++		read_bufdly = read_bufdly_reg,
++		read_data_reg_in_wire = {read_dout_reg[7:0]},
++		read_opcode = 8'b00000011,
++		read_rdid_wire = 1'b0,
++		read_sid_wire = 1'b0,
++		read_status_wire = read_status_reg,
++		read_wire = read_reg,
++		rflagstat_opcode = 8'b00000101,
++		rnvdummyclk_opcode = {8{1'b0}},
++		rsid_opcode = {8{1'b0}},
++		rsid_sdoin = 1'b0,
++		rstat_opcode = 8'b00000101,
++		scein_wire = (~ ncs_reg),
++		sdoin_wire = to_sdoin_wire,
++		sec_erase_wire = sec_erase_reg,
++		sec_protect_wire = 1'b0,
++		secprot_opcode = {8{1'b0}},
++		secprot_sdoin = 1'b0,
++		serase_opcode = 8'b11011000,
++		shift_bytes_wire = shift_bytes,
++		shift_opcode = shift_op_reg,
++		shift_opdata = stage2_wire,
++		shift_pgwr_data = shftpgwr_data_reg,
++		st_busy_wire = statreg_int[0],
++		stage2_wire = stage2_reg,
++		stage3_wire = stage3_reg,
++		stage4_wire = stage4_reg,
++		start_frpoll = 1'b0,
++		start_poll = ((start_wrpoll | start_sppoll) | start_frpoll),
++		start_sppoll = 1'b0,
++		start_wrpoll = start_wrpoll_reg2,
++		status_out = {statreg_out[7:0]},
++		to_sdoin_wire = ((((((shift_opdata & asmi_opcode_reg[7]) | rsid_sdoin) | memadd_sdoin) | write_sdoin) | secprot_sdoin) | freadwrv_sdoin),
++		wren_opcode = 8'b00000110,
++		wren_wire = wren,
++		write_opcode = 8'b00000010,
++		write_prot_true = write_prot_reg,
++		write_sdoin = ((((do_write & stage4_wire) & wire_wrstage_cntr_q[1]) & wire_wrstage_cntr_q[0]) & pgwrbuf_dataout[7]),
++		write_wire = write_reg,
++		wrvolatile_opcode = {8{1'b0}};
++endmodule //epcs_ctrl_altasmi_parallel_0ot2
++//VALID FILE
++
++
++// synopsys translate_off
++`timescale 1 ps / 1 ps
++// synopsys translate_on
++module epcs_ctrl (
++	addr,
++	clkin,
++	datain,
++	rden,
++	read,
++	read_status,
++	reset,
++	sector_erase,
++	shift_bytes,
++	wren,
++	write,
++	busy,
++	data_valid,
++	dataout,
++	illegal_erase,
++	illegal_write,
++	read_address,
++	status_out)/* synthesis synthesis_clearbox = 2 */;
++
++	input	[23:0]  addr;
++	input	  clkin;
++	input	[7:0]  datain;
++	input	  rden;
++	input	  read;
++	input	  read_status;
++	input	  reset;
++	input	  sector_erase;
++	input	  shift_bytes;
++	input	  wren;
++	input	  write;
++	output	  busy;
++	output	  data_valid;
++	output	[7:0]  dataout;
++	output	  illegal_erase;
++	output	  illegal_write;
++	output	[23:0]  read_address;
++	output	[7:0]  status_out;
++
++	wire  sub_wire0;
++	wire  sub_wire1;
++	wire [7:0] sub_wire2;
++	wire  sub_wire3;
++	wire  sub_wire4;
++	wire [23:0] sub_wire5;
++	wire [7:0] sub_wire6;
++	wire  busy = sub_wire0;
++	wire  data_valid = sub_wire1;
++	wire [7:0] dataout = sub_wire2[7:0];
++	wire  illegal_erase = sub_wire3;
++	wire  illegal_write = sub_wire4;
++	wire [23:0] read_address = sub_wire5[23:0];
++	wire [7:0] status_out = sub_wire6[7:0];
++
++	epcs_ctrl_altasmi_parallel_0ot2	epcs_ctrl_altasmi_parallel_0ot2_component (
++				.addr (addr),
++				.clkin (clkin),
++				.datain (datain),
++				.rden (rden),
++				.read (read),
++				.read_status (read_status),
++				.reset (reset),
++				.sector_erase (sector_erase),
++				.shift_bytes (shift_bytes),
++				.wren (wren),
++				.write (write),
++				.busy (sub_wire0),
++				.data_valid (sub_wire1),
++				.dataout (sub_wire2),
++				.illegal_erase (sub_wire3),
++				.illegal_write (sub_wire4),
++				.read_address (sub_wire5),
++				.status_out (sub_wire6))/* synthesis synthesis_clearbox=2
++	 clearbox_macroname = ALTASMI_PARALLEL
++	 clearbox_defparam = "data_width=STANDARD;enable_sim=FALSE;epcs_type=EPCS16;flash_rstpin=FALSE;intended_device_family=Cyclone IV E;lpm_hint=UNUSED;lpm_type=altasmi_parallel;page_size=256;port_bulk_erase=PORT_UNUSED;port_die_erase=PORT_UNUSED;port_en4b_addr=PORT_UNUSED;port_ex4b_addr=PORT_UNUSED;port_fast_read=PORT_UNUSED;port_illegal_erase=PORT_USED;port_illegal_write=PORT_USED;port_rdid_out=PORT_UNUSED;port_read_address=PORT_USED;port_read_dummyclk=PORT_UNUSED;port_read_rdid=PORT_UNUSED;port_read_sid=PORT_UNUSED;port_read_status=PORT_USED;port_sector_erase=PORT_USED;port_sector_protect=PORT_UNUSED;port_shift_bytes=PORT_USED;port_wren=PORT_USED;port_write=PORT_USED;use_asmiblock=ON;use_eab=ON;write_dummy_clk=0;" */;
++
++endmodule
++
++// ============================================================
++// CNX file retrieval info
++// ============================================================
++// Retrieval info: LIBRARY: altera_mf altera_mf.altera_mf_components.all
++// Retrieval info: PRIVATE: INTENDED_DEVICE_FAMILY STRING "Cyclone IV E"
++// Retrieval info: CONSTANT: DATA_WIDTH STRING "STANDARD"
++// Retrieval info: CONSTANT: ENABLE_SIM STRING "FALSE"
++// Retrieval info: CONSTANT: EPCS_TYPE STRING "EPCS16"
++// Retrieval info: CONSTANT: FLASH_RSTPIN STRING "FALSE"
++// Retrieval info: CONSTANT: INTENDED_DEVICE_FAMILY STRING "Cyclone IV E"
++// Retrieval info: CONSTANT: LPM_HINT STRING "UNUSED"
++// Retrieval info: CONSTANT: LPM_TYPE STRING "altasmi_parallel"
++// Retrieval info: CONSTANT: PAGE_SIZE NUMERIC "256"
++// Retrieval info: CONSTANT: PORT_BULK_ERASE STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_DIE_ERASE STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_EN4B_ADDR STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_EX4B_ADDR STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_FAST_READ STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_ILLEGAL_ERASE STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_ILLEGAL_WRITE STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_RDID_OUT STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_READ_ADDRESS STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_READ_DUMMYCLK STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_READ_RDID STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_READ_SID STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_READ_STATUS STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_SECTOR_ERASE STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_SECTOR_PROTECT STRING "PORT_UNUSED"
++// Retrieval info: CONSTANT: PORT_SHIFT_BYTES STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_WREN STRING "PORT_USED"
++// Retrieval info: CONSTANT: PORT_WRITE STRING "PORT_USED"
++// Retrieval info: CONSTANT: USE_ASMIBLOCK STRING "ON"
++// Retrieval info: CONSTANT: USE_EAB STRING "ON"
++// Retrieval info: CONSTANT: WRITE_DUMMY_CLK NUMERIC "0"
++// Retrieval info: USED_PORT: addr 0 0 24 0 INPUT NODEFVAL "addr[23..0]"
++// Retrieval info: CONNECT: @addr 0 0 24 0 addr 0 0 24 0
++// Retrieval info: USED_PORT: busy 0 0 0 0 OUTPUT NODEFVAL "busy"
++// Retrieval info: CONNECT: busy 0 0 0 0 @busy 0 0 0 0
++// Retrieval info: USED_PORT: clkin 0 0 0 0 INPUT NODEFVAL "clkin"
++// Retrieval info: CONNECT: @clkin 0 0 0 0 clkin 0 0 0 0
++// Retrieval info: USED_PORT: data_valid 0 0 0 0 OUTPUT NODEFVAL "data_valid"
++// Retrieval info: CONNECT: data_valid 0 0 0 0 @data_valid 0 0 0 0
++// Retrieval info: USED_PORT: datain 0 0 8 0 INPUT NODEFVAL "datain[7..0]"
++// Retrieval info: CONNECT: @datain 0 0 8 0 datain 0 0 8 0
++// Retrieval info: USED_PORT: dataout 0 0 8 0 OUTPUT NODEFVAL "dataout[7..0]"
++// Retrieval info: CONNECT: dataout 0 0 8 0 @dataout 0 0 8 0
++// Retrieval info: USED_PORT: illegal_erase 0 0 0 0 OUTPUT NODEFVAL "illegal_erase"
++// Retrieval info: CONNECT: illegal_erase 0 0 0 0 @illegal_erase 0 0 0 0
++// Retrieval info: USED_PORT: illegal_write 0 0 0 0 OUTPUT NODEFVAL "illegal_write"
++// Retrieval info: CONNECT: illegal_write 0 0 0 0 @illegal_write 0 0 0 0
++// Retrieval info: USED_PORT: rden 0 0 0 0 INPUT NODEFVAL "rden"
++// Retrieval info: CONNECT: @rden 0 0 0 0 rden 0 0 0 0
++// Retrieval info: USED_PORT: read 0 0 0 0 INPUT NODEFVAL "read"
++// Retrieval info: CONNECT: @read 0 0 0 0 read 0 0 0 0
++// Retrieval info: USED_PORT: read_address 0 0 24 0 OUTPUT NODEFVAL "read_address[23..0]"
++// Retrieval info: CONNECT: read_address 0 0 24 0 @read_address 0 0 24 0
++// Retrieval info: USED_PORT: read_status 0 0 0 0 INPUT NODEFVAL "read_status"
++// Retrieval info: CONNECT: @read_status 0 0 0 0 read_status 0 0 0 0
++// Retrieval info: USED_PORT: reset 0 0 0 0 INPUT NODEFVAL "reset"
++// Retrieval info: CONNECT: @reset 0 0 0 0 reset 0 0 0 0
++// Retrieval info: USED_PORT: sector_erase 0 0 0 0 INPUT NODEFVAL "sector_erase"
++// Retrieval info: CONNECT: @sector_erase 0 0 0 0 sector_erase 0 0 0 0
++// Retrieval info: USED_PORT: shift_bytes 0 0 0 0 INPUT NODEFVAL "shift_bytes"
++// Retrieval info: CONNECT: @shift_bytes 0 0 0 0 shift_bytes 0 0 0 0
++// Retrieval info: USED_PORT: status_out 0 0 8 0 OUTPUT NODEFVAL "status_out[7..0]"
++// Retrieval info: CONNECT: status_out 0 0 8 0 @status_out 0 0 8 0
++// Retrieval info: USED_PORT: wren 0 0 0 0 INPUT NODEFVAL "wren"
++// Retrieval info: CONNECT: @wren 0 0 0 0 wren 0 0 0 0
++// Retrieval info: USED_PORT: write 0 0 0 0 INPUT NODEFVAL "write"
++// Retrieval info: CONNECT: @write 0 0 0 0 write 0 0 0 0
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl.v TRUE FALSE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl.qip TRUE FALSE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl.bsf FALSE TRUE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl_inst.v FALSE TRUE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl_bb.v FALSE TRUE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl.inc FALSE TRUE
++// Retrieval info: GEN_FILE: TYPE_NORMAL epcs_ctrl.cmp FALSE TRUE
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+new file mode 100644
+index 0000000..8df2090
+--- /dev/null
++++ b/rtl/wb_altasmi_parallel.v
+@@ -0,0 +1,184 @@
++// wb_altasmi_parallel.v — thin Wishbone (NEORV32 XBUS) wrapper around the
++// Altera altasmi_parallel megafunction.  Drives the dedicated AS pins
++// (DCLK / nCSO / ASDO / DATA0) via USE_ASMIBLOCK=ON — no QSF pin
++// assignments needed.
++//
++// Base: 0xF2000000.  1 MB decode window (xbus_adr[31:20] == 12'hF20).
++//
++// "Thin" model: MMIO exposes altasmi's raw control inputs and outputs;
++// firmware (Phase 3 epcs.c) drives the per-byte handshake.  Bits in CTRL
++// are split into LEVEL (read/write/sec_erase/rd_status — held until
++// firmware clears) and PULSE (shift_bytes/wren/reset — auto-clear after
++// one cycle).
++//
++// Register map (byte offsets, 32-bit accesses):
++//   0x00  CTRL    (W)  b0=read    (level)
++//                      b1=write   (level)
++//                      b2=sector_erase (level)
++//                      b3=read_status  (level)
++//                      b4=shift_bytes  (1-cycle pulse)
++//                      b5=wren         (1-cycle pulse)
++//                      b6=reset        (1-cycle pulse; clears sticky flags)
++//                  (R)  reads back the 4 level bits in same positions
++//   0x04  ADDR    (R/W) [23:0]   altasmi.addr
++//   0x08  DATAIN  (R/W) [7:0]    altasmi.datain
++//   0x0C  STATUS  (R)   b0=busy
++//                       b1=data_valid_sticky (clears on DATAOUT read or reset)
++//                       b2=illegal_erase_sticky (clears on reset)
++//                       b3=illegal_write_sticky (clears on reset)
++//   0x10  DATAOUT (R)   [7:0]    latched altasmi.dataout (reading clears DV)
++//   0x14  ESTAT   (R)   [7:0]    altasmi.status_out (latest read_status result)
++
++module wb_altasmi_parallel (
++    input         clk,
++    input         rst_n,
++
++    input  [31:0] xbus_adr,
++    input  [31:0] xbus_dat_w,
++    input  [3:0]  xbus_sel,
++    input         xbus_we,
++    input         xbus_stb,
++    input         xbus_cyc,
++    output reg [31:0] xbus_dat_r,
++    output reg    xbus_ack,
++    output        xbus_err
++);
++    assign xbus_err = 1'b0;
++
++    wire in_range = (xbus_adr[31:20] == 12'hF20);
++    wire [7:0] off = xbus_adr[7:0];
++
++    // ── Control registers ─────────────────────────────────────────────
++    reg ctrl_read;
++    reg ctrl_write;
++    reg ctrl_sec_erase;
++    reg ctrl_rd_status;
++    reg ctrl_shift_bytes;
++    reg ctrl_wren;
++    reg ctrl_reset;
++    reg [23:0] addr_reg;
++    reg [7:0]  datain_reg;
++
++    // ── altasmi outputs ───────────────────────────────────────────────
++    wire        am_busy;
++    wire        am_data_valid;
++    wire [7:0]  am_dataout;
++    wire [7:0]  am_status_out;
++    wire        am_illegal_erase;
++    wire        am_illegal_write;
++
++    // Generated by qmegawiz from rtl/ip/epcs_ctrl.v (altasmi_parallel
++    // wrapper, EPCS16, Cyclone IV E, USE_ASMIBLOCK=ON — drives the
++    // dedicated AS pins DCLK/nCSO/ASDO/DATA0 automatically).
++    epcs_ctrl u_am (
++        .clkin         (clk),
++        .reset         (ctrl_reset),
++        .addr          (addr_reg),
++        .datain        (datain_reg),
++        .rden          (1'b1),
++        .read          (ctrl_read),
++        .write         (ctrl_write),
++        .sector_erase  (ctrl_sec_erase),
++        .read_status   (ctrl_rd_status),
++        .shift_bytes   (ctrl_shift_bytes),
++        .wren          (ctrl_wren),
++        .busy          (am_busy),
++        .data_valid    (am_data_valid),
++        .dataout       (am_dataout),
++        .status_out    (am_status_out),
++        .illegal_erase (am_illegal_erase),
++        .illegal_write (am_illegal_write),
++        .read_address  ()  // diagnostic-only; not surfaced over MMIO
++    );
++
++    // ── Sticky flags + dataout latch ──────────────────────────────────
++    reg flag_illegal_erase;
++    reg flag_illegal_write;
++    reg flag_data_valid;
++    reg [7:0] latched_dataout;
++    reg       dataout_read_req;  // pulsed when firmware reads DATAOUT
++
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n) begin
++            flag_illegal_erase <= 1'b0;
++            flag_illegal_write <= 1'b0;
++            flag_data_valid    <= 1'b0;
++            latched_dataout    <= 8'd0;
++        end else begin
++            if (am_illegal_erase) flag_illegal_erase <= 1'b1;
++            if (am_illegal_write) flag_illegal_write <= 1'b1;
++            if (am_data_valid) begin
++                flag_data_valid <= 1'b1;
++                latched_dataout <= am_dataout;
++            end else if (dataout_read_req) begin
++                flag_data_valid <= 1'b0;
++            end
++            if (ctrl_reset) begin
++                flag_illegal_erase <= 1'b0;
++                flag_illegal_write <= 1'b0;
++                flag_data_valid    <= 1'b0;
++            end
++        end
++    end
++
++    // ── Bus transaction ───────────────────────────────────────────────
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n) begin
++            xbus_ack         <= 1'b0;
++            xbus_dat_r       <= 32'd0;
++            ctrl_read        <= 1'b0;
++            ctrl_write       <= 1'b0;
++            ctrl_sec_erase   <= 1'b0;
++            ctrl_rd_status   <= 1'b0;
++            ctrl_shift_bytes <= 1'b0;
++            ctrl_wren        <= 1'b0;
++            ctrl_reset       <= 1'b0;
++            addr_reg         <= 24'd0;
++            datain_reg       <= 8'd0;
++            dataout_read_req <= 1'b0;
++        end else begin
++            xbus_ack         <= 1'b0;
++            // auto-clear pulse bits + read-req strobe
++            ctrl_shift_bytes <= 1'b0;
++            ctrl_wren        <= 1'b0;
++            ctrl_reset       <= 1'b0;
++            dataout_read_req <= 1'b0;
++
++            if (xbus_cyc && xbus_stb && in_range && !xbus_ack) begin
++                xbus_ack <= 1'b1;
++                if (xbus_we) begin
++                    case (off)
++                        8'h00: begin
++                            ctrl_read        <= xbus_dat_w[0];
++                            ctrl_write       <= xbus_dat_w[1];
++                            ctrl_sec_erase   <= xbus_dat_w[2];
++                            ctrl_rd_status   <= xbus_dat_w[3];
++                            ctrl_shift_bytes <= xbus_dat_w[4];
++                            ctrl_wren        <= xbus_dat_w[5];
++                            ctrl_reset       <= xbus_dat_w[6];
++                        end
++                        8'h04: addr_reg   <= xbus_dat_w[23:0];
++                        8'h08: datain_reg <= xbus_dat_w[7:0];
++                        default: ;
++                    endcase
++                end else begin
++                    case (off)
++                        8'h00: xbus_dat_r <= {28'd0, ctrl_rd_status, ctrl_sec_erase,
++                                              ctrl_write, ctrl_read};
++                        8'h04: xbus_dat_r <= {8'd0, addr_reg};
++                        8'h08: xbus_dat_r <= {24'd0, datain_reg};
++                        8'h0C: xbus_dat_r <= {28'd0, flag_illegal_write, flag_illegal_erase,
++                                              flag_data_valid, am_busy};
++                        8'h10: begin
++                            xbus_dat_r       <= {24'd0, latched_dataout};
++                            dataout_read_req <= 1'b1;
++                        end
++                        8'h14: xbus_dat_r <= {24'd0, am_status_out};
++                        default: xbus_dat_r <= 32'd0;
++                    endcase
++                end
++            end
++        end
++    end
++
++endmodule
+diff --git a/rtl/wb_altremote_update.v b/rtl/wb_altremote_update.v
+new file mode 100644
+index 0000000..32c8564
+--- /dev/null
++++ b/rtl/wb_altremote_update.v
+@@ -0,0 +1,278 @@
++// wb_altremote_update.v — Wishbone (NEORV32 XBUS) wrapper around the
++// Cyclone IV E remote-update block (cycloneive_rublock primitive),
++// implementing the 29-bit shift-register handshake described in the
++// Cyclone IV Device Handbook (Vol 1, Ch 8 "Remote System Upgrade").
++//
++// We bypass the altremote_update megafunction entirely — its Lite-
++// Edition qmegawiz silent generator strips write_param/data_in for
++// Cyclone IV E in REMOTE mode, leaving no way to set PGM_SEL from the
++// running image.  The underlying rublock primitive supports the full
++// (write + read + reconfig) interface; we drive it directly with a
++// small shift FSM.
++//
++// 29-bit shift-register layout (LSB-first per Cyclone IV handbook):
++//   bits  0..23 = boot byte address (PGM_SEL[23:0])
++//   bit      24 = WD_EN  (watchdog enable; 0 = disabled)
++//   bits 25..27 = WD_TMR[2:0] (watchdog timeout selector — ignored when WD_EN=0)
++//   bit      28 = AP_CONFIG_SEL (0 = factory boot next, 1 = application)
++// Firmware writes the full 29-bit value to DATA before kicking SHIFT.
++// For Phase 2 bring-up we hard-disable the watchdog (bit 24 = 0).
++//
++// Base: 0xF3000000.  1 MB decode (xbus_adr[31:20] == 12'hF30).
++//
++// Register map (byte offsets, 32-bit accesses):
++//   0x00  DATA    (R/W)  [28:0] shift-register payload
++//                  Reading after SHIFT_OUT_CAPTURE returns the captured
++//                  rublock state.
++//   0x04  CMD     (W)
++//                  b0 = SHIFT_IN_AND_RECONFIG : load DATA, shift it
++//                       into rublock (29 cycles), pulse rconfig — FPGA
++//                       reloads from the new boot page (~150 ms).
++//                  b1 = SHIFT_OUT_CAPTURE     : capture current rublock
++//                       state, shift 29 bits into DATA over 29 cycles.
++//                  b2 = RECONFIG_ONLY         : pulse rconfig using
++//                       whatever rublock currently holds (post-POR
++//                       this is the factory image — useful for testing).
++//                  b3 = RESET_TIMER           : pulse rsttimer
++//                       (watchdog clear; cheap when WD_EN=0).
++//                  CMD writes are level-edge: any high bit triggers
++//                  the corresponding action.  STATUS.busy gates new
++//                  triggers.
++//   0x08  STATUS  (R)
++//                  b0 = busy (FSM running)
++//                  b1 = done_sticky (last op completed; clears on read)
++//                  b4..0 = state[3:0] (debug)
++
++module wb_altremote_update (
++    input         clk,
++    input         rst_n,
++
++    input  [31:0] xbus_adr,
++    input  [31:0] xbus_dat_w,
++    input  [3:0]  xbus_sel,
++    input         xbus_we,
++    input         xbus_stb,
++    input         xbus_cyc,
++    output reg [31:0] xbus_dat_r,
++    output reg    xbus_ack,
++    output        xbus_err
++);
++    assign xbus_err = 1'b0;
++
++    wire in_range = (xbus_adr[31:20] == 12'hF30);
++    wire [7:0] off = xbus_adr[7:0];
++
++    // ── rublock primitive I/O ─────────────────────────────────────────
++    reg  ru_shiftnld;  // 1 = shift, 0 = load/update
++    reg  ru_captnupdt; // 1 = capture (read), 0 = update (write)
++    reg  ru_regin;     // serial in
++    reg  ru_rsttimer;  // watchdog clear
++    reg  ru_rconfig;   // pulse → FPGA reloads
++    wire ru_regout;    // serial out
++
++    cycloneive_rublock u_ru (
++        .clk       (clk),
++        .shiftnld  (ru_shiftnld),
++        .captnupdt (ru_captnupdt),
++        .regin     (ru_regin),
++        .rsttimer  (ru_rsttimer),
++        .rconfig   (ru_rconfig),
++        .regout    (ru_regout)
++    );
++
++    // ── User register: 29-bit shift payload (write side) ────────────
++    reg [28:0] data_reg;
++    // FSM-owned readback register: holds shift-out capture result.
++    // Reading DATA returns this so the FSM and bus block don't both
++    // drive the same net (avoids Quartus error 10028).
++    reg [28:0] capture_reg;
++
++    // ── FSM ──────────────────────────────────────────────────────────
++    localparam S_IDLE       = 4'd0;
++    localparam S_LOAD_PRE   = 4'd1;  // capt=0, shiftnld=0 for one clk (latch in)
++    localparam S_SHIFT_IN   = 4'd2;  // shiftnld=1, regin = data_reg LSB, 29 cycles
++    localparam S_LOAD_POST  = 4'd3;  // shiftnld=0 for one clk (update PGM_SEL)
++    localparam S_RECONFIG   = 4'd4;  // rconfig=1 for one clk (point of no return)
++    localparam S_CAP_PRE    = 4'd5;  // capt=1, shiftnld=0 for one clk (capture)
++    localparam S_SHIFT_OUT  = 4'd6;  // capt=1, shiftnld=1, shift 29 cycles
++    localparam S_TIMER_RST  = 4'd7;  // rsttimer=1 for one clk
++    localparam S_DONE       = 4'd8;
++
++    reg [3:0]  state;
++    reg [4:0]  bit_cnt;       // 0..28 (need 5 bits for value 29)
++    reg [28:0] shift_buf;     // local shift register (mirror)
++    reg        done_sticky;
++    reg        status_read_req;
++
++    wire busy = (state != S_IDLE) && (state != S_DONE);
++
++    // Trigger latches (so single MMIO write into CMD can start one op)
++    reg trig_shift_in;
++    reg trig_shift_out;
++    reg trig_reconfig;
++    reg trig_rsttimer;
++
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n) begin
++            state           <= S_IDLE;
++            bit_cnt         <= 5'd0;
++            shift_buf       <= 29'd0;
++            capture_reg     <= 29'd0;
++            done_sticky     <= 1'b0;
++            ru_shiftnld     <= 1'b0;
++            ru_captnupdt    <= 1'b0;
++            ru_regin        <= 1'b0;
++            ru_rsttimer     <= 1'b0;
++            ru_rconfig      <= 1'b0;
++        end else begin
++            // defaults each cycle
++            ru_shiftnld  <= 1'b0;
++            ru_captnupdt <= 1'b0;
++            ru_regin     <= 1'b0;
++            ru_rsttimer  <= 1'b0;
++            ru_rconfig   <= 1'b0;
++
++            // clear done on STATUS read
++            if (status_read_req) done_sticky <= 1'b0;
++
++            case (state)
++                S_IDLE: begin
++                    bit_cnt <= 5'd0;
++                    if (trig_shift_in) begin
++                        shift_buf <= data_reg;
++                        state <= S_LOAD_PRE;
++                    end else if (trig_shift_out) begin
++                        state <= S_CAP_PRE;
++                    end else if (trig_reconfig) begin
++                        state <= S_RECONFIG;
++                    end else if (trig_rsttimer) begin
++                        state <= S_TIMER_RST;
++                    end
++                end
++
++                S_LOAD_PRE: begin
++                    // one cycle of shiftnld=0, capt=0 → prepare write
++                    ru_shiftnld  <= 1'b0;
++                    ru_captnupdt <= 1'b0;
++                    state <= S_SHIFT_IN;
++                end
++
++                S_SHIFT_IN: begin
++                    ru_shiftnld  <= 1'b1;
++                    ru_captnupdt <= 1'b0;
++                    ru_regin     <= shift_buf[0];
++                    shift_buf    <= {1'b0, shift_buf[28:1]};
++                    if (bit_cnt == 5'd28) begin
++                        bit_cnt <= 5'd0;
++                        state   <= S_LOAD_POST;
++                    end else begin
++                        bit_cnt <= bit_cnt + 5'd1;
++                    end
++                end
++
++                S_LOAD_POST: begin
++                    // shiftnld=0, capt=0 → register loaded into PGM_SEL
++                    ru_shiftnld  <= 1'b0;
++                    ru_captnupdt <= 1'b0;
++                    if (trig_reconfig || trig_shift_in) begin
++                        // SHIFT_IN_AND_RECONFIG path: trigger reconfig now
++                        state <= S_RECONFIG;
++                    end else begin
++                        state <= S_DONE;
++                    end
++                end
++
++                S_RECONFIG: begin
++                    ru_rconfig <= 1'b1;
++                    // Point of no return — FPGA will reload from new page
++                    // within ~150 ms.  Stay here; the design will be
++                    // re-initialized before we get to S_DONE.
++                    state <= S_DONE;
++                end
++
++                S_CAP_PRE: begin
++                    // capt=1, shiftnld=0 for one clk → snapshot PGM_SEL
++                    ru_shiftnld  <= 1'b0;
++                    ru_captnupdt <= 1'b1;
++                    state <= S_SHIFT_OUT;
++                end
++
++                S_SHIFT_OUT: begin
++                    ru_shiftnld  <= 1'b1;
++                    ru_captnupdt <= 1'b1;
++                    shift_buf <= {ru_regout, shift_buf[28:1]};
++                    if (bit_cnt == 5'd28) begin
++                        bit_cnt     <= 5'd0;
++                        capture_reg <= {ru_regout, shift_buf[28:1]};
++                        state       <= S_DONE;
++                    end else begin
++                        bit_cnt <= bit_cnt + 5'd1;
++                    end
++                end
++
++                S_TIMER_RST: begin
++                    ru_rsttimer <= 1'b1;
++                    state <= S_DONE;
++                end
++
++                S_DONE: begin
++                    done_sticky <= 1'b1;
++                    state       <= S_IDLE;
++                end
++
++                default: state <= S_IDLE;
++            endcase
++        end
++    end
++
++    // ── Wishbone bus transaction ─────────────────────────────────────
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n) begin
++            xbus_ack        <= 1'b0;
++            xbus_dat_r      <= 32'd0;
++            data_reg        <= 29'd0;
++            trig_shift_in   <= 1'b0;
++            trig_shift_out  <= 1'b0;
++            trig_reconfig   <= 1'b0;
++            trig_rsttimer   <= 1'b0;
++            status_read_req <= 1'b0;
++        end else begin
++            xbus_ack        <= 1'b0;
++            // Auto-clear triggers (consumed by FSM on next IDLE check)
++            trig_shift_in   <= 1'b0;
++            trig_shift_out  <= 1'b0;
++            trig_reconfig   <= 1'b0;
++            trig_rsttimer   <= 1'b0;
++            status_read_req <= 1'b0;
++
++            if (xbus_cyc && xbus_stb && in_range && !xbus_ack) begin
++                xbus_ack <= 1'b1;
++                if (xbus_we) begin
++                    case (off)
++                        8'h00: data_reg <= xbus_dat_w[28:0];
++                        8'h04: begin
++                            // Only accept new trigger when idle
++                            if (!busy) begin
++                                trig_shift_in  <= xbus_dat_w[0];
++                                trig_shift_out <= xbus_dat_w[1];
++                                trig_reconfig  <= xbus_dat_w[2];
++                                trig_rsttimer  <= xbus_dat_w[3];
++                            end
++                        end
++                        default: ;
++                    endcase
++                end else begin
++                    case (off)
++                        8'h00: xbus_dat_r <= {3'd0, capture_reg};
++                        8'h08: begin
++                            xbus_dat_r       <= {27'd0, state, done_sticky, busy};
++                            status_read_req  <= 1'b1;
++                        end
++                        default: xbus_dat_r <= 32'd0;
++                    endcase
++                end
++            end
++        end
++    end
++
++endmodule
+-- 
+2.43.0
+
