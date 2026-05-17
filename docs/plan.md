@@ -129,16 +129,31 @@ bootstrap path (no GUI step):
   Firmware (Phase 3 `epcs.c`) drives per-byte handshake; HDL is just
   ~80 LoC of bus glue.
 
-The altremote_update IP can't be used directly: its qmegawiz silent
-generator strips `write_param`/`data_in` for Cyclone IV E REMOTE mode
-even when explicitly requested, leaving no way to set PGM_SEL from
-the running image.  Solved by **bypassing the IP entirely**:
+The altremote_update IP couldn't be used in our first attempt because
+the `qmegawiz -silent` flow we used **didn't pass the "Add support for
+writing configuration parameters" option**, and without it the
+generated wrapper drops `write_param`/`data_in` even for Cyclone IV E
+REMOTE mode.  Phase 4.1 investigation (2026-05-17 PM, see
+[[reference-rublock-complexity]]) located the ALSE 2023 App Note that
+documents this checkbox in the wizard — meaning the IP IS usable from
+Lite, we just need to re-run qmegawiz with the right options.  For
+Phase 2 we shipped the workaround:
 
 - `rtl/wb_altremote_update.v` — directly instantiates the
   `cycloneive_rublock` WYSIWYG primitive (7 ports), with a 29-bit
   shift FSM driving its serial interface.  Wrapper @ `0xF3000000`,
   register map `{DATA, CMD={SHIFT_IN_AND_RECONFIG, SHIFT_OUT_CAPTURE,
   RECONFIG_ONLY, RESET_TIMER}, STATUS}`.
+
+**Caveat (uncovered in Phase 4.1)**: this direct-primitive wrapper only
+exposes the 29-bit shift register, which writes the Update register
+(next-reconfig settings).  The currently-running watchdog reads from
+the Control register (loaded from `.pof` option bits at config time),
+which is **read-only** at this layer.  Disabling the running watchdog
+requires the megafunction's `param`/`data_in`/`write_param` protocol
+(`param=3, data_in[0]=0, write_param`) — not available in this
+wrapper.  See Phase 4 for the implications and [[reference-rublock-
+complexity]] for the full failure log.
 
 QSF additions: `USE_CONFIGURATION_DEVICE ON`,
 `CYCLONEIII_CONFIGURATION_DEVICE EPCS16`,
@@ -178,9 +193,60 @@ silently drops write-side ports in Lite Edition.
 
 **Effort**: 6–8 h.
 
-### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE
+### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
-**Adds**:
+**Phase 4.1 finding** (2026-05-17 afternoon, see [[reference-rublock-
+complexity]]): the plan-v5 estimate "2–3 h, drive
+`wb_altremote_update.CMD=SHIFT_IN_AND_RECONFIG`" turns out to be a
+significant underestimate.  Empirical evidence on AX301 silicon:
+
+1. After JTAG-volatile load of our bitstream (rublock instantiated),
+   the FPGA **autonomously reconfigures back to EPCS page 0 within
+   ~100-500 ms** of stage2 reaching its dispatcher prompt.  No `'r'`
+   command needed.
+2. Cause: the rublock hardware watchdog loads from `.pof` option bits
+   at config time with `WD_EN=1` by default.  The current Control
+   register (where the running WD lives) is read-only via our 29-bit
+   shift wrapper; we can only write the Update register (next
+   reconfig).  See [[reference-rublock-complexity]] for the four
+   failed mitigation attempts (SHIFT_IN_ONLY with WD_EN=0, auto-pulser
+   with and without `(* preserve *)`, direct counter→rsttimer wiring).
+3. The proper API for runtime WD disable is the **megafunction**'s
+   `param=3, data_in[0]=0, write_param` protocol — which our direct-
+   primitive wrapper doesn't expose.
+
+**Recovery path** (estimated 4–8 h vs original 2–3 h):
+1. Re-run `qmegawiz` on `altremote_update` for Cyclone IV E REMOTE
+   mode with **"Add support for writing configuration parameters"**
+   explicitly enabled (it's a wizard checkbox; ALSE app note p. 3).
+2. Rewrite `rtl/wb_altremote_update.v` as a Wishbone wrapper around the
+   megafunction (not the primitive).  Expose registers for `param[2:0]`,
+   `data_in[21:0]`, `read_source[1:0]`, plus trigger bits for
+   `write_param`, `read_param`, `reconfig`, `reset_timer`.  Resource
+   delta is small: megafunction adds ~83 LCs over the bare primitive,
+   our current ~189 LC wrapper would be replaced with a thinner one
+   around the megafunction.
+3. `epcs.c` adds `epcs_remote_reconfig(page, ap_sel)` following the
+   ALSE sequence: (a) write reg #4 = boot page byte address (caveat:
+   may need to be the un-divided address per the Cyclone 10 LP note,
+   verify on AX301), (b) write reg #3 with `data_in[0]=0` to inhibit
+   WD, (c) raise `reconfig` for ≥250 ns.
+4. Validate first on **EPCS cold-boot path** (`openFPGALoader -f`),
+   not JTAG-volatile.  Hypothesis from Phase 4.1: rublock state after
+   JTAG-volatile may differ from after EPCS cold-boot.  Cost: this
+   overwrites factory ALINX, so first script a Quartus build of a
+   small "Conf2" demo (e.g. blinky) to a second EPCS page so reconfig
+   has a visible target without re-flashing.
+5. `[rot] handing off to TPU bitstream…\r\n` + TX-empty drain + busy-
+   loop pause (mirror the proven `mode_set_baud` pattern) is still
+   the right firmware shape; that part of the original plan is fine.
+
+**Watchdog policy** (avoid infinite-reconfig loops):
+- ALTREMOTE_UPDATE supports `WATCHDOG_EN` + `WATCHDOG_TIMEOUT`. If the loaded image (TPU) doesn't write to the watchdog clear register within ~timeout seconds of CONF_DONE, FPGA self-falls-back to page 0 (ROT). If ROT then re-runs mode_t and re-triggers, infinite reboot.
+- **For initial bring-up: set `WATCHDOG_EN=0`** (manual fallback only) by writing reg #3 first.  Removes the loop-trap class entirely.
+- Future enablement (after TPU firmware grows a clear-routine): set `WATCHDOG_EN=1`, `WATCHDOG_TIMEOUT≥30s`, AND require TPU's stage2_tpu / Linux to pulse `reset_timer` (megafunction input) early in boot. Until then, leave disabled.
+
+**Adds (original plan, deferred but conceptually still valid)**:
 - `epcs.c`: `void epcs_remote_reconfig(uint32_t page)` — writes `PAGE_SEL=1` then `RECONFIG_TRIGGER=1` to `0xF3000000`. After this MMIO write, `nCONFIG` pulses low and the FPGA self-reconfigures from EPCS page 1; firmware never returns. UART prints `[rot] handing off to TPU bitstream…\r\n` and waits for TX-empty **THEN an extra busy-loop pause** before triggering — the TX-empty flag asserts when the shift register loads, not when the last STOP bit hits the wire (~87 µs at 115200-8N1). Mirror the proven pattern in `mode_set_baud` (main.c:326-328): `while (!(uart_ctrl[0] & TX_EMPTY)) { } ; for (volatile int i = 0; i < 2000; i++) { }` — the busy-loop covers worst-case PHY drain across baud rates.
 
 **Watchdog policy** (avoid infinite-reconfig loops):
@@ -236,7 +302,9 @@ console-lockouts the operator can't easily clear without JTAG.
 
 **Test**: scope `nCONFIG` pin (or just observe UART silence then TPU stage2 banner ~150 ms later → kernel boot). Verify no extra dots/garbage at end of UART trace from truncated final byte.
 
-**Effort**: 2–3 h (base Phase 4) + 2 h (boot-counter, deferred).
+**Effort**: **4–8 h** (revised 2026-05-17 PM after Phase 4.1) + 2 h
+(boot-counter, deferred).  Original 2–3 h estimate assumed the direct-
+primitive wrapper would suffice; Phase 4.1 proved otherwise.
 
 ### Phase 5 — Build automation: cross-repo orchestrator (`tpu-then-rot`)  ✅ DONE
 
@@ -838,10 +906,10 @@ ROT/TPU pair." Quartus stays.
 |---|---|---|
 | 1: SD-side .rbf verify (Track A) | 3–4 h | ✅ done (~3 h) |
 | 2: Quartus IP (altasmi via qmegawiz CLI + rublock direct) | 6–8 h | ✅ done (~6 h) — patch 0005 |
-| 3: EPCS write+verify driver + read-back-skip | 6–8 h | pending — silicon ready, pure firmware on `wb_altasmi_parallel` |
-| 4: ALTREMOTE_UPDATE trigger + UART drain | 2–3 h | pending — silicon ready, drive `wb_altremote_update.CMD=SHIFT_IN_AND_RECONFIG` |
+| 3: EPCS write+verify driver + read-back-skip | 6–8 h | **next** — silicon ready, pure firmware on `wb_altasmi_parallel` |
+| 4: ALTREMOTE_UPDATE trigger + UART drain | ~~2–3 h~~ **4–8 h** | 🔴 **deferred** — Phase 4.1 proved direct-primitive wrapper can't disable running watchdog; needs megafunction rework.  See Phase 4 section + [[reference-rublock-complexity]]. |
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
-| 6.0: First-boot bring-up (KEY2 pull-up + LED polarity) | 1 h | ✅ done (~3 h, includes diagnosis) — patches 0006 + 0007.  Stage2 banner + CLK + SDRAM PASS verified on iron 2026-05-17. |
+| 6.0: First-boot bring-up (KEY2 pull-up + LED polarity) | 1 h | ✅ done (~4 h, includes original-qsf-was-broken diagnosis + RTL-bypass rewrite) — patches 0006 (rewritten 2026-05-17 PM: RTL bypass `rstn_int <= por_cnt(3)`; original qsf `WEAK_PULL_UP_RESISTOR` on E16 doesn't compile on EP4CE10F17C8) + 0007 (LED polarity).  Stage2 banner + CLK + SDRAM PASS verified on iron 2026-05-17 with rewritten patch 0006. |
 | 6: HW bench validation (SD + mode 't' on iron) | 3–4 h | pending — needs SD card + Phase 3/4 |
 | **7: LutCodec C port + σ⁻¹ + CRC + IMEM bump** | **8–12 h** | ✅ done (~4 h) |
 | **8: mode 'g' generator handler** (incl. edits.bin CRC-32 gate) | **4–6 h** | ✅ done (~3.5 h) — software path; EPCS-write steps 8-10 wait on Phase 3-4 |
