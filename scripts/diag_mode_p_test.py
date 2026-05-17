@@ -40,7 +40,7 @@ BITSTREAM    = "/home/test/neorv32_rot/output/neorv32_demo.rbf"
 STAGE2_ELF   = "/home/test/neorv32_rot/sw/stage2_loader/main.elf"
 # Diagnostic + NH6 bitstreams known to embed patch 0010's instrumented
 # mode 'P'.  Prefix match is heuristic (any rebuild produces a new md5).
-EXPECTED_DIAG_MD5_PREFIXES = ("f931e805", "aa41f714", "011a4c37", "bdee9496", "891efece", "1787cd8a", "df477575", "5145a6d7")
+EXPECTED_DIAG_MD5_PREFIXES = ("f931e805", "aa41f714", "011a4c37", "bdee9496", "891efece", "1787cd8a", "df477575", "5145a6d7", "43f8578e")
 OFL_LOADER   = os.path.expanduser(
     "~/see_neorv32_run_linux/tools/openFPGALoader/build/openFPGALoader")
 
