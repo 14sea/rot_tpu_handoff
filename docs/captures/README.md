@@ -16,6 +16,10 @@ signatures.
 | `diag_nh9_fast_read_ok.log` | 2487 B | `9d80d60cf30b447b0db03520f6d48572` | NH9 `5145a6d7…` (qmegawiz regen w/ port_fast_read=PORT_USED) | First silicon win: Phase C FAST_READ returns real EPCS bytes `0x7d 0x21 0x0f 0x00` (not phantom 0xff). Phase A RDSR OK i=2 (first-run-after-flash; later runs intermittent). C4 RDEN_DROP pulse TIMEOUT — termination still broken at this stage. Listener cleanup race truncated capture after C3 (fix landed in same session). Capture commit: `a951caa`. |
 | `diag_nh10_auto_terminate_ok.log` | 2371 B | `88548dd4c01390bb6784250ae691cdc2` | NH10 `43f8578e…` (wrapper auto-terminate: `am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read)`) | Termination closure: C5 STATUS=0x02 (busy DROPPED, only DV bit left) vs prior NH9 0x03 stuck.  3/3 deterministic.  Phase C bytes `0x21 0x00 0x88 0x00` — different from NH9's `0x7d 0x21 0x0f 0x00` despite reading same flash address (cross-bitstream placement-dependent metastability hint; fully characterized later in Phase D probe). |
 | `diag_nh10_phase_d_alignment_probe.log` | 3870 B | `8fba57aaabfd6f136c67550f2a887b19` | NH10 `bc9ba066…` (NH10 + Phase D diag firmware) | Phase 3 silicon-status reframe.  D0 addr=0x100000 → `ff ff ff ff` (wrapper byte alignment OK for blank flash).  D1 addr=0 same boot → `18 81 21 00` (≠ Phase C's `a1 00 d1 00`; megafunction `read_add_cntr` not reset between consecutive FAST_READs).  D2 addr=0x10 → `15 80 14 3f` (offset arithmetic OK).  Phase A 3/3 fresh-boot TIMEOUT (cold-boot intermittent RDSR).  3/3 deterministic across re-runs.  Root cause class: timing slack `-1.182 ns` setup CLOCK metastability + state pollution between ops. |
+| `diag_phase4_pre_rtl_fix.log` | 457 B | `71cd4f0a4cad88535da14d91bada4a2a` | Firmware-only `f351496124bab1f2423c076896ad22a0` (Phase 4 firmware on Phase 2 wrapper, no RTL fix) | First Phase 4 silicon test.  Stage2 boots clean, dispatcher reaches "CRTM locked", new menu shows `r=reconfig`, 'r' command accepted: `[stage2] Mode: remote reconfig` + `[rot] altremote: pgm_sel=0x000000 ... triggering reconfig` — then silence.  rconfig never asserts on the rublock pin.  Hypothesis at this point: rconfig pulse width too narrow (NH11). |
+| `diag_phase4_nh11_fsm_unreachable.log` | 457 B | `71cd4f0a4cad88535da14d91bada4a2a` | NH11 only `ea758429...` (16-cycle rconfig hold added; auto_reconfig latch NOT yet added) | **Byte-identical to pre-RTL-fix capture.**  NH11 widening alone changes ZERO bytes of UART → FSM never reaches S_RECONFIG in the first place, so hold width is moot.  Empirical falsification of the "rconfig pulse width" hypothesis as load-bearing.  Drove the NH12 audit which found the real bug: `S_LOAD_POST` reads `trig_reconfig\|trig_shift_in` ~31 cycles after the bus block cleared them. |
+| `diag_phase4_nh12_noinput_stable.log` | 400 B | `e889e396c98f8b350f29b74e068f0122` | NH11+NH12 `60094abc6c87914c7f9cd72fa5c62adc` | Sanity capture: NH12 bitstream flashed, NO 'r' sent.  Output shows prior cold-boot factory ALINX timestamp `2010-3-17 14:30:46` (printed BEFORE openFPGALoader's reset took effect), then null-byte transition, then `[stage2] ready` + dispatcher + "CRTM locked".  Stage2 stable for 24 s of idle.  Refutes the "device reset on flash" alarm: the factory banner was an artifact of the JTAG-load handover, not NH12 misfiring on boot.  Also refutes the prior-session WD-suicide hypothesis on this hardware. |
+| `diag_phase4_nh12_reconfig_ok.log` | 3357 B | `613db17a485ce370b030eac806121f14` | NH11+NH12 `60094abc6c87914c7f9cd72fa5c62adc` | **Phase 4 silicon closure capture.**  Stage2 → dispatcher → `[stage2] Mode: remote reconfig — boot from EPCS page 0 (factory ALINX)` → `[rot] altremote: pgm_sel=0x000000 WD_EN=0 AP_CONFIG_SEL=0 — triggering reconfig` → factory ALINX banner `2010-3-17 14:19:0` appears immediately, then runs its periodic timestamp loop (14:19:1 ... 14:19:17) for the remaining ~17 s.  Matches success criterion from the brief. |
 
 ## Comparison points
 
@@ -64,3 +68,13 @@ follow-up work — when CTRL_RESET pulse / wrapper auto-reset /
 SDC fix is attempted, the new run's bytes can be compared
 byte-for-byte against these references to know if the fix
 landed.
+
+**Phase 4 closure (2026-05-17 night)**: NH11 (16-cycle rconfig
+hold; defensive, not load-bearing) + NH12 (auto_reconfig latch;
+load-bearing) close Phase 4 on silicon.  `diag_phase4_pre_rtl_fix`
+and `diag_phase4_nh11_fsm_unreachable` are byte-identical, which
+is the empirical refutation that drove the NH12 audit.
+`diag_phase4_nh12_reconfig_ok` is the success capture — factory
+ALINX banner appears immediately after the wrapper trigger.
+Reference for any future Phase 4 wrapper rework: a new run's
+post-trigger bytes must start with `2010-3-17 14:` within ~150 ms.

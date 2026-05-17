@@ -1,0 +1,9 @@
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe r=reconfig
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: remote reconfig — boot from EPCS page 0 (factory ALINX)
+[rot] altremote: pgm_sel=0x000000 WD_EN=0 AP_CONFIG_SEL=0 — triggering reconfig
