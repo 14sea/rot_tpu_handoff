@@ -1,0 +1,137 @@
+From 6df31bbe60592bfc3ec90d268256a10b0fe4959f Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 22:03:05 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20NH17:=20wb=5Faltasmi=5Fparallel.v?=
+ =?UTF-8?q?=20wrapper=20=E2=80=94=20per-byte=20event=20detector?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces am_data_valid (level-locked) with am_byte_event (per-byte
+pulse derived from am_read_addr edge detect) as the latched_dataout
+load trigger.  NH16-fw refuted "firmware-side phantom discard"
+because am_data_valid is held HIGH for the entire op duration once
+dvalid_reg sets on first end_read_byte (epcs_ctrl.v line 745); when
+firmware reads DATAOUT to clear flag_data_valid, the NH15 latch
+re-fires on the next cycle with the stale am_dataout (still dummy
+0xff because the next real end_read_byte is ~8 SCK cycles away).
+
+NH17 derives a true per-byte strobe from am_read_addr:
+- am_read_addr = megafunction's read_add_reg (line 1807)
+- enabled by (end_read_byte & end_one_cyc_pos & ~end_operation)
+  per line 1159 — updates EXACTLY ONCE per byte during a read op
+- detecting transitions of this 24-bit value gives a 1-cycle pulse
+  per byte (am_byte_event = am_read_addr != am_read_addr_d)
+
+Clocking: read_add_reg is on negedge clkin_wire (line 992-994);
+wrapper samples on posedge clk → 10 ns of clock-edge margin at
+50 MHz, single sync flop sufficient.  Same clock domain, opposite
+edges, no metastability concern.
+
+Compare width: 24-bit (not LSB-only).  read_add_cntr increments
+multiple times between end_read_byte events (cnt_en=1 always;
+clk_en gates on data_valid_wire which is itself level-locked), so
+captured am_read_addr can jump by N>1 per event.  LSB-only would
+miss events where the jump happens to keep LSB unchanged.  Full
+24-bit != also keeps the detector robust to non-monotonic addr
+patterns (e.g., rollover, sclr).
+
+Reset alignment: clear am_read_addr_d on ctrl_reset (NH13 wrapper
+trigger that stretches am_reset_in to 16 cycles) so wrapper-side
+baseline matches megafunction's read_add_reg=0 post-reset.  Without
+this, the first byte_event after a DC_RESET could spuriously fire
+if the megafunction's read_add_reg started from 0 but
+am_read_addr_d retained the previous op's last value.
+
+Firmware: NO change needed.  Phase F (patch 0024) already does
+the right sequence (CTRL=FAST_READ → wait DV → discard phantom →
+wait DV → read real) — that pattern failed under NH16-fw because
+of the level-lock, but works under NH17 because the second wait
+suspends until next byte_event = real byte at addr+1.
+
+Expected silicon outcome (HW test pending):
+- Phase E (no discard) at addr=0..3: still captures phantom 0xff
+  for byte 0 (NH15 latch + byte_event both fire for dummy).
+- Phase F (discard + wait + read real) at addr=0..3: should now
+  return REAL = actual flash content at addr.  D-iter cross-
+  reference: addr=0 should return 0x12 (matches NH15 capture
+  Phase D iter 1 byte 1).
+- Phase C 4-byte sequence: byte 0 still 0xff phantom; bytes 1, 2,
+  3 should now be DETERMINISTIC (real flash bytes at addr 0, 1, 2,
+  per NH17 per-byte pacing) instead of racey.
+
+Estimated LE delta: ~25 LE (24-bit register + != gate).
+---
+ rtl/wb_altasmi_parallel.v | 49 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 3f1a31a..3de35ef 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -178,6 +178,43 @@ module wb_altasmi_parallel (
+         .read_address  (am_read_addr)
+     );
+ 
++    // ── NH17: per-byte event detector (am_read_addr edge) ────────────
++    // Replaces am_data_valid as the latch trigger.  am_data_valid is
++    // LEVEL-LOCKED by the megafunction's dvalid_reg (epcs_ctrl.v line
++    // 745: sets on first end_read_byte, cleared only by end_op_wire),
++    // so NH16-fw's "firmware-side discard phantom byte" failed —
++    // post-clear re-latch fires immediately with the stale am_dataout
++    // because the level-locked am_data_valid is still high before the
++    // next real end_read_byte event.
++    //
++    // am_read_addr = megafunction's read_add_reg (epcs_ctrl.v line
++    // 1807), enabled by (end_read_byte & end_one_cyc_pos &
++    // ~end_operation) per line 1159 → updates exactly ONCE per byte
++    // during a read op.  Detecting transitions of this 24-bit value
++    // gives a clean per-byte strobe to replace level-locked DV.
++    //
++    // Clocking: read_add_reg is on negedge clkin_wire (line 992-994);
++    // wrapper samples on posedge clk → 10 ns of clock-edge margin at
++    // 50 MHz, single sync flop is sufficient.  No metastability
++    // concern (same clock domain, opposite edges).
++    //
++    // 24-bit compare (not LSB-only): read_add_cntr increments multiple
++    // times between end_read_byte events (cnt_en=1 always, clk_en gates
++    // on data_valid_wire which is also level-locked), so the captured
++    // am_read_addr can jump by N>1 per event.  LSB-only would miss
++    // events where the jump happens to keep LSB unchanged.
++    //
++    // Reset alignment: clear on ctrl_reset (NH13 wrapper trigger that
++    // stretches am_reset_in to 16 cycles) so wrapper-side baseline
++    // matches megafunction's read_add_reg=0 post-reset.
++    reg [23:0] am_read_addr_d;
++    always @(posedge clk or negedge rst_n) begin
++        if (!rst_n)          am_read_addr_d <= 24'd0;
++        else if (ctrl_reset) am_read_addr_d <= 24'd0;
++        else                 am_read_addr_d <= am_read_addr;
++    end
++    wire am_byte_event = (am_read_addr != am_read_addr_d);
++
+     // ── Sticky flags + dataout latch ──────────────────────────────────
+     reg flag_illegal_erase;
+     reg flag_illegal_write;
+@@ -219,7 +256,17 @@ module wb_altasmi_parallel (
+             // intentional, since for multi-byte bursts firmware can't keep
+             // up anyway.  Phase 9-class redesign would add a wrapper FIFO
+             // + length counter; out of scope for this iteration.
+-            if (am_data_valid && !flag_data_valid) begin
++            //
++            // NH17 (2026-05-17 night session 2): replace am_data_valid
++            // (level-locked) with am_byte_event (per-byte pulse derived
++            // from am_read_addr edge detect above).  See block header for
++            // rationale.  NH16-fw refuted "firmware-side phantom discard"
++            // because re-latch fires before next real byte under level-
++            // lock; NH17 RTL fix delays re-latch until next end_read_byte
++            // event.  Combined with the existing !flag_data_valid gate,
++            // this gives a per-byte 1-deep FIFO instead of a
++            // per-DV-pulse 1-deep FIFO.
++            if (am_byte_event && !flag_data_valid) begin
+                 flag_data_valid <= 1'b1;
+                 latched_dataout <= am_dataout;
+             end else if (dataout_read_req) begin
+-- 
+2.43.0
+
