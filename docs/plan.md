@@ -250,16 +250,57 @@ Mode 'P' hang cause is therefore OPEN again.  Remaining candidates
 - **NH3**: JTAG-volatile load leaves AS-pin mux in a different state
   than EPCS cold-boot — prior session's hypothesis, still untested.
 
-**NH1 fix applied 2026-05-17 night, awaits HW validation**: patch
+**NH1 fix applied + HW-tested 2026-05-17 night — REFUTED**: patch
 `0009-Phase-3-NH1-epcs.c-wait_not_busy-two-phase-wait-dodg.patch`
 modifies `wait_not_busy()` to do a bounded busy-rise spin (cap 64
-iters) before the busy-fall wait.  All wait_not_busy() callsites
-benefit (epcs_read pre-amble + post-deassert, epcs_read_status,
-epcs_erase_sector pre/post, epcs_program_page pre/post + per-byte).
-Stage2 size: 14460 → 14480 B (+20 B).  Cross-tests still green.
-**HW test next**: listener-first flash neorv32_demo.rbf + new stage2
-imem_image, send 'P'.  If mode 'P' completes → NH1 confirmed →
-Phase 3 closes.  If still hangs → NH1 refuted → NH2 or NH3.
+iters) before the busy-fall wait.  Stage2 size: 14460 → 14480 B.
+Cross-tests green (lutcodec 127/127, edits.bin 5/5).
+
+**HW test result (`scripts/nh1_mode_p_test.py`, 2026-05-17 night)**:
+- New bitstream md5 `871f1eccf5b12e93fef754da31693974` (≠ prior
+  `fcfd8122…`, confirms NH1 stage2 is baked into bitstream)
+- Listener captured 340 B of UART, md5
+  `d8dbe639bb7ae183c508cdb73a6ebddf`
+- **Capture is byte-identical to the prior session's hang signature**
+  (per [[reference-rublock-complexity]] §"post-audit reproducibility
+  data": "Mode 'P' hang: 2/2 byte-identical (UART capture md5
+  d8dbe639…, 340 B each)").  So NH1 fix is **3/3 reproducible with
+  zero change in behavior**.
+- Final printed line: `[stage2] Mode: EPCS probe — read 64 B
+  @0x000000\r\n`.  Then silence — same as prior runs.
+
+**Refutation logic**: if the busy-poll race was the actual root
+cause, the two-phase wait would have let altasmi properly enter the
+read operation → at least one byte would have been produced →
+`am_data_valid` would have asserted → at least the first hex row
+(`00000000: ...`) would have appeared in the capture.  None of
+those happened.  The hang location at `wait_data_valid()` is
+genuine, not an artifact of misordered firmware sequencing.
+
+**Patch 0009 retained as defensive**: even if NH1 wasn't THE bug,
+the two-phase wait_not_busy is a robustness improvement (hardens
+against future NEORV32 pipeline changes).  No revert.
+
+**Remaining hypotheses**:
+- ~~**NH1** busy-poll race~~ — refuted by 3/3 byte-identical repro
+- **NH2**: rublock-vs-asmiblock device-arch contention — needs deeper
+  static dig (fit.rpt for shared AS resources, rublock primitive
+  documentation for runtime AS-pin claims)
+- **NH3**: JTAG-volatile vs EPCS-cold-boot pin state — destructive
+  EPCS-flash test; overwrites factory ALINX
+- **NH4** (new): shift_bytes pulse width — 1-cycle pulse at 100 MHz
+  may be too narrow for altasmi's internal FSM if it has multi-cycle
+  sync stages from `shift_bytes` input
+- **NH5** (new): EPCS flash chip mismatch — AX301 might have a
+  non-EPCS16 device (e.g., EPCQ4A, EPCQ128) and the altasmi opcodes
+  encoded for EPCS16 don't match.  Check AX301 schematic /
+  flash chip part number on the board
+
+**Next step** (most diagnostic per cost): instrument mode 'P' with
+inline STATUS dumps at each handshake step.  Print STATUS after each
+CTRL write + before each spin, capture how am_busy / am_data_valid /
+sticky-illegal flags evolve during the hang.  Without that empirical
+data, NH2-NH5 are all guesses.
 
 Discipline note: A5 was a two-step inference ("port missing" +
 "warning means denial") and BOTH steps failed empirical check after
