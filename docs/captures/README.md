@@ -13,6 +13,9 @@ signatures.
 | `diag_baseline_hang.log` | 1510 B | `d9330cae7e1effbc39447fc1345ad39a` | Diagnostic `f931e805…`, NH6 `aa41f714…`, NH7 `011a4c37…`, NH8 v1 `bdee9496…` (all four byte-identical) | Diagnostic mode 'P' with patch 0010 inline STATUS-trace. Phase A RDSR clean (6 iters, ESTAT=0x00); Phase B CTRL=READ → STATUS=0x03 (busy=1, DV=1) immediately, busy never clears across 10M poll iters. The canonical "wrapper-rden=1 stage4 deadlock" signature. |
 | `diag_nh8v2_rden0_fsm_abort.log` | 1413 B | `cd860075d6a24a3b1fba0f9ef1961487` | NH8 v2 `891efece…` (am_rden = 1'b0 constant) | Different failure mode: B1 STATUS=0x00 IMMEDIATELY after CTRL=READ (busy never even asserts), B2 OK at i=0, B4 dv_wait TIMEOUT with STATUS=0x00. The FSM aborts before any byte shifts because `end_read` fires immediately on `do_read` (no rden gate). Confirms rden controls end-of-read mechanism but bare `rden=0` is too aggressive. |
 | `diag_nh8v3_rden_pulse_noop.log` | 1630 B | `b33a323081b77cc6c07c96f3d0f8e44a` | NH8 v3 `1787cd8a…` (am_rden = ~ctrl_rden_drop, firmware-pulsed via CTRL.b7) | Same body as `diag_baseline_hang.log` for B1-B5 (busy stuck at STATUS=0x03), PLUS new B5b/B5c lines showing the firmware-issued rden_drop pulse has no effect: B5b STATUS=0x03, B5c post-pulse wait TIMEOUT. Confirms 1-cycle rden=0 pulse cannot escape the stage4 deadlock because `stage_cntr` has already drifted off 2'b10 by the time firmware can pulse. |
+| `diag_nh9_fast_read_ok.log` | 2487 B | `9d80d60cf30b447b0db03520f6d48572` | NH9 `5145a6d7…` (qmegawiz regen w/ port_fast_read=PORT_USED) | First silicon win: Phase C FAST_READ returns real EPCS bytes `0x7d 0x21 0x0f 0x00` (not phantom 0xff). Phase A RDSR OK i=2 (first-run-after-flash; later runs intermittent). C4 RDEN_DROP pulse TIMEOUT — termination still broken at this stage. Listener cleanup race truncated capture after C3 (fix landed in same session). Capture commit: `a951caa`. |
+| `diag_nh10_auto_terminate_ok.log` | 2371 B | `88548dd4c01390bb6784250ae691cdc2` | NH10 `43f8578e…` (wrapper auto-terminate: `am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read)`) | Termination closure: C5 STATUS=0x02 (busy DROPPED, only DV bit left) vs prior NH9 0x03 stuck.  3/3 deterministic.  Phase C bytes `0x21 0x00 0x88 0x00` — different from NH9's `0x7d 0x21 0x0f 0x00` despite reading same flash address (cross-bitstream placement-dependent metastability hint; fully characterized later in Phase D probe). |
+| `diag_nh10_phase_d_alignment_probe.log` | 3870 B | `8fba57aaabfd6f136c67550f2a887b19` | NH10 `bc9ba066…` (NH10 + Phase D diag firmware) | Phase 3 silicon-status reframe.  D0 addr=0x100000 → `ff ff ff ff` (wrapper byte alignment OK for blank flash).  D1 addr=0 same boot → `18 81 21 00` (≠ Phase C's `a1 00 d1 00`; megafunction `read_add_cntr` not reset between consecutive FAST_READs).  D2 addr=0x10 → `15 80 14 3f` (offset arithmetic OK).  Phase A 3/3 fresh-boot TIMEOUT (cold-boot intermittent RDSR).  3/3 deterministic across re-runs.  Root cause class: timing slack `-1.182 ns` setup CLOCK metastability + state pollution between ops. |
 
 ## Comparison points
 
@@ -49,3 +52,15 @@ Delete this directory only after Phase 3 closes (mode 'P' actually
 returns real flash content), because these captures are the
 empirical record that future qmegawiz regens (or hand-written SPI
 master) must beat.
+
+**Phase 3 partial-closure update (2026-05-17 night)**: NH9 +
+NH10 + Phase D establish (a) blank-flash detect is reliable
+silicon-closed, (b) READ termination is silicon-closed via NH10
+auto-terminate, but (c) content reads are unreliable per
+consecutive read and per bitstream rebuild (read_add_cntr state
+pollution + placement-dependent metastability from negative
+timing slack).  Captures retained for the content-accuracy
+follow-up work — when CTRL_RESET pulse / wrapper auto-reset /
+SDC fix is attempted, the new run's bytes can be compared
+byte-for-byte against these references to know if the fix
+landed.
