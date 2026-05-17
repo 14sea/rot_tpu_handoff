@@ -240,18 +240,34 @@ Mode 'P' hang cause is therefore OPEN again.  Remaining candidates
   asserted busy.  First poll reads busy=0, returns immediately,
   firmware proceeds to pulse `shift_bytes` — but altasmi's preamble
   (opcode + 24-bit address) hasn't started yet, so the pulse is
-  lost.  Fix: add a busy-must-rise-first phase before the
-  busy-falls wait, OR a defensive cycle delay.
+  lost.  Static-check 2026-05-17 night confirmed 1-cycle register
+  latency exists in epcs_ctrl.v (`read_reg` line 1244-1250 →
+  combinational do_read/busy_wire); whether NEORV32's store→load
+  pipeline actually hits the race window is empirical.
 - **NH2**: rublock primitive contends with asmiblock at the device-
   architecture level (different mechanism from the pin-reservation
   conflict A5 wrongly diagnosed).
 - **NH3**: JTAG-volatile load leaves AS-pin mux in a different state
   than EPCS cold-boot — prior session's hypothesis, still untested.
 
+**NH1 fix applied 2026-05-17 night, awaits HW validation**: patch
+`0009-Phase-3-NH1-epcs.c-wait_not_busy-two-phase-wait-dodg.patch`
+modifies `wait_not_busy()` to do a bounded busy-rise spin (cap 64
+iters) before the busy-fall wait.  All wait_not_busy() callsites
+benefit (epcs_read pre-amble + post-deassert, epcs_read_status,
+epcs_erase_sector pre/post, epcs_program_page pre/post + per-byte).
+Stage2 size: 14460 → 14480 B (+20 B).  Cross-tests still green.
+**HW test next**: listener-first flash neorv32_demo.rbf + new stage2
+imem_image, send 'P'.  If mode 'P' completes → NH1 confirmed →
+Phase 3 closes.  If still hangs → NH1 refuted → NH2 or NH3.
+
 Discipline note: A5 was a two-step inference ("port missing" +
 "warning means denial") and BOTH steps failed empirical check after
 ~10 min more digging.  Reaffirms [[feedback-empirical-over-plan-claims]]:
 exhaust the cheap empirical checks before writing claims into plan.md.
+NH1 is now also a claim — but it's expressed as a *hypothesis under
+HW test*, not a confirmed root cause, with explicit refutation
+criteria.
 
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
