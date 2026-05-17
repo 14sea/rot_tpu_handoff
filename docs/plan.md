@@ -906,7 +906,7 @@ ROT/TPU pair." Quartus stays.
 |---|---|---|
 | 1: SD-side .rbf verify (Track A) | 3–4 h | ✅ done (~3 h) |
 | 2: Quartus IP (altasmi via qmegawiz CLI + rublock direct) | 6–8 h | ✅ done (~6 h) — patch 0005 |
-| 3: EPCS write+verify driver + read-back-skip | 6–8 h | **next** — silicon ready, pure firmware on `wb_altasmi_parallel` |
+| 3: EPCS write+verify driver + read-back-skip | 6–8 h | 🟡 **firmware verified (cross-tests + apply chain), HW pending** — patch 0008.  Five JTAG-volatile flashes hit autonomous-reconfig (~500 ms post-boot, NOT rublock WD).  HW debug scheduled for dedicated session — needs scope on nCONFIG + openFPGALoader --verbose + qsf option-bit inspection. |
 | 4: ALTREMOTE_UPDATE trigger + UART drain | ~~2–3 h~~ **4–8 h** | 🔴 **deferred** — Phase 4.1 proved direct-primitive wrapper can't disable running watchdog; needs megafunction rework.  See Phase 4 section + [[reference-rublock-complexity]]. |
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
 | 6.0: First-boot bring-up (KEY2 pull-up + LED polarity) | 1 h | ✅ done (~4 h, includes original-qsf-was-broken diagnosis + RTL-bypass rewrite) — patches 0006 (rewritten 2026-05-17 PM: RTL bypass `rstn_int <= por_cnt(3)`; original qsf `WEAK_PULL_UP_RESISTOR` on E16 doesn't compile on EP4CE10F17C8) + 0007 (LED polarity).  Stage2 banner + CLK + SDRAM PASS verified on iron 2026-05-17 with rewritten patch 0006. |
