@@ -813,6 +813,113 @@ READ accuracy issue needs follow-up before slot content-verification
 (SHA-256) is trusted, but that's a Phase-3-followup, not a Phase-4
 blocker.
 
+**Phase 3 status (2026-05-17 night, session 2 — NH15+NH16
+empirical iterations, 3 hypotheses refuted)**
+
+This session attempted to close Phase 3 content-read accuracy
+following the NH13/NH14 work.  Net outcome: **three load-bearing
+hypotheses refuted**, but content-read still UNRELIABLE.  Patches
+0022–0024 land as defensive + diagnostic; Phase 3 partial-closure
+status from prior session is unchanged.
+
+**Refutation 1 — NH14 "addr→read_address linkage broken" is
+EXPECTED behavior**, not a wrapper bug.  Paper audit found:
+- `epcs_ctrl.v:1807`: `read_address = read_add_reg[23:0]`
+- `epcs_ctrl.v:1159`: `wire_read_add_reg_ena = (end_read_byte &
+  end_one_cyc_pos & ~end_operation)`
+
+So `read_address` is a **per-byte snapshot captured at end_read_byte
+during read ops**.  It NEVER updates in idle.  NH14's observation
+"`*DP_ADDR` writes don't update RADDR" is correct — but it doesn't
+indicate a broken linkage.  The internal `addr_reg` load (line
+616/618) and `read_add_cntr.sload=(rden_wire & not_busy)` (line
+1658) are correctly wired; load fires at the busy 0→1 transition
+when CTRL=FAST_READ is written.  The C5 RADDR=0x81E85 datum was
+the snapshot at the last byte before NH10 auto-terminate caught up.
+
+**Refutation 2 — `shift_bytes` is write-path-only**:
+- `epcs_ctrl.v:1591`: `pgwr_data_cntr.clk_en(((shift_bytes_wire &
+  wren_wire) & (~ reach_max_cnt)) & (~ do_write))`
+- `epcs_ctrl.v:1694`: `scfifo4.wrreq(((shift_bytes_wire & wren_wire)
+  & (~ do_write)))`
+
+`shift_bytes_wire` appears nowhere in the read path.  Firmware's
+`CTRL.b4=SHIFT_BYTES` pulse during FAST_READ does NOTHING — bytes
+shift in autonomously via the megafunction's internal `gen_cntr`.
+Phase E and F drop the SHIFT_BYTES bit entirely.
+
+**Refutation 3 — NH16 firmware-only phantom-discard does NOT
+work** because `am_data_valid` is LEVEL-LOCKED.  Per
+[[reference-rublock-complexity]] line 745: `dvalid_reg` sets on
+first `(end_read_byte & end_one_cyc_pos)` and stays HIGH until
+`end_op_wire` clears it.  So:
+- T+N: first byte (dummy 0xff) completes, am_data_valid goes high,
+  NH15 latches latched_dataout=0xff, flag=1.
+- T+N+k: firmware reads DATAOUT → dataout_read_req → flag=0.
+- T+N+k+1: am_data_valid is STILL HIGH (level-locked) → NH15's
+  `!flag_data_valid` is true → re-latches latched_dataout = whatever
+  am_dataout currently is.  Since the next real end_read_byte hasn't
+  fired yet, am_dataout still holds dummy=0xff → captures 0xff
+  again.
+
+Phase F empirical confirmation (NH16 bitstream `8ef7b2eb`, capture
+`diag_phase3_nh16_fw_level_lock_refuted.log` md5 `4a463636`):
+
+    [P] F addr=0x00000000 phantom=0xff REAL=0xff (phantom_wi=3 real_wi=0)
+    [P] F addr=0x00000001 phantom=0xff REAL=0xff (phantom_wi=3 real_wi=0)
+    [P] F addr=0x00000002 phantom=0xff REAL=0xff (phantom_wi=3 real_wi=0)
+    [P] F addr=0x00000003 phantom=0xff REAL=0xff (phantom_wi=3 real_wi=0)
+
+`real_wi=0` (zero polls before second DV) is the smoking gun for
+level-locked am_data_valid.
+
+**Validated this session — NH15 latch-lock IS silicon-correct**.
+With wrapper RTL change (`if (am_data_valid && !flag_data_valid)`
+instead of `if (am_data_valid)`):
+- Byte 0 of every FAST_READ op is **deterministically 0xff** across
+  boots + addresses + Phase C/D/E (the dummy byte that fast_read
+  protocol emits between addr and data, MISO floats high).
+  Previously was racey (0x7d / 0x21 / 0xa1 / 0x40 across runs).
+- Bytes 1+ are still racey because of the level-lock issue, but
+  byte 0 alone is now deterministic.
+
+**Hypothesis ladder revision**:
+| Hypothesis | Verdict | Notes |
+|---|---|---|
+| NH14 — addr→read_address broken | REFUTED | read_address is per-byte snapshot, not live addr |
+| NH15 — latch-lock latched_dataout | SILICON-OK | byte 0 deterministic now |
+| NH16-fw — discard phantom in firmware | REFUTED | level-locked am_data_valid re-latches |
+| NH17 — RTL trigger on am_read_addr increments | open candidate | ~10 LE wrapper change; not tried this session |
+| Phase 9-class — wrapper FIFO + length cntr | open | ~50-150 LE; deferred |
+| Hand-rolled SPI master against asmiblock | open | ~200-400 LE, 2-3 h; documented in prior memory |
+
+**Captures this session** (in `docs/captures/`):
+- `diag_phase3_nh15_latch_lock_phantom.log` (md5 `649d2383…`, 4168 B)
+  — bitstream `58ea4ed8…`, NH15 first HW test.  Phase C/D/E captured.
+- `diag_phase3_nh16_fw_level_lock_refuted.log` (md5 `4a463636…`, 4631 B)
+  — bitstream `8ef7b2eb…`, NH16-fw HW test.  Phase C/D/E/F captured.
+
+**Patches stacked** (0022–0024 added this session):
+- 0022 NH15 wrapper RTL (1 line change, +1 AND gate; LE 8939/10320
+  87 %, no new Critical Warnings, no NH-relevant register prunes)
+- 0023 NH15 firmware Phase E (one-byte-per-op; ELF 17728 → 18024 B)
+- 0024 NH16 firmware Phase F (phantom-discard variant; ELF 18024 →
+  18568 B)
+
+**Next session candidates** (preserve choice, do not pre-commit):
+- NH17 RTL: trigger on am_read_addr increments instead of am_data_valid.
+- Phase 9 destructive multi-slot work (orthogonal to content-read).
+- Phase 6 SD-card mode 't' bring-up (needs SD card hardware; SHA verify
+  would currently mostly read 0xff or racey bytes — premature).
+- Plan B megafunction-bypass (hand-write SPI master against asmiblock).
+
+Discipline note: this session's pattern matches prior NH8/NH11/NH13
+falsifications — wrapper-layer fixes keep getting partial credit but
+the underlying altasmi megafunction's protocol model keeps surprising
+us.  Estimated remaining Phase 3 effort: 6–12 h spread across 2-3
+sessions, with high probability that one of NH17 or Plan B is the
+actual close.
+
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  ✅ DONE (2026-05-17 night, silicon)
 
 **Closure summary** (2026-05-17 night).  Phase 4 is silicon-closed on
