@@ -142,8 +142,12 @@ rot-firmware: $(TPU_RBF_DST)
 
 rot-bitstream: rot-firmware
 	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QSH) --flow compile $(ROT_PROJECT)
+	@# ROT qsf doesn't set PROJECT_OUTPUT_DIRECTORY → .sof lands in
+	@# $(ROT_QUARTUS) itself, not output_files/.  TPU project sets the
+	@# directory so its sof is under output_files/ — see tpu-bitstream
+	@# target above for the asymmetric handling.
 	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QCPF) -c -o bitstream_compression=off \
-	    output_files/$(ROT_PROJECT).sof ../output/$(ROT_PROJECT).rbf
+	    $(ROT_PROJECT).sof ../output/$(ROT_PROJECT).rbf
 	@ls -la $(ROT_RBF)
 
 rot-zeta-verify: $(ROT_RBF)
