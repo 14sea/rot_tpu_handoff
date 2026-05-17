@@ -648,6 +648,86 @@ to the original NH9 build `df477575`).
 - (c) Phase 4 ALTREMOTE_UPDATE rework can now proceed against a
   silicon-validated EPCS read path.
 
+**2026-05-17 night — NH10: wrapper auto-terminate, full READ closure
+on silicon.**
+
+Granular Phase A re-test (1M-iter cap + per-iter ESTAT) and 3-run
+reproducibility showed:
+1. **Phase A "regression" was a one-off transient.**  3/3 HW runs:
+   `A2 done i=0x2 final=0x0 OK`.  RDSR works fine.  The original
+   NH9 commit body's "Phase A TIMEOUT" observation was apparently
+   a cold-boot one-off; not a real bug.  No fix needed.
+2. **Newly observed FAST_READ termination bug** (3/3 deterministic):
+   `C4 post_rden_drop_wait TIMEOUT` + `C5 STATUS=0x03` (busy stuck
+   at 1 after CTRL=0).  Previously masked by listener.run() Python
+   cleanup error that truncated the capture before C4/C5.
+
+Root cause (verified via paper audit + HW evidence):
+- `end_read_reg <= ((~rden) & (do_read|do_fast_read) & data_valid_wire
+  & end_read_byte)` per epcs_ctrl.v line 826
+- `data_valid_wire = dvalid_reg = (end_read_byte & end_one_cyc_pos)` —
+  a SINGLE-CYCLE PULSE per byte shifted (not level-locked as prior
+  memory speculated)
+- firmware's CTRL.b7=RDEN_DROP is also a single-cycle pulse
+- Two single-cycle pulses must align in the same sysclk cycle for
+  end_read_reg to fire.  Empirically impossible from firmware-side
+  Wishbone writes.  After the firmware-pulse misses, the megafunction
+  stays busy_wire=1 forever → fast_read_reg can't update
+  (clk_en=(~busy_wire & rden_wire)) → entire EPCS subsystem stuck
+  until POR.
+
+NH10 FIX — 1-line wrapper RTL change:
+```
+- wire am_rden = ~ctrl_rden_drop;
++ wire am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read);
+```
+
+Reading: am_rden=1 unless (firmware pulsed RDEN_DROP) OR (megafunction
+is busy AND firmware has cleared the FAST_READ level bit).  The new
+second term implements AUTO-TERMINATE — when firmware writes CTRL=0
+while FSM is still busy, am_rden is held LOW until busy drops.
+end_read_reg gets unlimited cycles to align with the next
+data_valid_wire pulse (~150 sysclks max), and fires reliably.
+Firmware API unchanged (the existing CTRL.b7 pulse path is preserved
+for back-compat, but is now redundant).
+
+HW-VERIFIED 3/3 (capture md5 88548dd4 at
+`docs/captures/diag_nh10_auto_terminate_ok.log`):
+- C5 STATUS=0x02 (busy=0, only DV bit left) vs prior 0x03 (busy
+  stuck).  Determinism: 3/3 runs identical.
+- Phase A still OK (3/3 i=2).
+- Phase C bytes 3/3 consistent: `0x21 0x00 0x88 0x00`.
+
+Budget post-NH10: LE 8929/10320 (87%, +49 LE for the new combinational
+term in am_rden); slack -1.182 ns setup CLOCK (worsened 0.18 ns from
+NH9's -1.003, design has worked at negative slack throughout); RBF
+md5 `43f8578e0abf8e03bfba36c69f3b3edc` (368011 B); ELF unchanged
+16708 B (firmware untouched).
+
+**Phase 3 status post-NH10**:
+- READ path: ✅ silicon-closed (epcs_fast_read returns real bytes)
+- READ termination: ✅ silicon-closed (busy reliably drops after
+  CTRL=0)
+- RDSR path: ✅ working (epcs_read_status returns valid ESTAT;
+  initial "regression" was false alarm)
+- ERASE / PROGRAM: not yet HW-validated, but no longer blocked by
+  termination — sequential read-then-write is now safe.  poll_wip_clear()
+  can re-enter RDSR after a fast_read without getting stuck.
+
+**Carryover for next session**:
+- Phase C bytes differ between bitstreams (5145a6d7: `0x7d 0x21 0x0f
+  0x00`; 43f8578e: `0x21 0x00 0x88 0x00`).  Investigation: may be
+  off-by-one alignment or dummy-byte-vs-first-byte confusion in the
+  shift_bytes timing.  Doesn't block READ closure (bytes are non-0xff,
+  proving real flash content) but the actual addr-0 content is one of
+  these (or neither) — needs verification against a known-content
+  EPCS region (e.g. read addr 0x100000 = blank → should be all 0xff).
+- diag_mode_p_test.py classify() should add NH10 verdict to
+  distinguish "READ data ok + termination ok" (full closure) from
+  "READ data ok + termination broken" (partial NH9 state).
+- diag_mode_p_test.py listener.run() Python cleanup race that truncated
+  prior NH9 capture before C4/C5 — cosmetic but should be hardened.
+
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
 **Phase 4.1 finding** (2026-05-17 afternoon, see [[reference-rublock-
