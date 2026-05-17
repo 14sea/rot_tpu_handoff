@@ -193,6 +193,19 @@ silently drops write-side ports in Lite Edition.
 
 **Effort**: 6–8 h.
 
+**Phase 3 HW status (2026-05-17 evening — INCONCLUSIVE)** — firmware
+shipped in patch 0008 (epcs.c: `epcs_read`, `epcs_read_status`,
+`epcs_erase_sector`, `epcs_program_page` + mode 'P' diagnostic).
+Cross-tests green (test_lutcodec_c 127/127, test_edits_bin 5/5).
+HW verification attempted tonight via mode 'P' but **the experiment
+did not produce controlled data** (see Phase 4 §"2026-05-17 evening
+test — what happened and what we cannot conclude").  Two observations
+stand: (a) on the bitstream tested tonight, no autonomous reconfig
+was seen in the 7 s post-stage2-banner window; (b) `'P'` (mode 'P')
+hangs in `wait_data_valid()` on that same bitstream.  Neither
+observation has a proven cause yet.  Mode 'P' silicon validation
+remains open.
+
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
 **Phase 4.1 finding** (2026-05-17 afternoon, see [[reference-rublock-
@@ -214,6 +227,53 @@ significant underestimate.  Empirical evidence on AX301 silicon:
 3. The proper API for runtime WD disable is the **megafunction**'s
    `param=3, data_in[0]=0, write_param` protocol — which our direct-
    primitive wrapper doesn't expose.
+
+**2026-05-17 evening test — what happened and what we cannot
+conclude**.  Attempted "option A" diagnostic: comment out
+`INTERNAL_FLASH_UPDATE_MODE "REMOTE"` in qsf, rebuild, flash, observe.
+HW observations:
+1. Stage2 banner appeared normally; **no autonomous reconfig in the
+   7 s post-banner window** the listener captured.
+2. After sending `'P'` (mode_epcs_probe), handler entered then
+   **hung in `wait_data_valid()` forever** — altasmi `am_data_valid`
+   never asserted.
+3. qsf was reverted to REMOTE-on and re-built.
+
+**The hidden control failure** (uncovered by audit later in same
+session): the REMOTE-off and REMOTE-on rebuilds produced **byte-
+identical bitstreams** (both md5 `fcfd8122…`).  So the experiment
+that looked like "swap one qsf line, observe behavior change" actually
+tested the SAME bitstream twice.  Likely cause: `cycloneive_rublock`
+primitive's own params (`OPERATION_MODE="REMOTE"`,
+`INTENDED_DEVICE_FAMILY="Cyclone IV E"`) dictate the bitstream's
+config mode regardless of qsf — Warning 169143 fires in both builds
+and is informational about precedence, not a rejection.
+
+**What we cannot conclude from this evening's data**:
+- Whether the qsf REMOTE flag has any effect on bitstream behavior
+  when rublock is instantiated (probably none, given byte-identity).
+- Whether the ~500 ms auto-reconfig observed in prior sessions vs.
+  "no reconfig in 7 s" tonight reflects a bitstream property at all —
+  could be board state, JTAG sequence, openFPGALoader version, prior-
+  session bitstream actually differing from `5bcac02c…` on disk, or
+  a one-off.
+- Whether the mode 'P' hang is caused by silicon (AS pins not
+  available to user logic in some config-controller state) or
+  firmware (altasmi handshake bug in epcs.c / wb_altasmi_parallel).
+
+**What we DO know**:
+- Two HW data points: no reconfig in 7 s + mode 'P' hangs.  Both real,
+  causes unproven.
+- Phase 4 megafunction rework remains the canonical path forward —
+  not because of tonight's "coupling proof" (retracted), but because
+  it's the only mechanism that gives firmware-side control over both
+  the running watchdog AND the reconfig trigger.  Mode 'P' silicon
+  validation will be possible on the megafunction-based bitstream and
+  will disambiguate the firmware-vs-silicon question above.
+
+**Recovery path** (original Phase 4.1 effort estimate stands: 4–8 h
+for megafunction wrapper + epcs_remote_reconfig + EPCS cold-boot
+validation):
 
 **Recovery path** (estimated 4–8 h vs original 2–3 h):
 1. Re-run `qmegawiz` on `altremote_update` for Cyclone IV E REMOTE
@@ -906,7 +966,7 @@ ROT/TPU pair." Quartus stays.
 |---|---|---|
 | 1: SD-side .rbf verify (Track A) | 3–4 h | ✅ done (~3 h) |
 | 2: Quartus IP (altasmi via qmegawiz CLI + rublock direct) | 6–8 h | ✅ done (~6 h) — patch 0005 |
-| 3: EPCS write+verify driver + read-back-skip | 6–8 h | 🟡 **firmware verified (cross-tests + apply chain), HW pending** — patch 0008.  Five JTAG-volatile flashes hit autonomous-reconfig (~500 ms post-boot, NOT rublock WD).  HW debug scheduled for dedicated session — needs scope on nCONFIG + openFPGALoader --verbose + qsf option-bit inspection. |
+| 3: EPCS write+verify driver + read-back-skip | 6–8 h | 🟡 **firmware verified, mode 'P' silicon validation OPEN** — patch 0008.  2026-05-17 evening test inconclusive (REMOTE-on / REMOTE-off rebuilds produced byte-identical bitstreams → no controlled comparison; see Phase 4 §evening-test section).  Mode 'P' observed hanging in `wait_data_valid()` on the bitstream tested; cause unproven (silicon vs firmware).  Path forward: Phase 4 megafunction bitstream enables disambiguation — if mode 'P' works post-Phase-4, firmware was fine; if still hangs, debug epcs.c / wb_altasmi_parallel. |
 | 4: ALTREMOTE_UPDATE trigger + UART drain | ~~2–3 h~~ **4–8 h** | 🔴 **deferred** — Phase 4.1 proved direct-primitive wrapper can't disable running watchdog; needs megafunction rework.  See Phase 4 section + [[reference-rublock-complexity]]. |
 | 5: Cross-repo build orchestrator | 2 h | ✅ done (~2 h) |
 | 6.0: First-boot bring-up (KEY2 pull-up + LED polarity) | 1 h | ✅ done (~4 h, includes original-qsf-was-broken diagnosis + RTL-bypass rewrite) — patches 0006 (rewritten 2026-05-17 PM: RTL bypass `rstn_int <= por_cnt(3)`; original qsf `WEAK_PULL_UP_RESISTOR` on E16 doesn't compile on EP4CE10F17C8) + 0007 (LED polarity).  Stage2 banner + CLK + SDRAM PASS verified on iron 2026-05-17 with rewritten patch 0006. |
