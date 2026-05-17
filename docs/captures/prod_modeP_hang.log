@@ -1,0 +1,8 @@
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: EPCS probe — read 64 B @0x000000

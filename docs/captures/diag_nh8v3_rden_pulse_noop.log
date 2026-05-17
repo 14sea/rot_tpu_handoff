@@ -1,0 +1,37 @@
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe
+[stage2] CRTM locked — waiting for host command
+[P] diagnostic STATUS-trace probe v1
+[P] s0 idle STATUS=0x00000000
+[P] --- Phase A: RDSR ---
+[P] A1 after CTRL=RD_STATUS STATUS=0x00000001
+[P] A2 wait_not_busy i=0x00000000 STATUS=0x00000001
+[P] A2 done i=0x0000000d final=0x00000000 OK
+[P] A3 ESTAT=0x00000000
+[P] A4 after CTRL=0 STATUS=0x00000000
+[P] --- Phase B: READ 1B @0 ---
+[P] B0 ADDR=0 STATUS=0x00000000
+[P] B1 after CTRL=READ STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00000000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00100000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00200000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00300000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00400000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00500000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00600000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00700000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00800000 STATUS=0x00000003
+[P] B2 pre-amble wait i=0x00900000 STATUS=0x00000003
+[P] B2 done i=0x00989680 final=0x00000003 TIMEOUT
+[P] B3 after CTRL=READ|SHIFT_BYTES STATUS=0x00000003
+[P] B4 done i=0x00000000 final=0x00000003 OK
+[P] B5 DATAOUT=0x000000ff
+[P] B5b after CTRL=READ|RDEN_DROP STATUS=0x00000003
+[P] B5c post_rden_drop_wait i=0x00989680 final=0x00000003 TIMEOUT
+[P] B6 after CTRL=0 STATUS=0x00000003
+[P] diagnostic DONE
+[stage2] ready for next cmd
