@@ -262,18 +262,23 @@ and is informational about precedence, not a rejection.
   firmware (altasmi handshake bug in epcs.c / wb_altasmi_parallel).
 
 **What we DO know**:
-- Two HW data points: no reconfig in 7 s + mode 'P' hangs.  Both real,
-  causes unproven.
+- Two HW data points: no reconfig + mode 'P' hangs.  Both real, causes
+  unproven, **and both are DETERMINISTIC per post-audit reproducibility
+  check** — bitstream stable 3/3 byte-identical captures (289 B each,
+  30 s window); mode 'P' hangs 2/2 byte-identical captures (340 B each,
+  always at `wait_data_valid()` after the entry banner).  The mode 'P'
+  hang is therefore debuggable as a specific reproducible failure, not
+  a flake or race.
 - Phase 4 megafunction rework remains the canonical path forward —
   not because of tonight's "coupling proof" (retracted), but because
   it's the only mechanism that gives firmware-side control over both
   the running watchdog AND the reconfig trigger.  Mode 'P' silicon
   validation will be possible on the megafunction-based bitstream and
   will disambiguate the firmware-vs-silicon question above.
-
-**Recovery path** (original Phase 4.1 effort estimate stands: 4–8 h
-for megafunction wrapper + epcs_remote_reconfig + EPCS cold-boot
-validation):
+- One loose end: ~15 min idle after the stable-bitstream window, stage2
+  stopped responding to UART (0-byte capture for 6 s); reflashing
+  recovered.  So "stable for 30 s" is solid but stability beyond 30 s
+  is not verified.
 
 **Recovery path** (estimated 4–8 h vs original 2–3 h):
 1. Re-run `qmegawiz` on `altremote_update` for Cyclone IV E REMOTE
