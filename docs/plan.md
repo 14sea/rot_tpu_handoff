@@ -193,27 +193,65 @@ silently drops write-side ports in Lite Edition.
 
 **Effort**: 6–8 h.
 
-**Phase 3 HW status (2026-05-17 evening — INCONCLUSIVE; root cause
-identified 2026-05-17 night via static audit)** — firmware shipped in
+**Phase 3 HW status (2026-05-17 evening — INCONCLUSIVE; cause STILL
+OPEN after night audit, see retraction below)** — firmware shipped in
 patch 0008 (epcs.c: `epcs_read`, `epcs_read_status`,
 `epcs_erase_sector`, `epcs_program_page` + mode 'P' diagnostic).
 Cross-tests green (test_lutcodec_c 127/127, test_edits_bin 5/5).
 HW verification attempted via mode 'P' but the experiment did not
 produce controlled data (see Phase 4 §"2026-05-17 evening test").
 
-**Mode 'P' hang root cause (2026-05-17 night static audit — confirmed
-empirically)**: NOT a firmware bug.  Five-candidate static-grep
-checklist ([[reference-rublock-complexity]]) found firmware A1-A4
-clean (CTRL/STATUS bit maps match, shift_bytes pulse 1-cycle wide,
-flag_data_valid handshake correct).  A5 found a megafunction-
-generation hole: `epcs_ctrl.v` was generated without
-`PORT_ASMI_ACCESS_GRANTED="PORT_USED"`, so altasmi has no protocol
-to negotiate AS-pin access with the config controller in REMOTE
-mode.  Empirically confirmed by **4× Critical Warning 169123** in
-`neorv32_demo.fit.rpt:2349-2352` (Quartus ignored altasmi's reserve-
-pin requests for DCLK / nCSO / ASDO / DATA0 because REMOTE mode owns
-them).  Mode 'P' validation is blocked on Phase 4 megafunction
-regen, not on any firmware change.  epcs.c is verified ready.
+**Mode 'P' hang root cause (2026-05-17 night static audit — A1-A4
+clean, A5 INITIALLY CLAIMED then RETRACTED)**: Five-candidate
+static-grep checklist ([[reference-rublock-complexity]]) found
+firmware A1-A4 clean (CTRL/STATUS bit maps match, shift_bytes pulse
+1-cycle wide, flag_data_valid handshake correct).  These results
+stand.
+
+**A5 RETRACTION (later same night)**: A5 originally claimed a
+megafunction-generation hole — that `epcs_ctrl.v` was missing
+`PORT_ASMI_ACCESS_GRANTED="PORT_USED"`, causing the 4× Critical
+Warning 169123 in `neorv32_demo.fit.rpt:2349-2352`, which we read as
+"Quartus denied altasmi's AS-pin access".  Both halves of that claim
+are wrong:
+
+1. `PORT_ASMI_ACCESS_GRANTED` / `PORT_ASMI_ACCESS_REQUEST` **do not
+   exist** in Quartus 21.1 Lite's altasmi_parallel megafunction for
+   Cyclone IV E.  The complete 18-parameter `PORT_*` enumeration in
+   `$QUARTUS_ROOTDIR/libraries/megafunctions/xml_info/altasmi_parallel_info.xml`
+   includes only PORT_BULK_ERASE..PORT_WRITE.  asmi_access is a
+   newer-family (MAX 10 / Cyclone 10 GX+) feature.  The proposed fix
+   path is impossible at the tool level on this device.
+2. The 4× Critical Warning 169123 is **cosmetic**, not load-bearing.
+   `neorv32_demo.fit.rpt` shows `sd2~ALTERA_DCLK` → H1 (output, Row
+   I/O, 3.3-V LVTTL), `sd2~ALTERA_SCE` → D2 (output), `sd2~ALTERA_SDO`
+   → C1 (output), `sd2~ALTERA_DATA0` → H2 (input).  The asmiblock
+   atom is fully placed and routed to the dedicated AS pins.  Warning
+   169123 is about *redundant* QSF reserve-pin assignments under
+   REMOTE mode ("you don't need to declare these pins as reserved
+   because we manage them"), not about denying altasmi pin access.
+
+Mode 'P' hang cause is therefore OPEN again.  Remaining candidates
+(in order of plausibility):
+
+- **NH1** (firmware-side, cheap to test): busy-poll race in
+  `epcs_read()` — `am_ctrl_write(CTRL_READ)` returns and firmware
+  enters `wait_not_busy()` before altasmi's internal FSM has actually
+  asserted busy.  First poll reads busy=0, returns immediately,
+  firmware proceeds to pulse `shift_bytes` — but altasmi's preamble
+  (opcode + 24-bit address) hasn't started yet, so the pulse is
+  lost.  Fix: add a busy-must-rise-first phase before the
+  busy-falls wait, OR a defensive cycle delay.
+- **NH2**: rublock primitive contends with asmiblock at the device-
+  architecture level (different mechanism from the pin-reservation
+  conflict A5 wrongly diagnosed).
+- **NH3**: JTAG-volatile load leaves AS-pin mux in a different state
+  than EPCS cold-boot — prior session's hypothesis, still untested.
+
+Discipline note: A5 was a two-step inference ("port missing" +
+"warning means denial") and BOTH steps failed empirical check after
+~10 min more digging.  Reaffirms [[feedback-empirical-over-plan-claims]]:
+exhaust the cheap empirical checks before writing claims into plan.md.
 
 ### Phase 4 — ROT firmware: trigger ALTREMOTE_UPDATE  🔴 DEFERRED (2026-05-17 PM)
 
@@ -289,35 +327,36 @@ and is informational about precedence, not a rejection.
   recovered.  So "stable for 30 s" is solid but stability beyond 30 s
   is not verified.
 
-**Recovery path** (estimated 4–8 h vs original 2–3 h; scope expanded
-2026-05-17 night to include altasmi regen after A5 audit):
+**Recovery path** (estimated 4–8 h vs original 2–3 h.  Note: an
+earlier draft of this list, scope-expanded 2026-05-17 night to add
+"1a: altasmi regen with PORT_ASMI_ACCESS_GRANTED" and "2a: wire
+asmi_access between IPs", was retracted later that same night —
+see Phase 3 §"A5 RETRACTION".  Steps 1a/2a were impossible (port
+doesn't exist in Quartus 21.1 Lite for Cyclone IV E) and unnecessary
+(the warning they were meant to silence is cosmetic).  This list
+now matches the original 2026-05-17 PM draft.):
 1. Re-run `qmegawiz` on `altremote_update` for Cyclone IV E REMOTE
    mode with **"Add support for writing configuration parameters"**
    explicitly enabled (it's a wizard checkbox; ALSE app note p. 3).
-   Confirm `asmi_access` output port appears in generated `.v`.
-1a. **Re-run `qmegawiz` on `altasmi_parallel` (`epcs_ctrl.v`)** with
-   `PORT_ASMI_ACCESS_GRANTED="PORT_USED"` (also
-   `PORT_ASMI_ACCESS_REQUEST="PORT_USED"` if exposed by wizard).
-   This adds the input pin altasmi needs to participate in pin
-   arbitration with the config controller in REMOTE mode.  Without
-   this, fit.rpt emits 4× Critical Warning 169123 for the dedicated
-   AS pins (DCLK/nCSO/ASDO/DATA0) and altasmi's internal SCK toggle
-   never reaches physical pins → mode 'P' `wait_data_valid()` hangs.
-   See [[reference-rublock-complexity]] §"A5 audit" for the
-   confirming fit.rpt evidence on head `0fc9641`.
+   ⚠ Caveat per [[feedback-quartus-clearbox-megafunctions]]: prior
+   session found this checkbox does NOT actually expose write_param /
+   data_in in Lite for Cyclone IV E REMOTE mode.  A re-attempt is
+   warranted to empirically confirm the prior finding still holds
+   (tools evolve), but expect this step may produce a stripped module
+   identical to the direct-primitive case.
 2. Rewrite `rtl/wb_altremote_update.v` as a Wishbone wrapper around the
-   megafunction (not the primitive).  Expose registers for `param[2:0]`,
+   megafunction (not the primitive) IF step 1 succeeded in exposing
+   write_param/data_in.  Expose registers for `param[2:0]`,
    `data_in[21:0]`, `read_source[1:0]`, plus trigger bits for
    `write_param`, `read_param`, `reconfig`, `reset_timer`.  Resource
    delta is small: megafunction adds ~83 LCs over the bare primitive,
    our current ~189 LC wrapper would be replaced with a thinner one
-   around the megafunction.
-2a. Update `rtl/wb_altasmi_parallel.v` to wire the regenerated
-   altasmi's `asmi_access_granted` input from altremote_update's
-   `asmi_access` output (top-level signal or a shared bus in
-   `neorv32_test_setup_bootloader.vhd`).  After regen verify
-   `neorv32_demo.fit.rpt` for Critical Warning 169123 — **0
-   occurrences is the success criterion** for this sub-step.
+   around the megafunction.  If step 1 produced stripped ports,
+   alternative: hand-craft the 29-bit shift sequence equivalent to
+   `param=3, data_in[0]=0, write_param` on the existing direct-
+   primitive wrapper (requires reverse-engineering the rublock
+   internal register layout — see ALSE app note p. 4 + Cyclone IV
+   Handbook Vol 1 Ch 8 for the bit map).
 3. `epcs.c` adds `epcs_remote_reconfig(page, ap_sel)` following the
    ALSE sequence: (a) write reg #4 = boot page byte address (caveat:
    may need to be the un-divided address per the Cyclone 10 LP note,
