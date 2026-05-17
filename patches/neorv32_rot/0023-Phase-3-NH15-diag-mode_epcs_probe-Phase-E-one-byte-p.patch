@@ -1,0 +1,133 @@
+From baecd84099d38f8c8db302b37424faef58e4b87a Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 21:24:24 +0100
+Subject: [PATCH 2/2] =?UTF-8?q?Phase=203=20NH15=20diag:=20mode=5Fepcs=5Fpr?=
+ =?UTF-8?q?obe=20Phase=20E=20=E2=80=94=20one-byte-per-op?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Phase E to mode_epcs_probe that reads 4 bytes via ONE
+CTRL=FAST_READ per byte read, with addr incremented per byte and
+NH10 auto-terminate between ops (CTRL=0 → wait busy=0).  Companion
+to wrapper NH15 latch-lock (preceding commit).
+
+Sequence per byte:
+  DC_RESET pulse + delay (clear flag, reset cntr)
+  *DP_ADDR = base + i
+  *DP_CTRL = DC_FAST_READ
+  wait flag_data_valid=1
+  byte = *DP_DATAOUT
+  *DP_CTRL = 0  (NH10 auto-terminate)
+  wait busy=0
+
+Expected with NH15: bytes deterministic across boots + iterations;
+E byte_i at addr 0..3 should match the first 4 bytes of the factory
+ALINX bitstream at flash offset 0 (which itself can be cross-
+verified by reading the .pof or by openFPGALoader -r the first
+sector).  Without NH15 (refutation): same Phase-C-style race.
+
+Phase A/B/C/D are preserved unchanged for empirical baseline diff —
+the C5 RADDR=0x81E85 streaming-counter datum and the D iterations'
+post-addr RADDR=0 datum stay valid as historical reference points.
+
+Stage2 ELF size: 17728 → 18024 B (+296 B).
+---
+ sw/stage2_loader/main.c | 81 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 855bb50..6180457 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -738,6 +738,87 @@ static void mode_epcs_probe(void)
+         }
+     }
+ 
++    /* =================================================================
++     * Phase E — NH15 one-byte-per-op (latch-lock falsification)
++     *
++     * Hypothesis (NH15): the Phase C/D non-deterministic bytes are caused
++     * by the wrapper's latched_dataout being overwritten by every
++     * am_data_valid pulse during a FAST_READ's continuous stream.  Wrapper
++     * NH15 gates the load with !flag_data_valid, so the slot becomes a
++     * 1-deep FIFO: first byte captured, subsequent stream-overflow bytes
++     * dropped.  Firmware here does ONE CTRL=FAST_READ per byte, reading
++     * exactly the first byte at each address.
++     *
++     * Sequence per byte (auto-terminate via NH10, no RDEN_DROP):
++     *   1. DC_RESET pulse + delay (clear flag, reset cntr to known state)
++     *   2. *DP_ADDR = base + i
++     *   3. *DP_CTRL = DC_FAST_READ
++     *   4. wait flag_data_valid=1 (= STATUS.b1)
++     *   5. byte = *DP_DATAOUT (read clears flag)
++     *   6. *DP_CTRL = 0    (NH10 auto-terminate)
++     *   7. wait busy=0
++     *
++     * Expected behavior with NH15:
++     *   - Bytes deterministic across boots + across iterations
++     *   - E byte_i at addr 0..3 should match the first 4 bytes of the
++     *     factory ALINX bitstream at flash offset 0
++     *   - Without NH15 (refutation case): bytes would still race because
++     *     the megafunction streams during firmware's MMIO setup overhead
++     *     for steps 4-6
++     * ================================================================= */
++    uart_puts("[P] --- Phase E: NH15 one-byte-per-op @0 ---\r\n");
++
++    for (uint32_t i = 0; i < 4u; i++) {
++        uint32_t a = i;
++
++        /* Step 1: reset + delay (NH13 stretcher = 16 sysclk; 32 sw_iters
++         * is comfortably more than that). */
++        *DP_CTRL = DC_RESET;
++        for (volatile int d = 0; d < 32; d++) { /* stretcher delay */ }
++
++        /* Step 2: addr */
++        *DP_ADDR = a;
++
++        /* Step 3: start FAST_READ */
++        *DP_CTRL = DC_FAST_READ;
++
++        /* Step 4: wait DV */
++        uint32_t s = 0;
++        uint32_t wi;
++        for (wi = 0; wi < 1000000u; wi++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++
++        uart_puts("[P] E addr=");
++        uart_puthex32(a);
++        uart_puts(" wait_dv wi=");
++        uart_puthex32(wi);
++        uart_puts(" STATUS=");
++        uart_puthex32(s);
++
++        if (s & 0x2u) {
++            /* Step 5: read DATAOUT (clears flag) */
++            uint32_t b = *DP_DATAOUT;
++            uart_puts(" DATAOUT=");
++            uart_puthex32(b);
++            uart_puts("\r\n");
++        } else {
++            uart_puts(" TIMEOUT\r\n");
++            /* Don't break — still need to clear CTRL so megafunction
++             * releases for next iteration. */
++        }
++
++        /* Step 6: clear CTRL (NH10 auto-terminate) */
++        *DP_CTRL = 0;
++
++        /* Step 7: wait busy=0 */
++        for (wi = 0; wi < 10000u; wi++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++        /* Don't print release wait — keep trace compact. */
++    }
++
+     uart_puts("[P] diagnostic DONE\r\n");
+ 
+     #undef DP_BASE
+-- 
+2.43.0
+

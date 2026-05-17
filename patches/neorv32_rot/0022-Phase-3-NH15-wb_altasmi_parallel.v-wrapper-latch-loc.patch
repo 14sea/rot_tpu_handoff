@@ -1,0 +1,96 @@
+From 7a53305a856da36c32061f809c82c0ed412ef9e8 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 21:24:09 +0100
+Subject: [PATCH 1/2] =?UTF-8?q?Phase=203=20NH15:=20wb=5Faltasmi=5Fparallel?=
+ =?UTF-8?q?.v=20wrapper=20=E2=80=94=20latch-lock=20DV=20slot?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Gate latched_dataout load with !flag_data_valid so the slot acts as a
+1-deep FIFO.  Previous behavior loaded on every am_data_valid pulse:
+during a FAST_READ the megafunction's free-running gen_cntr streams
+bytes at ~Mbyte/s, overwriting latched_dataout faster than firmware's
+MMIO polling can consume — so firmware reads a non-deterministic byte
+(whichever happened to be the most recent overwrite at the cycle
+DATAOUT was read).  Root cause of the Phase C/D non-deterministic-
+bytes finding (NH14 capture 646e1719: bytes vary per bitstream
+rebuild AND per intra-boot consecutive read).
+
+With this gate:
+- First DV after a FAST_READ captures the byte; subsequent stream-
+  overflow DV pulses are dropped (no overwrite).
+- Firmware reads DATAOUT (dataout_read_req clears flag); next DV
+  pulse then loads the next byte.
+
+Paired firmware change: Phase E in mode_epcs_probe does ONE
+CTRL=FAST_READ per byte (relying on NH10 auto-terminate after each)
+with addr incremented per byte — gives deterministic per-address
+reads at the cost of pre-amble overhead per byte (~30 sysclks).
+
+NH14's earlier "addr→read_address linkage broken" framing is
+REFUTED by this audit: read_address output port (epcs_ctrl.v line
+1807) is the read_add_reg, whose enable (line 1159) fires only at
+end_read_byte during a read op — it's a per-byte snapshot, never
+updates in idle.  So *DP_ADDR writes never moving RADDR is expected
+megafunction behavior, not a wrapper bug.
+
+NH13 ctrl_reset stretcher (patch 0020) remains as defensive: it
+still correctly resets read_add_cntr to 0 between ops (verified in
+NH14 capture, C-pre-addr RADDR=0x0).
+
+Refuted but kept for reference: SHIFT_BYTES is a write-only signal
+(shift_bytes_wire only in lpm_counter pgwr_data_cntr clk_en line
+1591 and scfifo4 wrreq line 1694).  Firmware's CTRL.b4 pulse during
+reads has no effect — bytes shift in via gen_cntr autonomously.
+Phase E drops the SHIFT_BYTES bit entirely.
+
+For multi-byte burst reads (Phase 6 mode 't' SHA verify), the
+1-deep slot still loses bytes that arrive while the slot is full —
+intentional.  Phase 9-class redesign would add a wrapper FIFO +
+length counter; out of scope for this iteration.
+---
+ rtl/wb_altasmi_parallel.v | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 673075f..3f1a31a 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -194,7 +194,32 @@ module wb_altasmi_parallel (
+         end else begin
+             if (am_illegal_erase) flag_illegal_erase <= 1'b1;
+             if (am_illegal_write) flag_illegal_write <= 1'b1;
+-            if (am_data_valid) begin
++            // NH15 (2026-05-17 night): only load latched_dataout when the
++            // slot is empty (flag_data_valid=0).  Previous behavior loaded
++            // on EVERY am_data_valid pulse, so during a FAST_READ the
++            // megafunction's free-running gen_cntr produced ~Mbyte/s of DV
++            // pulses that overwrote latched_dataout faster than firmware's
++            // MMIO polling could consume it — firmware ended up reading a
++            // non-deterministic byte (whichever happened to be the most
++            // recent overwrite at the cycle DATAOUT was read).  Root cause
++            // of Phase C/D non-deterministic-bytes finding (NH14 capture
++            // 646e1719 — bytes vary per bitstream rebuild AND per intra-
++            // boot consecutive read).
++            //
++            // With this gate, the slot is a 1-deep FIFO: first DV pulse
++            // captures the byte, subsequent DV pulses are dropped, firmware
++            // reads DATAOUT to consume (dataout_read_req clears flag), and
++            // the very next DV pulse can load the next byte.  Paired
++            // firmware change: ONE CTRL=FAST_READ per byte (relying on
++            // NH10 auto-terminate after each), with addr incremented per
++            // byte — Phase E in mode_epcs_probe.
++            //
++            // For burst reads (>1 byte per op), the slot's 1-deep depth
++            // still loses any bytes that arrive while the slot is full —
++            // intentional, since for multi-byte bursts firmware can't keep
++            // up anyway.  Phase 9-class redesign would add a wrapper FIFO
++            // + length counter; out of scope for this iteration.
++            if (am_data_valid && !flag_data_valid) begin
+                 flag_data_valid <= 1'b1;
+                 latched_dataout <= am_dataout;
+             end else if (dataout_read_req) begin
+-- 
+2.43.0
+

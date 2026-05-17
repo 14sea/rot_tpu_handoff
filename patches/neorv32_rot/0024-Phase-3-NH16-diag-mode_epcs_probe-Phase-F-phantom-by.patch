@@ -1,0 +1,168 @@
+From 324edfa026af918a6fd90c53b3868994d085c47c Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 17 May 2026 21:36:55 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20NH16=20diag:=20mode=5Fepcs=5Fprobe?=
+ =?UTF-8?q?=20Phase=20F=20=E2=80=94=20phantom-byte=20skip?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds Phase F to mode_epcs_probe that reads 4 bytes via ONE
+CTRL=FAST_READ per byte with NH16 phantom-byte discard.  Phase E
+on HW (capture /tmp/diag_phase3_nh15_run1.log) revealed that with
+NH15 latch-lock, byte 0 of every FAST_READ is deterministically
+0xff regardless of address — caused by the fast_read protocol's
+dummy byte (opcode 0x0B + 24-bit addr + 1 DUMMY byte + data).
+MISO floats high during the dummy clock period, so the dummy DV
+pulse carries 0xff, which NH15 latches as the first slot value.
+
+NH16 firmware-only fix: after CTRL=FAST_READ, consume + discard
+the first DATAOUT (clears flag_data_valid via dataout_read_req),
+then wait for the next DV which is the REAL first byte at the
+requested address.
+
+Sequence per byte:
+  DC_RESET pulse + delay
+  *DP_ADDR = base + i
+  *DP_CTRL = DC_FAST_READ
+  wait DV  (= phantom dummy 0xff)
+  phantom = *DP_DATAOUT  (discard, clears flag)
+  wait DV  (= real first byte at addr)
+  real = *DP_DATAOUT
+  *DP_CTRL = 0  (NH10 auto-terminate)
+  wait busy=0
+
+Cross-check basis: Phase D iter 1 (addr=0) under NH15 returned
+ff, 0x12, 0x82, 0x5c — the 0xff is phantom, 0x12 the real first
+byte at flash offset 0.  Phase F at addr=0 SHOULD return REAL=0x12;
+at addr=1 REAL=0x82; at addr=2 REAL=0x5c; at addr=3 REAL=??
+(intra-boot determinism).
+
+Phase E preserved unchanged for empirical baseline.  Stage2 ELF
+size: 18024 → 18568 B (+544 B).
+---
+ sw/stage2_loader/main.c | 108 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 108 insertions(+)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 6180457..ce495d2 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -819,6 +819,114 @@ static void mode_epcs_probe(void)
+         /* Don't print release wait — keep trace compact. */
+     }
+ 
++    /* =================================================================
++     * Phase F — NH16 phantom-byte skip (NH15 + dummy-byte discard)
++     *
++     * Phase E found that with NH15 latch-lock, byte 0 of every FAST_READ
++     * op is deterministically 0xff regardless of address — explained by
++     * the fast_read opcode protocol: 0x0B + 24-bit addr + 1 DUMMY byte
++     * + data bytes.  The megafunction's data_valid pulses on the dummy
++     * byte (MISO floats high during dummy clock period → 0xff).  NH15
++     * locks that phantom.
++     *
++     * NH16 firmware-level fix: after CTRL=FAST_READ, read DATAOUT once
++     * to consume + discard the phantom byte (clears flag_data_valid),
++     * then wait for the next DV pulse which is the real first byte at
++     * the requested address.
++     *
++     * Cross-check vs Phase D iter 1 (addr=0): D1 sequence was
++     * ff, 0x12, 0x82, 0x5c — the 0xff is the phantom, 0x12 is the real
++     * first byte at flash offset 0.  Phase F at addr=0 SHOULD return
++     * 0x12; at addr=1 should return 0x82; at addr=2 should return 0x5c;
++     * etc. (if intra-boot deterministic).
++     *
++     * Sequence per byte:
++     *   1. DC_RESET pulse + delay
++     *   2. *DP_ADDR = base + i
++     *   3. *DP_CTRL = DC_FAST_READ
++     *   4. wait DV  (phantom dummy)
++     *   5. (void)*DP_DATAOUT  → discards phantom, clears flag
++     *   6. wait DV  (real first byte at addr)
++     *   7. byte = *DP_DATAOUT
++     *   8. *DP_CTRL = 0  (NH10 auto-terminate)
++     *   9. wait busy=0
++     * ================================================================= */
++    uart_puts("[P] --- Phase F: NH16 phantom-skip one-byte-per-op @0 ---\r\n");
++
++    for (uint32_t i = 0; i < 4u; i++) {
++        uint32_t a = i;
++
++        /* Step 1: reset + delay */
++        *DP_CTRL = DC_RESET;
++        for (volatile int d = 0; d < 32; d++) { /* stretcher delay */ }
++
++        /* Step 2: addr */
++        *DP_ADDR = a;
++
++        /* Step 3: start FAST_READ */
++        *DP_CTRL = DC_FAST_READ;
++
++        /* Step 4: wait phantom DV */
++        uint32_t s = 0;
++        uint32_t wi;
++        for (wi = 0; wi < 1000000u; wi++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++        if (!(s & 0x2u)) {
++            uart_puts("[P] F addr=");
++            uart_puthex32(a);
++            uart_puts(" PHANTOM_TIMEOUT wi=");
++            uart_puthex32(wi);
++            uart_puts("\r\n");
++            *DP_CTRL = 0;
++            for (wi = 0; wi < 10000u; wi++) { if (!(*DP_STATUS & 0x1u)) break; }
++            continue;
++        }
++
++        /* Step 5: discard phantom */
++        uint32_t phantom = *DP_DATAOUT;
++
++        /* Step 6: wait real DV */
++        uint32_t wi2;
++        for (wi2 = 0; wi2 < 1000000u; wi2++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++
++        if (s & 0x2u) {
++            /* Step 7: read real byte */
++            uint32_t b = *DP_DATAOUT;
++            uart_puts("[P] F addr=");
++            uart_puthex32(a);
++            uart_puts(" phantom=");
++            uart_puthex32(phantom);
++            uart_puts(" REAL=");
++            uart_puthex32(b);
++            uart_puts(" (phantom_wi=");
++            uart_puthex32(wi);
++            uart_puts(" real_wi=");
++            uart_puthex32(wi2);
++            uart_puts(")\r\n");
++        } else {
++            uart_puts("[P] F addr=");
++            uart_puthex32(a);
++            uart_puts(" phantom=");
++            uart_puthex32(phantom);
++            uart_puts(" REAL_TIMEOUT real_wi=");
++            uart_puthex32(wi2);
++            uart_puts("\r\n");
++        }
++
++        /* Step 8: clear CTRL */
++        *DP_CTRL = 0;
++
++        /* Step 9: wait busy=0 */
++        for (wi = 0; wi < 10000u; wi++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++    }
++
+     uart_puts("[P] diagnostic DONE\r\n");
+ 
+     #undef DP_BASE
+-- 
+2.43.0
+
