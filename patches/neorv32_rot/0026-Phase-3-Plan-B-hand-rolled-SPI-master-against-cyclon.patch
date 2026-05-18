@@ -1,0 +1,671 @@
+From d9f6d2443ca1cd4c9aefe7a882a1cb7f371e3f2d Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 19:31:48 +0100
+Subject: [PATCH] Phase 3 Plan B: hand-rolled SPI master against
+ cycloneive_asmiblock primitive
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replaces wb_altasmi_parallel.v body — was a thin Wishbone wrapper around
+the altasmi_parallel megafunction (epcs_ctrl.v), now a hand-rolled SPI
+master FSM driving cycloneive_asmiblock directly (5-port single-bit SPI
+primitive, cycloneive_atoms.v line 7017).
+
+Rationale: NH15+NH16-fw+NH17 wrapper iterations on the megafunction-
+based path validated three useful primitives (byte-0 dummy lock; per-
+byte event from read_add_reg edge; ctrl_reset stretcher) but each fix
+traded one pipeline race for another (latch-overwrite → level-lock
+re-latch → stage_cntr=2'b10 gating race).  Megafunction's
+read_data_reg / dvalid_reg / read_add_reg have different clock edges +
+gating conditions designed for an internal HardCopy config controller,
+NOT external MMIO sampling.  Wrapper-layer patch budget exhausted in
+Quartus 21.1 Lite Cyclone IV E.
+
+Plan B scope (first round): READ path only (fast_read 0x0B opcode).
+Write/erase paths stubbed (illegal_* tied to 0); CTRL bits b1/b2/b3/b4/
+b5/b7 are MMIO-compatible no-ops.  CTRL.b6 reset + b8 fast_read level
+keep their semantics so firmware Phase E (mode_epcs_probe one-byte-per-
+op) does not need to change.
+
+FSM: IDLE → PRE (4-cycle CS-to-SCK setup) → SHIFT (8 bits, MSB first,
+SPI mode 0) → LOAD (1-cycle byte reload) → ... → PAUSE (CS held low,
+wait firmware drain via STATUS.b1 + DATAOUT read) → TAIL (4-cycle CS
+hold high) → IDLE.  Phase enum: CMD(0x0B) → A2 → A1 → A0 → DUM → DAT → ...
+SCK = sysclk/4 = 12.5 MHz (EPCS16 fast_read supports >=25 MHz; 2x margin).
+NH15 1-deep dataout slot preserved with byte_valid (per-byte 1-cycle
+pulse) replacing the megafunction's level-locked am_data_valid.
+
+Synthesis: 0 errors, 0 Critical Warnings (was 4x 169123 with altasmi).
+LE 8682/10320 = 84%, -259 LE vs NH17 (8941).  Wrapper itself 215 LE.
+ASMI blocks 1/1 (100%) placed on H1/D2/C1/H2 dedicated AS pins.
+Setup slack -1.160 ns (was -1.182 ns NH17 — unchanged).  20 Warnings
+are unused stub regs (ctrl_write etc. tied to GND) — expected.
+
+Bitstream md5 16ee77945254dd5ec81cc23d5b3dac37 (368011 B).
+Stage2 ELF unchanged (Phase E firmware compatible without changes).
+---
+ rtl/wb_altasmi_parallel.v | 551 ++++++++++++++++++++++----------------
+ 1 file changed, 318 insertions(+), 233 deletions(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 3de35ef..1542dfd 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -1,50 +1,58 @@
+-// wb_altasmi_parallel.v — thin Wishbone (NEORV32 XBUS) wrapper around the
+-// Altera altasmi_parallel megafunction.  Drives the dedicated AS pins
+-// (DCLK / nCSO / ASDO / DATA0) via USE_ASMIBLOCK=ON — no QSF pin
+-// assignments needed.
++// wb_altasmi_parallel.v — Plan B hand-rolled SPI master against the
++// cycloneive_asmiblock primitive.  Preserves the MMIO interface
++// previously exposed over the altasmi_parallel megafunction wrapper,
++// so firmware (mode_epcs_probe Phase E one-byte-per-op) does not
++// need to change.
+ //
+-// Base: 0xF2000000.  1 MB decode window (xbus_adr[31:20] == 12'hF20).
++// Why: the altasmi_parallel megafunction has internal pipeline timing
++// races (read_data_reg / dvalid_reg / read_add_reg gated by different
++// stage_cntr conditions) that make external MMIO sampling unreliable.
++// NH15+NH16-fw+NH17 wrapper iterations validated three useful
++// primitives (byte-0 dummy lock; per-byte event from read_add_reg
++// edge; ctrl_reset stretcher) but each fix traded one race for
++// another — wrapper-layer patch budget exhausted in Quartus 21.1 Lite.
++//
++// Plan B: skip the megafunction.  Directly instantiate
++// cycloneive_asmiblock (5-port primitive: dclkin / scein / oe / sdoin
++// / data0out — Quartus 21.1 Lite Cyclone IV E, cycloneive_atoms.v
++// line 7017) and roll our own SPI master.  altasmi's own
++// instantiation at epcs_ctrl.v line 422 (sd3) confirms this primitive
++// is silicon-validated for AS-pin access (NH15 byte-0=0xff dummy
++// proved data round-trips through the pins).
++//
++// First-round scope: READ path only (fast_read 0x0B opcode), with the
++// existing NH15 1-deep dataout slot for firmware back-pressure.
++// Write/erase paths are stubbed (illegal_* flags wired to 0) and will
++// be added in a later round once the read path is silicon-validated.
+ //
+-// "Thin" model: MMIO exposes altasmi's raw control inputs and outputs;
+-// firmware (Phase 3 epcs.c) drives the per-byte handshake.  Bits in CTRL
+-// are split into LEVEL (read/write/sec_erase/rd_status — held until
+-// firmware clears) and PULSE (shift_bytes/wren/reset — auto-clear after
+-// one cycle).
++// Base: 0xF2000000.  1 MB decode window (xbus_adr[31:20] == 12'hF20).
+ //
+-// Register map (byte offsets, 32-bit accesses):
+-//   0x00  CTRL    (W)  b0=reserved (NH9: removed — port_fast_read=PORT_USED
+-//                                    causes qmegawiz 21.1 Lite to strip the
+-//                                    `read` input port from the megafunction
+-//                                    as a fast_read/read mutex.  Use b8.)
+-//                      b1=write   (level)
+-//                      b2=sector_erase (level)
+-//                      b3=read_status  (level)
+-//                      b4=shift_bytes  (1-cycle pulse)
+-//                      b5=wren         (1-cycle pulse)
+-//                      b6=reset        (1-cycle pulse; clears sticky flags)
+-//                      b7=rden_drop    (1-cycle pulse; drops rden to 0 for
+-//                                        one cycle to fire end_read_reg —
+-//                                        firmware pulses after last byte
+-//                                        of a read to terminate operation)
+-//                      b8=fast_read    (level — opcode 0x0B + 24-bit addr +
+-//                                        1 dummy byte; uses the stage3
+-//                                        do_wait_dummyclk FSM-unlock that
+-//                                        plain READ lacks — see comment at
+-//                                        epcs_ctrl.v line 383 OR-term)
+-//                  (R)  reads back the 4 level bits in matching positions
+-//   0x04  ADDR    (R/W) [23:0]   altasmi.addr
+-//   0x08  DATAIN  (R/W) [7:0]    altasmi.datain
+-//   0x0C  STATUS  (R)   b0=busy
+-//                       b1=data_valid_sticky (clears on DATAOUT read or reset)
+-//                       b2=illegal_erase_sticky (clears on reset)
+-//                       b3=illegal_write_sticky (clears on reset)
+-//   0x10  DATAOUT (R)   [7:0]    latched altasmi.dataout (reading clears DV)
+-//   0x14  ESTAT   (R)   [7:0]    altasmi.status_out (latest read_status result)
+-//   0x18  RADDR   (R)   [23:0]   altasmi.read_address (live read-address
+-//                                counter; primary purpose: prevent
+-//                                synthesis pruning of read_add_cntr →
+-//                                end_read_reg; secondary purpose: runtime
+-//                                diagnostic of READ progress)
++// Register map (unchanged from the megafunction wrapper):
++//   0x00  CTRL    (W)  b1=write (level — IGNORED first round)
++//                      b2=sector_erase (level — IGNORED first round)
++//                      b3=read_status  (level — IGNORED first round; returns 0)
++//                      b4=shift_bytes  (1-cycle pulse — IGNORED; reads
++//                                        are now SCK-paced internally)
++//                      b5=wren         (1-cycle pulse — IGNORED first round)
++//                      b6=reset        (1-cycle pulse — aborts current op,
++//                                        clears sticky flags + dataout slot)
++//                      b7=rden_drop    (1-cycle pulse — IGNORED; CTRL=0
++//                                        is now the canonical termination)
++//                      b8=fast_read    (level — starts a FAST_READ op;
++//                                        clearing it terminates the op
++//                                        per NH10 auto-terminate semantics)
++//                  (R)  reads back the level bits in matching positions
++//   0x04  ADDR    (R/W) [23:0]   24-bit byte address for FAST_READ
++//   0x08  DATAIN  (R/W) [7:0]    write-data scratch (IGNORED first round)
++//   0x0C  STATUS  (R)   b0=busy   (any FSM state != IDLE)
++//                       b1=data_valid_sticky (latched_dataout has a fresh byte)
++//                       b2=illegal_erase_sticky (tied to 0 first round)
++//                       b3=illegal_write_sticky (tied to 0 first round)
++//   0x10  DATAOUT (R)   [7:0]    latched SPI receive byte (reading clears DV)
++//   0x14  ESTAT   (R)   [7:0]    tied to 0 (no RDSR path first round)
++//   0x18  RADDR   (R)   [23:0]   internal byte-progress counter for diagnostics:
++//                                  starts at ADDR on op entry, increments by 1
++//                                  per data byte successfully shifted in.
+ 
+ module wb_altasmi_parallel (
+     input         clk,
+@@ -65,162 +73,264 @@ module wb_altasmi_parallel (
+     wire in_range = (xbus_adr[31:20] == 12'hF20);
+     wire [7:0] off = xbus_adr[7:0];
+ 
+-    // ── Control registers ─────────────────────────────────────────────
+-    reg ctrl_write;
+-    reg ctrl_sec_erase;
+-    reg ctrl_rd_status;
+-    reg ctrl_shift_bytes;
+-    reg ctrl_wren;
+-    reg ctrl_reset;
+-    reg ctrl_rden_drop;
+-    reg ctrl_fast_read;
++    // ── MMIO-visible control registers ────────────────────────────────
++    reg ctrl_write;       // unused first round
++    reg ctrl_sec_erase;   // unused first round
++    reg ctrl_rd_status;   // unused first round
++    reg ctrl_shift_bytes; // unused first round (auto-clear)
++    reg ctrl_wren;        // unused first round (auto-clear)
++    reg ctrl_reset;       // 1-cycle pulse: abort + clear (auto-clear)
++    reg ctrl_rden_drop;   // unused first round (auto-clear)
++    reg ctrl_fast_read;   // LEVEL: 1 starts/sustains FAST_READ op
+     reg [23:0] addr_reg;
+     reg [7:0]  datain_reg;
+ 
+-    // ── altasmi outputs ───────────────────────────────────────────────
+-    wire        am_busy;
+-    wire        am_data_valid;
+-    wire [7:0]  am_dataout;
+-    wire [7:0]  am_status_out;
+-    wire        am_illegal_erase;
+-    wire        am_illegal_write;
+-    wire [23:0] am_read_addr;       // NH7 fix: must be connected so Quartus
+-                                    // doesn't prune read_add_cntr →
+-                                    // end_read_reg.  Surfaced over MMIO 0x18.
+-
+-    // ── Power-on reset stretcher (NH6 fix) ────────────────────────────
+-    // altasmi_parallel spec: reset must be asserted ≥250 ns at power-up
+-    // to initialize the megafunction (FIFO counters, internal FSM).
+-    // Without this, am_data_valid is level-held high during pre-amble on
+-    // READ-class opcodes — exactly the symptom captured by patch 0010's
+-    // diagnostic STATUS-trace (Phase A RDSR works, Phase B READ hangs at
+-    // pre-amble with STATUS=0x03 across 10M poll iters).
+-    //
+-    // Stretch the megafunction's reset for 31 cycles after rst_n
+-    // deasserts (= 620 ns @ 50 MHz, 2.5× the spec minimum), then OR
+-    // with a firmware-issued soft-reset pulse so firmware can still
+-    // request a soft-reset on demand.
+-    reg [4:0] am_por_cnt;
+-    wire am_por_done = &am_por_cnt;  // saturates at 5'b11111
+-    always @(posedge clk or negedge rst_n) begin
+-        if (!rst_n)             am_por_cnt <= 5'd0;
+-        else if (!am_por_done)  am_por_cnt <= am_por_cnt + 5'd1;
+-    end
++    reg dataout_read_req; // pulsed when firmware reads DATAOUT
++
++    // ── SPI clock divider ─────────────────────────────────────────────
++    // 4-cycle period: SCK = sysclk/4 = 12.5 MHz @ 50 MHz.  Phase
++    // (within one period):
++    //   cnt=0: SCK low.  MOSI just changed (assigned at prior sck_fall).
++    //   cnt=1: SCK low.
++    //   cnt=2: SCK high.  Stable mid-high — sample MISO here.
++    //   cnt=3: SCK high.  Falling edge events.
++    // sck_q is the output to the asmiblock.
++
++    reg [1:0]  sck_div_cnt;
++    reg        sck_q;
++    reg        sck_active;
+ 
+-    // NH13 (2026-05-17 silicon): the original `am_reset_in = ctrl_reset
+-    // | ~am_por_done` left firmware-issued ctrl_reset as a 1-cycle pulse
+-    // (~20 ns @ 50 MHz), well below the megafunction's 250 ns reset
+-    // spec.  Effect: the megafunction's internal read_add_cntr (lpm_counter)
+-    // did NOT actually reset on CTRL.b6 writes, so consecutive
+-    // FAST_READs in the same boot returned non-deterministic bytes
+-    // (counter state leaked across operations).  Stretch the firmware-
+-    // issued pulse to 16 cycles (= 320 ns @ 50 MHz) via a small load-
+-    // -and-count-down counter; sticky flag clearing logic still triggers
+-    // on the 1-cycle ctrl_reset (idempotent for multiple cycles, harmless).
+-    reg [4:0] ctrl_reset_cnt;
+-    wire ctrl_reset_active = |ctrl_reset_cnt;
+     always @(posedge clk or negedge rst_n) begin
+-        if (!rst_n)                 ctrl_reset_cnt <= 5'd0;
+-        else if (ctrl_reset)        ctrl_reset_cnt <= 5'd16;
+-        else if (ctrl_reset_active) ctrl_reset_cnt <= ctrl_reset_cnt - 5'd1;
++        if (!rst_n) begin
++            sck_div_cnt <= 2'd0;
++            sck_q       <= 1'b0;
++        end else if (!sck_active) begin
++            sck_div_cnt <= 2'd0;
++            sck_q       <= 1'b0;
++        end else begin
++            sck_div_cnt <= sck_div_cnt + 2'd1;
++            if      (sck_div_cnt == 2'd1) sck_q <= 1'b1; // rising into cnt=2
++            else if (sck_div_cnt == 2'd3) sck_q <= 1'b0; // falling into cnt=0
++        end
+     end
+-    wire am_reset_in = ctrl_reset_active | ~am_por_done;
+-
+-    // Generated by qmegawiz from rtl/ip/epcs_ctrl.v (altasmi_parallel
+-    // wrapper, EPCS16, Cyclone IV E, USE_ASMIBLOCK=ON — drives the
+-    // dedicated AS pins DCLK/nCSO/ASDO/DATA0 automatically).
+-    // NH8 v3: firmware-controlled rden via CTRL.b7 pulse.
+-    //
+-    // History: NH8 v1 (rden=~dataout_read_req) preserved end_read_reg
+-    // at synthesis but never fired it at runtime — the rden-drop
+-    // window misaligned with data_valid_wire pulses.  NH8 v2 (rden=0)
+-    // fired end_read_reg too aggressively — FSM aborted before
+-    // shifting any data byte.  Trace evidence: B1 STATUS=0x00 right
+-    // after CTRL=READ (busy never even asserted; the operation
+-    // exited immediately).
+-    //
+-    // Correct semantics: hold rden=1 while bytes are being shifted,
+-    // drop rden=0 for one cycle AFTER the final byte's data_valid
+-    // pulse to signal "this was the last byte → terminate read."
+-    //
+-    // Default am_rden=1.  Two termination paths, both supported:
+-    //   (a) Firmware pulses CTRL.b7=1 (single-cycle RDEN_DROP).  Race-prone:
+-    //       the rden=0 pulse must align with the megafunction's single-cycle
+-    //       data_valid_wire pulse for end_read_reg to fire.  Empirically
+-    //       unreliable on NH9 (C4 TIMEOUT 3/3 reproducible).
+-    //   (b) NH10 AUTO-TERMINATE: when firmware clears the FAST_READ level
+-    //       bit (CTRL=0) while the megafunction is still busy, the wrapper
+-    //       HOLDS am_rden=0 until busy drops.  end_read_reg gets unlimited
+-    //       cycles to align with the data_valid_wire pulse — termination
+-    //       always completes within one shift cycle (~150 sysclks).
+-    //   Firmware API: just write CTRL=0 then wait_not_busy().  The b7 pulse
+-    //   is retained for back-compat but is now redundant.
+-    wire am_rden = ~ctrl_rden_drop & ~(am_busy & ~ctrl_fast_read);
+-
+-    epcs_ctrl u_am (
+-        .clkin         (clk),
+-        .reset         (am_reset_in),
+-        .addr          (addr_reg),
+-        .datain        (datain_reg),
+-        .rden          (am_rden),
+-        .fast_read     (ctrl_fast_read),
+-        .write         (ctrl_write),
+-        .sector_erase  (ctrl_sec_erase),
+-        .read_status   (ctrl_rd_status),
+-        .shift_bytes   (ctrl_shift_bytes),
+-        .wren          (ctrl_wren),
+-        .busy          (am_busy),
+-        .data_valid    (am_data_valid),
+-        .dataout       (am_dataout),
+-        .status_out    (am_status_out),
+-        .illegal_erase (am_illegal_erase),
+-        .illegal_write (am_illegal_write),
+-        .read_address  (am_read_addr)
+-    );
+ 
+-    // ── NH17: per-byte event detector (am_read_addr edge) ────────────
+-    // Replaces am_data_valid as the latch trigger.  am_data_valid is
+-    // LEVEL-LOCKED by the megafunction's dvalid_reg (epcs_ctrl.v line
+-    // 745: sets on first end_read_byte, cleared only by end_op_wire),
+-    // so NH16-fw's "firmware-side discard phantom byte" failed —
+-    // post-clear re-latch fires immediately with the stale am_dataout
+-    // because the level-locked am_data_valid is still high before the
+-    // next real end_read_byte event.
+-    //
+-    // am_read_addr = megafunction's read_add_reg (epcs_ctrl.v line
+-    // 1807), enabled by (end_read_byte & end_one_cyc_pos &
+-    // ~end_operation) per line 1159 → updates exactly ONCE per byte
+-    // during a read op.  Detecting transitions of this 24-bit value
+-    // gives a clean per-byte strobe to replace level-locked DV.
+-    //
+-    // Clocking: read_add_reg is on negedge clkin_wire (line 992-994);
+-    // wrapper samples on posedge clk → 10 ns of clock-edge margin at
+-    // 50 MHz, single sync flop is sufficient.  No metastability
+-    // concern (same clock domain, opposite edges).
+-    //
+-    // 24-bit compare (not LSB-only): read_add_cntr increments multiple
+-    // times between end_read_byte events (cnt_en=1 always, clk_en gates
+-    // on data_valid_wire which is also level-locked), so the captured
+-    // am_read_addr can jump by N>1 per event.  LSB-only would miss
+-    // events where the jump happens to keep LSB unchanged.
+-    //
+-    // Reset alignment: clear on ctrl_reset (NH13 wrapper trigger that
+-    // stretches am_reset_in to 16 cycles) so wrapper-side baseline
+-    // matches megafunction's read_add_reg=0 post-reset.
+-    reg [23:0] am_read_addr_d;
++    // sample_pulse: 1-cycle pulse during cnt==2 (mid SCK-high); MISO
++    // has had cnt 0+1 (40 ns) since the chip's prior falling edge to
++    // propagate to miso_in.
++    // fall_pulse: 1-cycle pulse during cnt==3 (SCK still high; we
++    // schedule changes that take effect at cnt==0 of next period,
++    // which is the physical SCK falling edge).
++    wire sample_pulse = sck_active && (sck_div_cnt == 2'd2);
++    wire fall_pulse   = sck_active && (sck_div_cnt == 2'd3);
++
++    // ── SPI master FSM ────────────────────────────────────────────────
++    localparam [2:0]
++        S_IDLE  = 3'd0,
++        S_PRE   = 3'd1,  // CS-to-SCK setup hold
++        S_LOAD  = 3'd2,  // 1-cycle byte reload between bytes
++        S_SHIFT = 3'd3,  // 8-bit shift in/out
++        S_PAUSE = 3'd4,  // post-data-byte stall; CS held low
++        S_TAIL  = 3'd5;  // CS-high recovery before going idle
++
++    localparam [2:0]
++        P_CMD = 3'd0,
++        P_A2  = 3'd1,
++        P_A1  = 3'd2,
++        P_A0  = 3'd3,
++        P_DUM = 3'd4,
++        P_DAT = 3'd5;
++
++    reg [2:0] state;
++    reg [2:0] phase;
++    reg [7:0] mosi_shift;
++    reg [7:0] miso_shift;
++    reg [2:0] bit_cnt;
++    reg [3:0] tick_cnt;       // generic counter for PRE/TAIL hold
++    reg       byte_valid;     // 1-cycle pulse when DAT byte completes
++    reg [23:0] raddr_q;       // diag byte-progress counter
++
++    wire op_busy = (state != S_IDLE);
++
++    function [2:0] next_phase;
++        input [2:0] cur;
++        case (cur)
++            P_CMD: next_phase = P_A2;
++            P_A2:  next_phase = P_A1;
++            P_A1:  next_phase = P_A0;
++            P_A0:  next_phase = P_DUM;
++            P_DUM: next_phase = P_DAT;
++            P_DAT: next_phase = P_DAT;
++            default: next_phase = P_DAT;
++        endcase
++    endfunction
++
++    function [7:0] phase_load;
++        input [2:0] p;
++        input [23:0] a;
++        case (p)
++            P_CMD: phase_load = 8'h0B;
++            P_A2:  phase_load = a[23:16];
++            P_A1:  phase_load = a[15:8];
++            P_A0:  phase_load = a[7:0];
++            P_DUM: phase_load = 8'h00;
++            P_DAT: phase_load = 8'h00;
++            default: phase_load = 8'h00;
++        endcase
++    endfunction
++
++    // Outputs to the asmiblock primitive.
++    reg cs_n_q;
++    reg oe_q;        // 0 = user logic drives AS pins; 1 = hi-Z
++    reg mosi_q;
++    wire miso_in;
++
++    // Forward-declared so FSM can read it for the resume-decision in S_PAUSE
++    reg flag_data_valid;
++
+     always @(posedge clk or negedge rst_n) begin
+-        if (!rst_n)          am_read_addr_d <= 24'd0;
+-        else if (ctrl_reset) am_read_addr_d <= 24'd0;
+-        else                 am_read_addr_d <= am_read_addr;
++        if (!rst_n) begin
++            state       <= S_IDLE;
++            phase       <= P_CMD;
++            mosi_shift  <= 8'h00;
++            miso_shift  <= 8'h00;
++            bit_cnt     <= 3'd0;
++            tick_cnt    <= 4'd0;
++            byte_valid  <= 1'b0;
++            raddr_q     <= 24'd0;
++            cs_n_q      <= 1'b1;
++            oe_q        <= 1'b1;
++            mosi_q      <= 1'b0;
++            sck_active  <= 1'b0;
++        end else begin
++            byte_valid <= 1'b0; // default 1-cycle pulse low
++
++            if (ctrl_reset) begin
++                state      <= S_IDLE;
++                phase      <= P_CMD;
++                mosi_shift <= 8'h00;
++                miso_shift <= 8'h00;
++                bit_cnt    <= 3'd0;
++                tick_cnt   <= 4'd0;
++                raddr_q    <= 24'd0;
++                cs_n_q     <= 1'b1;
++                oe_q       <= 1'b1;
++                mosi_q     <= 1'b0;
++                sck_active <= 1'b0;
++            end else begin
++                case (state)
++                    // -----------------------------------------------------
++                    S_IDLE: begin
++                        cs_n_q     <= 1'b1;
++                        oe_q       <= 1'b1;
++                        mosi_q     <= 1'b0;
++                        sck_active <= 1'b0;
++                        if (ctrl_fast_read) begin
++                            phase    <= P_CMD;
++                            raddr_q  <= addr_reg;
++                            tick_cnt <= 4'd0;
++                            cs_n_q   <= 1'b0;
++                            oe_q     <= 1'b0;
++                            state    <= S_PRE;
++                        end
++                    end
++
++                    // -----------------------------------------------------
++                    S_PRE: begin
++                        // CS-to-SCK setup: 4 sysclks (80 ns) before
++                        // first SCK rising edge.
++                        if (tick_cnt == 4'd3) begin
++                            tick_cnt   <= 4'd0;
++                            mosi_shift <= 8'h0B;
++                            mosi_q     <= 1'b0;          // MSB of 0x0B = 0
++                            bit_cnt    <= 3'd0;
++                            sck_active <= 1'b1;
++                            state      <= S_SHIFT;
++                        end else tick_cnt <= tick_cnt + 4'd1;
++                    end
++
++                    // -----------------------------------------------------
++                    S_LOAD: begin
++                        // Reload between bytes.  phase has already been
++                        // advanced (in S_SHIFT) by the time we land here.
++                        mosi_shift <= phase_load(phase, addr_reg);
++                        mosi_q     <= phase_load(phase, addr_reg) >> 7;
++                        bit_cnt    <= 3'd0;
++                        sck_active <= 1'b1;
++                        state      <= S_SHIFT;
++                    end
++
++                    // -----------------------------------------------------
++                    S_SHIFT: begin
++                        // Sample MISO mid-high (sample_pulse, cnt==2).
++                        if (sample_pulse) begin
++                            miso_shift <= {miso_shift[6:0], miso_in};
++                        end
++
++                        // Schedule MOSI change / phase advance at
++                        // fall_pulse (cnt==3 → cnt==0 transition is the
++                        // physical SCK falling edge).
++                        if (fall_pulse) begin
++                            if (bit_cnt == 3'd7) begin
++                                // Byte complete.
++                                bit_cnt <= 3'd0;
++                                if (phase == P_DAT) begin
++                                    byte_valid <= 1'b1;
++                                    raddr_q    <= raddr_q + 24'd1;
++                                    sck_active <= 1'b0;
++                                    tick_cnt   <= 4'd0; // settle counter for S_PAUSE
++                                    state      <= S_PAUSE;
++                                end else begin
++                                    phase      <= next_phase(phase);
++                                    sck_active <= 1'b0;
++                                    state      <= S_LOAD;
++                                end
++                            end else begin
++                                bit_cnt    <= bit_cnt + 3'd1;
++                                mosi_shift <= {mosi_shift[6:0], 1'b0};
++                                mosi_q     <= mosi_shift[6];
++                            end
++                        end
++                    end
++
++                    // -----------------------------------------------------
++                    S_PAUSE: begin
++                        // CS held low (cs_n_q already 0); SCK stopped.
++                        // tick_cnt was reset to 0 at entry; let it count
++                        // up so the slot-loader can latch flag_data_valid
++                        // (2 NBA cycles after byte_valid pulses) before
++                        // we sample the resume condition.  3 cycles is
++                        // a safe margin.
++                        if (tick_cnt != 4'd3) tick_cnt <= tick_cnt + 4'd1;
++                        else if (!ctrl_fast_read) begin
++                            state    <= S_TAIL;
++                            tick_cnt <= 4'd0;
++                        end else if (!flag_data_valid) begin
++                            // Slot consumed by firmware → resume next byte.
++                            state <= S_LOAD;
++                        end
++                    end
++
++                    // -----------------------------------------------------
++                    S_TAIL: begin
++                        sck_active <= 1'b0;
++                        cs_n_q     <= 1'b1;
++                        if (tick_cnt == 4'd3) begin
++                            tick_cnt <= 4'd0;
++                            oe_q     <= 1'b1;
++                            state    <= S_IDLE;
++                        end else tick_cnt <= tick_cnt + 4'd1;
++                    end
++
++                    default: state <= S_IDLE;
++                endcase
++            end
++        end
+     end
+-    wire am_byte_event = (am_read_addr != am_read_addr_d);
+ 
+-    // ── Sticky flags + dataout latch ──────────────────────────────────
+-    reg flag_illegal_erase;
+-    reg flag_illegal_write;
+-    reg flag_data_valid;
++    // ── 1-deep dataout slot (NH15 pattern preserved) ──────────────────
++    reg flag_illegal_erase;  // tied to 0 first round
++    reg flag_illegal_write;  // tied to 0 first round
+     reg [7:0] latched_dataout;
+-    reg       dataout_read_req;  // pulsed when firmware reads DATAOUT
+ 
+     always @(posedge clk or negedge rst_n) begin
+         if (!rst_n) begin
+@@ -229,46 +339,10 @@ module wb_altasmi_parallel (
+             flag_data_valid    <= 1'b0;
+             latched_dataout    <= 8'd0;
+         end else begin
+-            if (am_illegal_erase) flag_illegal_erase <= 1'b1;
+-            if (am_illegal_write) flag_illegal_write <= 1'b1;
+-            // NH15 (2026-05-17 night): only load latched_dataout when the
+-            // slot is empty (flag_data_valid=0).  Previous behavior loaded
+-            // on EVERY am_data_valid pulse, so during a FAST_READ the
+-            // megafunction's free-running gen_cntr produced ~Mbyte/s of DV
+-            // pulses that overwrote latched_dataout faster than firmware's
+-            // MMIO polling could consume it — firmware ended up reading a
+-            // non-deterministic byte (whichever happened to be the most
+-            // recent overwrite at the cycle DATAOUT was read).  Root cause
+-            // of Phase C/D non-deterministic-bytes finding (NH14 capture
+-            // 646e1719 — bytes vary per bitstream rebuild AND per intra-
+-            // boot consecutive read).
+-            //
+-            // With this gate, the slot is a 1-deep FIFO: first DV pulse
+-            // captures the byte, subsequent DV pulses are dropped, firmware
+-            // reads DATAOUT to consume (dataout_read_req clears flag), and
+-            // the very next DV pulse can load the next byte.  Paired
+-            // firmware change: ONE CTRL=FAST_READ per byte (relying on
+-            // NH10 auto-terminate after each), with addr incremented per
+-            // byte — Phase E in mode_epcs_probe.
+-            //
+-            // For burst reads (>1 byte per op), the slot's 1-deep depth
+-            // still loses any bytes that arrive while the slot is full —
+-            // intentional, since for multi-byte bursts firmware can't keep
+-            // up anyway.  Phase 9-class redesign would add a wrapper FIFO
+-            // + length counter; out of scope for this iteration.
+-            //
+-            // NH17 (2026-05-17 night session 2): replace am_data_valid
+-            // (level-locked) with am_byte_event (per-byte pulse derived
+-            // from am_read_addr edge detect above).  See block header for
+-            // rationale.  NH16-fw refuted "firmware-side phantom discard"
+-            // because re-latch fires before next real byte under level-
+-            // lock; NH17 RTL fix delays re-latch until next end_read_byte
+-            // event.  Combined with the existing !flag_data_valid gate,
+-            // this gives a per-byte 1-deep FIFO instead of a
+-            // per-DV-pulse 1-deep FIFO.
+-            if (am_byte_event && !flag_data_valid) begin
++            // illegal_* never asserted first round (write path stubbed).
++            if (byte_valid && !flag_data_valid) begin
+                 flag_data_valid <= 1'b1;
+-                latched_dataout <= am_dataout;
++                latched_dataout <= miso_shift;
+             end else if (dataout_read_req) begin
+                 flag_data_valid <= 1'b0;
+             end
+@@ -280,7 +354,7 @@ module wb_altasmi_parallel (
+         end
+     end
+ 
+-    // ── Bus transaction ───────────────────────────────────────────────
++    // ── Wishbone transaction ──────────────────────────────────────────
+     always @(posedge clk or negedge rst_n) begin
+         if (!rst_n) begin
+             xbus_ack         <= 1'b0;
+@@ -298,7 +372,6 @@ module wb_altasmi_parallel (
+             dataout_read_req <= 1'b0;
+         end else begin
+             xbus_ack         <= 1'b0;
+-            // auto-clear pulse bits + read-req strobe
+             ctrl_shift_bytes <= 1'b0;
+             ctrl_wren        <= 1'b0;
+             ctrl_reset       <= 1'b0;
+@@ -331,13 +404,13 @@ module wb_altasmi_parallel (
+                         8'h04: xbus_dat_r <= {8'd0, addr_reg};
+                         8'h08: xbus_dat_r <= {24'd0, datain_reg};
+                         8'h0C: xbus_dat_r <= {28'd0, flag_illegal_write, flag_illegal_erase,
+-                                              flag_data_valid, am_busy};
++                                              flag_data_valid, op_busy};
+                         8'h10: begin
+                             xbus_dat_r       <= {24'd0, latched_dataout};
+                             dataout_read_req <= 1'b1;
+                         end
+-                        8'h14: xbus_dat_r <= {24'd0, am_status_out};
+-                        8'h18: xbus_dat_r <= {8'd0, am_read_addr};
++                        8'h14: xbus_dat_r <= 32'd0;          // ESTAT n/a first round
++                        8'h18: xbus_dat_r <= {8'd0, raddr_q};
+                         default: xbus_dat_r <= 32'd0;
+                     endcase
+                 end
+@@ -345,4 +418,16 @@ module wb_altasmi_parallel (
+         end
+     end
+ 
++    // ── Cycloneive ASMIBLOCK primitive ────────────────────────────────
++    // 5-port single-bit SPI to dedicated AS pins
++    // (cycloneive_atoms.v line 7017).  oe=0 → user logic drives DCLK
++    // / nCSO / ASDO; data0out reads DATA0 (MISO).
++    cycloneive_asmiblock u_asmi (
++        .dclkin   (sck_q),
++        .scein    (cs_n_q),
++        .oe       (oe_q),
++        .sdoin    (mosi_q),
++        .data0out (miso_in)
++    );
++
+ endmodule
+-- 
+2.43.0
+
