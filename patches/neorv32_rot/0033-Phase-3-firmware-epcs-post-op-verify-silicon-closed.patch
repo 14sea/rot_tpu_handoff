@@ -1,0 +1,120 @@
+From b534ef5476a24118a432bea6a5a7692f50a10d20 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 22:04:51 +0100
+Subject: [PATCH] Phase 3 firmware: epcs_program_page + epcs_erase_sector
+ post-op verify
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes residual sector-10/12 + page-0 anomaly from patch 0032.
+
+The post-op 4-byte verify (FAST_READ + comparison) serves a dual role:
+1. Catches deterministic write corruption per-op (-3 error code).
+2. Provides chip-side settling delay between consecutive PP/erase ops
+   — without it, sectors 10 and 12 of 0x80000-base writes program
+   deterministic-but-wrong content despite chip-side WIP=0 and no
+   ILL_* flags.  With it, full 368 KB writes byte-identical.
+
+Empirical path discovered via diagnostic UART trace insertion in
+patches/ working branch — the extra FAST_READ calls between PPs
+happened to provide the needed inter-op gap.  Converted from debug
+form (UART prints) to production form (no prints, -3 error path).
+
+Silicon-validated 2026-05-19:
+- mode_t full path: SD SHA OK → idempotent check detects blank slot
+  (sha=37b56eeb...) → write_image 368011 B → read-back VERIFY OK
+  (sha=6fe90540... matches source).
+- External openFPGALoader spiOverJtag dump byte-identical to source.
+
+Stage2 ELF: 22320 → 22456 B (+136 for verify code).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/epcs.c | 27 +++++++++++++++++++++++++--
+ sw/stage2_loader/epcs.h | 17 ++++++++++++-----
+ 2 files changed, 37 insertions(+), 7 deletions(-)
+
+diff --git a/sw/stage2_loader/epcs.c b/sw/stage2_loader/epcs.c
+index fe9f15d..c5c0f71 100644
+--- a/sw/stage2_loader/epcs.c
++++ b/sw/stage2_loader/epcs.c
+@@ -122,7 +122,18 @@ int epcs_erase_sector(uint32_t addr)
+         wait_busy_clear(1000u);
+         return -1;
+     }
+-    return rc == 0 ? 0 : -2;
++    if (rc != 0) return -2;
++
++    /* Post-erase verify (4-byte sample at sector start).  Also serves
++     * as settling delay before the next op — without this gap the next
++     * page program's first byte_valid pulse races with chip-side state
++     * recovery, producing deterministic but wrong content on certain
++     * sector pairs (empirically sectors 10 and 12 in 0x80000-base
++     * writes; silicon-validated 2026-05-19). */
++    uint8_t verify[4];
++    epcs_fast_read(addr, 4, verify);
++    for (int i = 0; i < 4; i++) if (verify[i] != 0xFFu) return -3;
++    return 0;
+ }
+ 
+ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+@@ -182,7 +193,19 @@ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+         wait_busy_clear(1000u);
+         return -1;
+     }
+-    return rc == 0 ? 0 : -2;
++    if (rc != 0) return -2;
++
++    /* Post-PP verify (4-byte sample at page start).  Like the post-
++     * erase verify, this catches deterministic write corruption
++     * empirically observed at scale + provides chip-side settling
++     * delay before the next op (without it, sectors 10 and 12 of
++     * 0x80000-base writes program garbage despite chip-side WIP=0;
++     * with it, full 368 KB writes byte-identical to src). */
++    uint8_t verify[4];
++    uint32_t n = len < 4 ? len : 4;
++    epcs_fast_read(addr, n, verify);
++    for (uint32_t i = 0; i < n; i++) if (verify[i] != buf[i]) return -3;
++    return 0;
+ }
+ 
+ int epcs_write_image(uint32_t base, const uint8_t *src, uint32_t len)
+diff --git a/sw/stage2_loader/epcs.h b/sw/stage2_loader/epcs.h
+index 2757811..daeb04b 100644
+--- a/sw/stage2_loader/epcs.h
++++ b/sw/stage2_loader/epcs.h
+@@ -62,9 +62,10 @@ uint8_t epcs_read_status(void);
+ 
+ /*
+  * Erase the 64 KB sector containing addr.  Issues WREN, SEC_ERASE
+- * (opcode 0xD8 + 24-bit addr), then polls WIP until clear (tSE max
+- * ~3 s per EPCS16 spec).  Returns 0 on success, -1 on illegal_erase
+- * sticky, -2 on WIP-poll timeout.
++ * (opcode 0xD8 + 24-bit addr), polls WIP until clear (tSE max ~3 s
++ * per EPCS16 spec), then 4-byte verifies the sector start is 0xff.
++ * Returns 0 on success, -1 on illegal_erase sticky, -2 on WIP-poll
++ * timeout, -3 on post-erase verify mismatch.
+  */
+ int epcs_erase_sector(uint32_t addr);
+ 
+@@ -72,8 +73,14 @@ int epcs_erase_sector(uint32_t addr);
+  * Program up to len bytes (≤ EPCS_PAGE_SIZE) starting at addr.  Caller
+  * must ensure (addr & ~(EPCS_PAGE_SIZE-1)) + len-1 stays within the
+  * page (the flash wraps within the page silently, which would corrupt
+- * data).  Returns 0 on success, -1 on illegal_write sticky, -2 on
+- * WIP-poll or DV timeout.
++ * data).  After programming, 4-byte readback verifies the page start
++ * matches buf.  Returns 0 on success, -1 on illegal_write sticky, -2
++ * on WIP-poll or DV timeout, -3 on post-PP verify mismatch.
++ *
++ * Note: the post-PP verify also serves as required chip-side settling
++ * delay before the next op.  Without it, certain sector pairs (sectors
++ * 10 and 12 of 0x80000-base writes) deterministically program wrong
++ * content despite WIP=0 — silicon-validated 2026-05-19.
+  */
+ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf);
+ 
+-- 
+2.43.0
+
