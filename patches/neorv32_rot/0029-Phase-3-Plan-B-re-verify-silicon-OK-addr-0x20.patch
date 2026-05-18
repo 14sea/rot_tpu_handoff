@@ -1,0 +1,84 @@
+From 3d1db2c8684c5df2db6a0f9297f3749612876951 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 20:08:43 +0100
+Subject: [PATCH] Phase 3 Plan B re-verify: silicon-OK confirmed at addr 0x20+
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Modified mode_epcs_probe Phase E to read addr 0x20..0x2F instead of
+0..3, motivated by EPCS dump revealing flash bytes 0..0x1F are all
+0xff (factory ALINX bitstream header padding).
+
+HW result: 16/16 byte-IDENTICAL match between Plan B v3 silicon reads
+and EPCS backup dump:
+  addr  Plan B  Backup
+  0x20  0x56    0x56
+  0x21  0xef    0xef
+  0x22  0xef    0xef
+  0x23  0xef    0xef
+  0x24  0xef    0xef
+  0x25  0xef    0xef
+  0x26  0xef    0xef
+  0x27  0xcf    0xcf
+  0x28  0xdf    0xdf
+  0x29  0xdf    0xdf
+  0x2a  0x9f    0x9f
+  0x2b  0xdf    0xdf
+  0x2c  0x9f    0x9f
+  0x2d  0x8f    0x8f
+  0x2e  0x9f    0x9f
+  0x2f  0x9f    0x9f
+
+Phase 3 content-read FULLY SILICON-CLOSED via Plan B v3.
+
+Retracts: prior 'Plan B v1+v2+v3 silicon-refuted' verdict from
+commits 47dbf38 / 5be1bab / f0c9574 / 7813eb2 (orchestrator) +
+d9f6d24 / b4a3ab2 / 58a205d (neorv32_rot).  The 'all 0xff at every
+address' observation was a VALIDATION LOGIC ERROR: all addresses
+tested in Phase C/D/E/F captures (addr 0..0x10 + 0x100000) happen
+to be in EPCS-blank regions where the real flash content IS 0xff.
+The wrapper was returning correct content all along.
+
+Info 17011 'WYSIWYG SPI primitive converted to equivalent logic' is
+BENIGN — normal Quartus synthesis note for asmiblock cells, does
+NOT indicate broken silicon pin routing.  Pin map fit.rpt H1/D2/C1/H2
+→ u_asmi~ALTERA_DCLK/SCE/SDO/DATA0 is the load-bearing evidence;
+that was correct in v1+v2+v3 and silicon-confirmed now.
+
+Bitstream md5 85e21f659c0fb5613b1d738e3808e1c6 (same wb_altasmi_parallel
+RTL as v3, only firmware changed).  Stage2 ELF 18564 B (was 18568,
+slight delta from reading 16 addrs vs 4 in loop).  Capture
+docs/captures/diag_phase3_planB_v3_silicon_OK_addr20.log.
+---
+ sw/stage2_loader/main.c | 14 ++++++++++----
+ 1 file changed, 10 insertions(+), 4 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index ce495d2..3a9587d 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -766,10 +766,16 @@ static void mode_epcs_probe(void)
+      *     the megafunction streams during firmware's MMIO setup overhead
+      *     for steps 4-6
+      * ================================================================= */
+-    uart_puts("[P] --- Phase E: NH15 one-byte-per-op @0 ---\r\n");
+-
+-    for (uint32_t i = 0; i < 4u; i++) {
+-        uint32_t a = i;
++    /* Plan B reverify 2026-05-18: read addr 0x20..0x2F instead of 0..3.
++     * EPCS dump revealed flash bytes 0..0x1F are all 0xff (factory ALINX
++     * bitstream header padding) — so prior "Plan B all 0xff" runs could
++     * not distinguish (a) wrapper-silicon-broken from (b) wrapper-OK
++     * reading real blank bytes.  At 0x20+ the bitstream has real content
++     * (dump byte 0x20 = 0x56 0xef 0xef 0xef ...), so this distinguishes. */
++    uart_puts("[P] --- Phase E: Plan B reverify @0x20 ---\r\n");
++
++    for (uint32_t i = 0; i < 16u; i++) {
++        uint32_t a = 0x20u + i;
+ 
+         /* Step 1: reset + delay (NH13 stretcher = 16 sysclk; 32 sw_iters
+          * is comfortably more than that). */
+-- 
+2.43.0
+
