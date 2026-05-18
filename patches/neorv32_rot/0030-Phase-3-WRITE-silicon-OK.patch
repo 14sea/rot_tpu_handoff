@@ -1,0 +1,709 @@
+From 0a8ce2eee9f2f3c199a100e338c03e286089836d Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 20:23:26 +0100
+Subject: [PATCH] Phase 3 WRITE: WREN + RDSR + SEC_ERASE + PAGE_PROGRAM
+ silicon-validated
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Extends Plan B FSM (wb_altasmi_parallel.v) with full write/erase
+opcode support.  Adds firmware Phase G/H/I to mode_epcs_probe for
+silicon validation.
+
+RTL changes:
+- op_kind register (3-bit): OP_FAST_READ / OP_RDSR / OP_WREN /
+  OP_SEC_ERASE / OP_WRITE
+- phase_load function extended with op_kind + datain_reg inputs:
+  CMD byte picks 0x0B / 0x05 / 0x06 / 0xD8 / 0x02 from op_kind;
+  DAT byte returns datain_reg in OP_WRITE, 0x00 otherwise.
+- S_IDLE op-decode priority: fast_read > write > sec_erase >
+  rd_status > wren.
+- S_SHIFT bit_cnt==7 branch op-kind-aware:
+    WREN     : CMD only → TAIL
+    RDSR     : CMD → DAT (1 byte) → TAIL
+    SEC_ERASE: CMD → A2 → A1 → A0 → TAIL (CS-high triggers erase)
+    WRITE    : CMD → A2 → A1 → A0 → DAT loop with S_PAUSE
+    FAST_READ: CMD → A2 → A1 → A0 → DUM → DAT loop (unchanged)
+- S_PAUSE resume condition op-kind-aware:
+    FAST_READ: !ctrl_fast_read → TAIL; !flag_data_valid → LOAD
+    WRITE    : !ctrl_write → TAIL; ctrl_shift_bytes → LOAD
+- flag_data_valid clear path extended: dataout_read_req
+  (read-consume) OR ctrl_shift_bytes (write-advance).
+- CTRL.b2 (sec_erase), b3 (rd_status) reclassified as PULSE bits
+  (auto-clear).  CTRL.b1 (write), b8 (fast_read) remain LEVEL.
+
+Firmware additions (mode_epcs_probe):
+- Phase G: WREN + RDSR cycle.  Validates WREN sets WEL bit, RDSR
+  reads chip status.
+- Phase H: SEC_ERASE @0x100000 (slot 1, blank per safety backup).
+  Validates erase op + WIP-poll loop.
+- Phase I: PAGE_PROGRAM @0x100000 with pattern DEADBEEFCAFEBABE.
+  Pulses SHIFT_BYTES + refills DATAIN per byte.  Readback via
+  FAST_READ + compare.
+
+Silicon results (capture
+docs/captures/diag_phase3_write_silicon_OK.log):
+- Phase G: WEL bit transitions 0→1 after WREN as expected.
+- Phase H: WIP-poll completed in 14807 iterations (~150 ms,
+  within EPCS16/M25P16 tSE spec).
+- Phase I: 8/8 byte-IDENTICAL match on readback.
+- External cross-verify: openFPGALoader --dump-flash -o 0x100000
+  returns 'de ad be ef ca fe ba be' confirming bytes are persisted
+  in EPCS silicon, not just wrapper cache.
+
+Resource:
+- LE 8745/10320 (85 %, +63 vs Plan B v3 read-only 8682)
+- ASMI block 1/1 (100 %)
+- Setup slack -0.819 ns (improved from -1.160 ns)
+- Info 17011 benign synthesis note (known harmless per
+  2026-05-18 reverify)
+
+Bitstream md5 320d755755c4335929f154f87fd32409.
+Stage2 ELF 20416 B (+1852 B for Phase G/H/I).
+
+Phase 3 FULLY SILICON-CLOSED.  Read + write + erase + status all
+validated.  Path forward for mode 'g' EPCS persistence + Phase 9
+slot rotation is unblocked.
+---
+ rtl/wb_altasmi_parallel.v | 255 +++++++++++++++++++++++++++++--------
+ sw/stage2_loader/main.c   | 256 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 458 insertions(+), 53 deletions(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index c43c2d4..7e498db 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -28,19 +28,26 @@
+ // Base: 0xF2000000.  1 MB decode window (xbus_adr[31:20] == 12'hF20).
+ //
+ // Register map (unchanged from the megafunction wrapper):
+-//   0x00  CTRL    (W)  b1=write (level — IGNORED first round)
+-//                      b2=sector_erase (level — IGNORED first round)
+-//                      b3=read_status  (level — IGNORED first round; returns 0)
+-//                      b4=shift_bytes  (1-cycle pulse — IGNORED; reads
+-//                                        are now SCK-paced internally)
+-//                      b5=wren         (1-cycle pulse — IGNORED first round)
+-//                      b6=reset        (1-cycle pulse — aborts current op,
++//   0x00  CTRL    (W)  b1=write        (LEVEL — starts/sustains page-
++//                                        program op; clear to end op
++//                                        (CS-high triggers chip's PP latch))
++//                      b2=sector_erase (1-cycle PULSE — 0xD8 + 24-bit
++//                                        addr; chip starts erase on CS-high)
++//                      b3=read_status  (1-cycle PULSE — 0x05 RDSR; result
++//                                        lands in DATAOUT with STATUS.b1=1)
++//                      b4=shift_bytes  (1-cycle PULSE — write-side
++//                                        "advance to next byte"; firmware
++//                                        refills DATAIN then pulses to
++//                                        resume the wrapper from S_PAUSE)
++//                      b5=wren         (1-cycle PULSE — 0x06 write-enable;
++//                                        must precede write / erase)
++//                      b6=reset        (1-cycle PULSE — aborts current op,
+ //                                        clears sticky flags + dataout slot)
+-//                      b7=rden_drop    (1-cycle pulse — IGNORED; CTRL=0
+-//                                        is now the canonical termination)
+-//                      b8=fast_read    (level — starts a FAST_READ op;
+-//                                        clearing it terminates the op
+-//                                        per NH10 auto-terminate semantics)
++//                      b7=rden_drop    (1-cycle PULSE — IGNORED in Plan B;
++//                                        CTRL=0 is the canonical READ
++//                                        termination per NH10 semantics)
++//                      b8=fast_read    (LEVEL — starts/sustains a
++//                                        FAST_READ op; clear to end)
+ //                  (R)  reads back the level bits in matching positions
+ //   0x04  ADDR    (R/W) [23:0]   24-bit byte address for FAST_READ
+ //   0x08  DATAIN  (R/W) [7:0]    write-data scratch (IGNORED first round)
+@@ -140,8 +147,17 @@ module wb_altasmi_parallel (
+         P_DUM = 3'd4,
+         P_DAT = 3'd5;
+ 
++    // 2026-05-18 Phase 3 WRITE extension: opcode kind register
++    localparam [2:0]
++        OP_FAST_READ = 3'd0,  // 0x0B + addr + dummy + data (read loop)
++        OP_RDSR      = 3'd1,  // 0x05 + 1 data byte (status register)
++        OP_WREN      = 3'd2,  // 0x06 alone (sets write-enable latch)
++        OP_SEC_ERASE = 3'd3,  // 0xD8 + addr (chip erases sector on CS rising)
++        OP_WRITE     = 3'd4;  // 0x02 + addr + N data bytes (page program)
++
+     reg [2:0] state;
+     reg [2:0] phase;
++    reg [2:0] op_kind;
+     reg [7:0] mosi_shift;
+     reg [7:0] miso_shift;
+     reg [2:0] bit_cnt;
+@@ -151,29 +167,32 @@ module wb_altasmi_parallel (
+ 
+     wire op_busy = (state != S_IDLE);
+ 
+-    function [2:0] next_phase;
+-        input [2:0] cur;
+-        case (cur)
+-            P_CMD: next_phase = P_A2;
+-            P_A2:  next_phase = P_A1;
+-            P_A1:  next_phase = P_A0;
+-            P_A0:  next_phase = P_DUM;
+-            P_DUM: next_phase = P_DAT;
+-            P_DAT: next_phase = P_DAT;
+-            default: next_phase = P_DAT;
+-        endcase
+-    endfunction
+-
++    // phase_load: opcode/addr/dummy/data byte to put on MOSI for the
++    // current phase.  op_kind selects between read/RDSR/WREN/erase/write
++    // opcodes.  For P_DAT in OP_WRITE, returns datain_reg (firmware-
++    // supplied write byte); otherwise returns 0x00 (don't-care for MOSI
++    // during read data shift).
+     function [7:0] phase_load;
+         input [2:0] p;
++        input [2:0] k;
+         input [23:0] a;
++        input [7:0]  din;
+         case (p)
+-            P_CMD: phase_load = 8'h0B;
++            P_CMD: begin
++                case (k)
++                    OP_FAST_READ: phase_load = 8'h0B;
++                    OP_RDSR:      phase_load = 8'h05;
++                    OP_WREN:      phase_load = 8'h06;
++                    OP_SEC_ERASE: phase_load = 8'hD8;
++                    OP_WRITE:     phase_load = 8'h02;
++                    default:      phase_load = 8'h00;
++                endcase
++            end
+             P_A2:  phase_load = a[23:16];
+             P_A1:  phase_load = a[15:8];
+             P_A0:  phase_load = a[7:0];
+             P_DUM: phase_load = 8'h00;
+-            P_DAT: phase_load = 8'h00;
++            P_DAT: phase_load = (k == OP_WRITE) ? din : 8'h00;
+             default: phase_load = 8'h00;
+         endcase
+     endfunction
+@@ -209,6 +228,7 @@ module wb_altasmi_parallel (
+         if (!rst_n) begin
+             state       <= S_IDLE;
+             phase       <= P_CMD;
++            op_kind     <= OP_FAST_READ;
+             mosi_shift  <= 8'h00;
+             miso_shift  <= 8'h00;
+             bit_cnt     <= 3'd0;
+@@ -224,6 +244,7 @@ module wb_altasmi_parallel (
+             if (ctrl_reset) begin
+                 state      <= S_IDLE;
+                 phase      <= P_CMD;
++                op_kind    <= OP_FAST_READ;
+                 mosi_shift <= 8'h00;
+                 miso_shift <= 8'h00;
+                 bit_cnt    <= 3'd0;
+@@ -239,23 +260,61 @@ module wb_altasmi_parallel (
+                         cs_n_q     <= 1'b1;
+                         mosi_q     <= 1'b0;
+                         sck_active <= 1'b0;
++                        // Op-kind decode (priority order): fast_read >
++                        // write > sec_erase > rd_status > wren.
++                        // CTRL bits: b8=fast_read level, b1=write level,
++                        // b2=sec_erase level, b3=rd_status level,
++                        // b5=wren pulse.  Pulse bits auto-clear after
++                        // one MMIO cycle; the FSM latches op_kind at
++                        // S_PRE entry so the op runs to completion even
++                        // after b5 self-clears.
+                         if (ctrl_fast_read) begin
++                            op_kind  <= OP_FAST_READ;
++                            phase    <= P_CMD;
++                            raddr_q  <= addr_reg;
++                            tick_cnt <= 4'd0;
++                            cs_n_q   <= 1'b0;
++                            state    <= S_PRE;
++                        end else if (ctrl_write) begin
++                            op_kind  <= OP_WRITE;
++                            phase    <= P_CMD;
++                            raddr_q  <= addr_reg;
++                            tick_cnt <= 4'd0;
++                            cs_n_q   <= 1'b0;
++                            state    <= S_PRE;
++                        end else if (ctrl_sec_erase) begin
++                            op_kind  <= OP_SEC_ERASE;
+                             phase    <= P_CMD;
+                             raddr_q  <= addr_reg;
+                             tick_cnt <= 4'd0;
+                             cs_n_q   <= 1'b0;
+                             state    <= S_PRE;
++                        end else if (ctrl_rd_status) begin
++                            op_kind  <= OP_RDSR;
++                            phase    <= P_CMD;
++                            raddr_q  <= 24'd0;
++                            tick_cnt <= 4'd0;
++                            cs_n_q   <= 1'b0;
++                            state    <= S_PRE;
++                        end else if (ctrl_wren) begin
++                            op_kind  <= OP_WREN;
++                            phase    <= P_CMD;
++                            raddr_q  <= 24'd0;
++                            tick_cnt <= 4'd0;
++                            cs_n_q   <= 1'b0;
++                            state    <= S_PRE;
+                         end
+                     end
+ 
+                     // -----------------------------------------------------
+                     S_PRE: begin
+                         // CS-to-SCK setup: 4 sysclks (80 ns) before
+-                        // first SCK rising edge.
++                        // first SCK rising edge.  Load CMD byte based
++                        // on the latched op_kind.
+                         if (tick_cnt == 4'd3) begin
+                             tick_cnt   <= 4'd0;
+-                            mosi_shift <= 8'h0B;
+-                            mosi_q     <= 1'b0;          // MSB of 0x0B = 0
++                            mosi_shift <= phase_load(P_CMD, op_kind, addr_reg, datain_reg);
++                            mosi_q     <= phase_load(P_CMD, op_kind, addr_reg, datain_reg) >> 7;
+                             bit_cnt    <= 3'd0;
+                             sck_active <= 1'b1;
+                             state      <= S_SHIFT;
+@@ -266,8 +325,8 @@ module wb_altasmi_parallel (
+                     S_LOAD: begin
+                         // Reload between bytes.  phase has already been
+                         // advanced (in S_SHIFT) by the time we land here.
+-                        mosi_shift <= phase_load(phase, addr_reg);
+-                        mosi_q     <= phase_load(phase, addr_reg) >> 7;
++                        mosi_shift <= phase_load(phase, op_kind, addr_reg, datain_reg);
++                        mosi_q     <= phase_load(phase, op_kind, addr_reg, datain_reg) >> 7;
+                         bit_cnt    <= 3'd0;
+                         sck_active <= 1'b1;
+                         state      <= S_SHIFT;
+@@ -285,19 +344,67 @@ module wb_altasmi_parallel (
+                         // physical SCK falling edge).
+                         if (fall_pulse) begin
+                             if (bit_cnt == 3'd7) begin
+-                                // Byte complete.
+-                                bit_cnt <= 3'd0;
+-                                if (phase == P_DAT) begin
+-                                    byte_valid <= 1'b1;
+-                                    raddr_q    <= raddr_q + 24'd1;
+-                                    sck_active <= 1'b0;
+-                                    tick_cnt   <= 4'd0; // settle counter for S_PAUSE
+-                                    state      <= S_PAUSE;
+-                                end else begin
+-                                    phase      <= next_phase(phase);
+-                                    sck_active <= 1'b0;
+-                                    state      <= S_LOAD;
+-                                end
++                                // Byte complete.  Op-kind-aware phase
++                                // advance:
++                                //   WREN     : CMD only → TAIL after
++                                //   RDSR     : CMD → DAT (1 byte) → TAIL
++                                //   FAST_READ: CMD → A2 → A1 → A0 → DUM → DAT loop
++                                //   SEC_ERASE: CMD → A2 → A1 → A0 → TAIL
++                                //   WRITE    : CMD → A2 → A1 → A0 → DAT loop
++                                bit_cnt    <= 3'd0;
++                                sck_active <= 1'b0;
++                                case (phase)
++                                    P_CMD: begin
++                                        if (op_kind == OP_WREN) begin
++                                            tick_cnt <= 4'd0;
++                                            state    <= S_TAIL;
++                                        end else if (op_kind == OP_RDSR) begin
++                                            phase <= P_DAT;
++                                            state <= S_LOAD;
++                                        end else begin
++                                            phase <= P_A2;
++                                            state <= S_LOAD;
++                                        end
++                                    end
++                                    P_A2: begin
++                                        phase <= P_A1;
++                                        state <= S_LOAD;
++                                    end
++                                    P_A1: begin
++                                        phase <= P_A0;
++                                        state <= S_LOAD;
++                                    end
++                                    P_A0: begin
++                                        if (op_kind == OP_FAST_READ) begin
++                                            phase <= P_DUM;
++                                            state <= S_LOAD;
++                                        end else if (op_kind == OP_SEC_ERASE) begin
++                                            tick_cnt <= 4'd0;
++                                            state    <= S_TAIL;
++                                        end else begin // OP_WRITE
++                                            phase <= P_DAT;
++                                            state <= S_LOAD;
++                                        end
++                                    end
++                                    P_DUM: begin
++                                        phase <= P_DAT;
++                                        state <= S_LOAD;
++                                    end
++                                    P_DAT: begin
++                                        byte_valid <= 1'b1;
++                                        raddr_q    <= raddr_q + 24'd1;
++                                        if (op_kind == OP_RDSR) begin
++                                            // single-byte read; chip
++                                            // releases on CS rising
++                                            tick_cnt <= 4'd0;
++                                            state    <= S_TAIL;
++                                        end else begin
++                                            tick_cnt <= 4'd0;
++                                            state    <= S_PAUSE;
++                                        end
++                                    end
++                                    default: state <= S_TAIL;
++                                endcase
+                             end else begin
+                                 bit_cnt    <= bit_cnt + 3'd1;
+                                 mosi_shift <= {mosi_shift[6:0], 1'b0};
+@@ -314,13 +421,29 @@ module wb_altasmi_parallel (
+                         // (2 NBA cycles after byte_valid pulses) before
+                         // we sample the resume condition.  3 cycles is
+                         // a safe margin.
++                        //
++                        // OP_FAST_READ resume condition: !flag_data_valid
++                        //   (firmware consumed last byte via DATAOUT read)
++                        // OP_WRITE resume condition: ctrl_shift_bytes
++                        //   pulse — firmware refilled DATAIN and asked for
++                        //   next byte to be shifted.
++                        // End condition (both kinds): firmware clears the
++                        //   level CTRL bit (fast_read / write) → TAIL.
+                         if (tick_cnt != 4'd3) tick_cnt <= tick_cnt + 4'd1;
+-                        else if (!ctrl_fast_read) begin
+-                            state    <= S_TAIL;
+-                            tick_cnt <= 4'd0;
+-                        end else if (!flag_data_valid) begin
+-                            // Slot consumed by firmware → resume next byte.
+-                            state <= S_LOAD;
++                        else if (op_kind == OP_FAST_READ) begin
++                            if (!ctrl_fast_read) begin
++                                state    <= S_TAIL;
++                                tick_cnt <= 4'd0;
++                            end else if (!flag_data_valid) begin
++                                state <= S_LOAD;
++                            end
++                        end else begin // OP_WRITE
++                            if (!ctrl_write) begin
++                                state    <= S_TAIL;
++                                tick_cnt <= 4'd0;
++                            end else if (ctrl_shift_bytes) begin
++                                state <= S_LOAD;
++                            end
+                         end
+                     end
+ 
+@@ -352,11 +475,26 @@ module wb_altasmi_parallel (
+             flag_data_valid    <= 1'b0;
+             latched_dataout    <= 8'd0;
+         end else begin
+-            // illegal_* never asserted first round (write path stubbed).
++            // illegal_* never asserted first round (write path doesn't
++            // surface chip-side write protection in this wrapper).  Kept
++            // as MMIO-visible regs for forward-compat.
++            //
++            // flag_data_valid carries dual semantics depending on op_kind:
++            //   OP_FAST_READ / OP_RDSR: latched_dataout holds a byte the
++            //     firmware should consume by reading DATAOUT (clears via
++            //     dataout_read_req strobe).
++            //   OP_WRITE: latched_dataout is unused; flag means "wrapper
++            //     paused awaiting next DATAIN+shift_bytes pulse" (clears
++            //     via ctrl_shift_bytes pulse so firmware can refill
++            //     DATAIN and signal resume).
++            // The slot-load on byte_valid is shared: in OP_WRITE,
++            // miso_shift contains chip-driven bits during write data
++            // shift which are don't-care (typically 0xff floating).
++            // Latching them anyway is harmless.
+             if (byte_valid && !flag_data_valid) begin
+                 flag_data_valid <= 1'b1;
+                 latched_dataout <= miso_shift;
+-            end else if (dataout_read_req) begin
++            end else if (dataout_read_req || ctrl_shift_bytes) begin
+                 flag_data_valid <= 1'b0;
+             end
+             if (ctrl_reset) begin
+@@ -385,8 +523,19 @@ module wb_altasmi_parallel (
+             dataout_read_req <= 1'b0;
+         end else begin
+             xbus_ack         <= 1'b0;
++            // Pulse-style auto-clear: these CTRL bits go back to 0 every
++            // cycle unless re-asserted by an MMIO write.  The FSM
++            // latches op_kind at S_PRE entry so the operation runs to
++            // completion even after the pulse self-clears.
++            //   wren / sec_erase / rd_status : 1-shot ops
++            //   shift_bytes : write-side "advance to next byte" trigger
++            //   reset / rden_drop : misc.
++            // CTRL.b1 (write) and CTRL.b8 (fast_read) remain LEVEL — the
++            // firmware drops them to end the multi-byte op.
+             ctrl_shift_bytes <= 1'b0;
+             ctrl_wren        <= 1'b0;
++            ctrl_sec_erase   <= 1'b0;
++            ctrl_rd_status   <= 1'b0;
+             ctrl_reset       <= 1'b0;
+             ctrl_rden_drop   <= 1'b0;
+             dataout_read_req <= 1'b0;
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 3a9587d..a9c0da8 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -933,6 +933,262 @@ static void mode_epcs_probe(void)
+         }
+     }
+ 
++    /* =================================================================
++     * Phase G — WREN + RDSR cycle (Plan B write extension, 2026-05-18)
++     *
++     * Non-destructive validation of the new opcode paths:
++     *   1. RDSR initial — expect WIP=0, WEL=0 (chip idle, write disabled)
++     *   2. WREN pulse  — sends 0x06, sets chip's WEL latch
++     *   3. RDSR again  — expect WIP=0, WEL=1 (write now enabled but no op
++     *                    has triggered the latch to consume)
++     *
++     * Wrapper CTRL semantics:
++     *   b3 (RD_STATUS) is now a PULSE (auto-clear after one MMIO cycle).
++     *     FSM enters S_PRE, sends 0x05 + 1 byte read, latches result in
++     *     DATAOUT.  Firmware reads DATAOUT to consume.
++     *   b5 (WREN) is a PULSE.  FSM enters S_PRE, sends 0x06 only, no
++     *     data.  Wrapper returns to IDLE.  No DATAOUT update.
++     * ================================================================= */
++    #define DC_WREN        (1u << 5)
++    #define DC_SEC_ERASE   (1u << 2)
++    #define DC_WRITE       (1u << 1)
++
++    uart_puts("[P] --- Phase G: WREN + RDSR cycle ---\r\n");
++
++    /* G1: initial RDSR */
++    *DP_CTRL = DC_RD_STATUS;
++    {
++        uint32_t s = 0; uint32_t wi;
++        for (wi = 0; wi < 100000u; wi++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++        uart_puts("[P] G1 initial RDSR wi=");
++        uart_puthex32(wi);
++        if (s & 0x2u) {
++            uint32_t sr = *DP_DATAOUT;
++            uart_puts(" RDSR=");
++            uart_puthex32(sr);
++            uart_puts(" (WIP=");
++            uart_puthex32(sr & 1u);
++            uart_puts(" WEL=");
++            uart_puthex32((sr >> 1) & 1u);
++            uart_puts(")\r\n");
++        } else {
++            uart_puts(" TIMEOUT\r\n");
++        }
++        for (wi = 0; wi < 1000u; wi++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++    }
++
++    /* G2: WREN pulse */
++    *DP_CTRL = DC_WREN;
++    {
++        uint32_t wi;
++        for (wi = 0; wi < 10000u; wi++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++        uart_puts("[P] G2 WREN done busy_wait_wi=");
++        uart_puthex32(wi);
++        uart_puts("\r\n");
++    }
++
++    /* G3: RDSR after WREN — expect WEL=1 */
++    *DP_CTRL = DC_RD_STATUS;
++    {
++        uint32_t s = 0; uint32_t wi;
++        for (wi = 0; wi < 100000u; wi++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++        uart_puts("[P] G3 RDSR_after_WREN wi=");
++        uart_puthex32(wi);
++        if (s & 0x2u) {
++            uint32_t sr = *DP_DATAOUT;
++            uart_puts(" RDSR=");
++            uart_puthex32(sr);
++            uart_puts(" (WIP=");
++            uart_puthex32(sr & 1u);
++            uart_puts(" WEL=");
++            uart_puthex32((sr >> 1) & 1u);
++            uart_puts(")\r\n");
++        } else {
++            uart_puts(" TIMEOUT\r\n");
++        }
++        for (wi = 0; wi < 1000u; wi++) {
++            if (!(*DP_STATUS & 0x1u)) break;
++        }
++    }
++
++    /* =================================================================
++     * Phase H — SECTOR ERASE @0x100000 (slot 1, blank per EPCS dump
++     * 2026-05-18 safety backup; erasing a blank sector is idempotent
++     * but exercises the chip's erase path + WIP signaling).
++     *
++     * Sequence:
++     *   1. WREN
++     *   2. SEC_ERASE addr=0x100000 (pulse; opcode 0xD8 + 24-bit addr)
++     *   3. RDSR busy-poll loop with timeout (tSE max 150 ms; at ~5 µs
++     *      per RDSR cycle and 100k iter limit, ~500 ms timeout budget)
++     *   4. Final RDSR — expect WIP=0, WEL=0 (chip auto-clears WEL after
++     *      successful erase)
++     * ================================================================= */
++    uart_puts("[P] --- Phase H: SECTOR ERASE @0x100000 ---\r\n");
++
++    /* H1: WREN */
++    *DP_CTRL = DC_WREN;
++    { uint32_t wi; for (wi = 0; wi < 10000u; wi++) if (!(*DP_STATUS & 0x1u)) break; }
++
++    /* H2: SEC_ERASE */
++    *DP_ADDR = 0x00100000u;
++    *DP_CTRL = DC_SEC_ERASE;
++    { uint32_t wi; for (wi = 0; wi < 10000u; wi++) if (!(*DP_STATUS & 0x1u)) break;
++      uart_puts("[P] H2 SEC_ERASE sent busy_wait_wi=");
++      uart_puthex32(wi);
++      uart_puts("\r\n");
++    }
++
++    /* H3: poll WIP until clear (or timeout). Each iteration: RDSR pulse,
++     * wait DV, read SR, check WIP. */
++    {
++        uint32_t iter;
++        uint32_t last_sr = 0xFFu;
++        for (iter = 0; iter < 200000u; iter++) {
++            *DP_CTRL = DC_RD_STATUS;
++            uint32_t s = 0; uint32_t wi;
++            for (wi = 0; wi < 1000u; wi++) { s = *DP_STATUS; if (s & 0x2u) break; }
++            if (!(s & 0x2u)) { last_sr = 0xFEu; break; } /* poll timeout */
++            last_sr = *DP_DATAOUT;
++            for (wi = 0; wi < 100u; wi++) if (!(*DP_STATUS & 0x1u)) break;
++            if (!(last_sr & 0x1u)) break;
++            /* small spacing between RDSR cycles */
++            for (volatile int d = 0; d < 64; d++) {}
++        }
++        uart_puts("[P] H3 WIP-poll iter=");
++        uart_puthex32(iter);
++        uart_puts(" final_RDSR=");
++        uart_puthex32(last_sr);
++        uart_puts("\r\n");
++    }
++
++    /* =================================================================
++     * Phase I — PAGE PROGRAM @0x100000 (pattern: DE AD BE EF CA FE BA BE)
++     * + readback verify via FAST_READ.
++     *
++     * Sequence:
++     *   1. WREN
++     *   2. ADDR := 0x100000, DATAIN := 0xDE, CTRL := WRITE (level set)
++     *   3. Wait STATUS.b1=1 (wrapper paused after byte 0)
++     *   4. DATAIN := byte_i, pulse SHIFT_BYTES, wait STATUS.b1=1
++     *   5. Repeat for bytes 1..7
++     *   6. CTRL := 0 (drop write level → wrapper CS-high → chip PP)
++     *   7. WIP-poll RDSR loop until clear
++     *   8. FAST_READ @0x100000, byte 0..7, compare to pattern
++     * ================================================================= */
++    static const uint8_t pat[8] = {0xDE,0xAD,0xBE,0xEF,0xCA,0xFE,0xBA,0xBE};
++    uart_puts("[P] --- Phase I: PAGE PROGRAM @0x100000 pattern DEADBEEFCAFEBABE ---\r\n");
++
++    /* I1: WREN */
++    *DP_CTRL = DC_WREN;
++    { uint32_t wi; for (wi = 0; wi < 10000u; wi++) if (!(*DP_STATUS & 0x1u)) break; }
++
++    /* I2: addr + first byte + WRITE level */
++    #define DP_DATAIN ((volatile uint32_t *)(DP_BASE + 0x08))
++    *DP_ADDR   = 0x00100000u;
++    *DP_DATAIN = pat[0];
++    *DP_CTRL   = DC_WRITE;
++
++    /* I3: wait for STATUS.b1=1 (wrapper paused; ready for next byte) */
++    {
++        uint32_t i;
++        uint32_t s = 0, wi;
++        for (i = 1; i < 8u; i++) {
++            for (wi = 0; wi < 1000000u; wi++) {
++                s = *DP_STATUS;
++                if (s & 0x2u) break;
++            }
++            uart_puts("[P] I3 byte=");
++            uart_puthex32(i - 1u);
++            uart_puts(" wait_ready wi=");
++            uart_puthex32(wi);
++            uart_puts(" STATUS=");
++            uart_puthex32(s);
++            uart_puts("\r\n");
++            if (!(s & 0x2u)) goto i3_fail;
++            /* refill DATAIN for next byte + pulse SHIFT_BYTES (clears flag) */
++            *DP_DATAIN = pat[i];
++            *DP_CTRL = DC_WRITE | DC_SHIFT_BYTES;
++        }
++        /* Wait for the LAST byte's "ready" signal (byte 7 just shifted) */
++        for (wi = 0; wi < 1000000u; wi++) {
++            s = *DP_STATUS;
++            if (s & 0x2u) break;
++        }
++        uart_puts("[P] I3 byte=7 wait_ready wi=");
++        uart_puthex32(wi);
++        uart_puts("\r\n");
++        i3_fail: ;
++    }
++
++    /* I4: end op (drop write level) — CS rises, chip starts page program */
++    *DP_CTRL = 0;
++    { uint32_t wi; for (wi = 0; wi < 10000u; wi++) if (!(*DP_STATUS & 0x1u)) break; }
++
++    /* I5: WIP-poll until chip done */
++    {
++        uint32_t iter;
++        uint32_t last_sr = 0xFFu;
++        for (iter = 0; iter < 200000u; iter++) {
++            *DP_CTRL = DC_RD_STATUS;
++            uint32_t s = 0; uint32_t wi;
++            for (wi = 0; wi < 1000u; wi++) { s = *DP_STATUS; if (s & 0x2u) break; }
++            if (!(s & 0x2u)) { last_sr = 0xFEu; break; }
++            last_sr = *DP_DATAOUT;
++            for (wi = 0; wi < 100u; wi++) if (!(*DP_STATUS & 0x1u)) break;
++            if (!(last_sr & 0x1u)) break;
++            for (volatile int d = 0; d < 64; d++) {}
++        }
++        uart_puts("[P] I5 WIP-poll iter=");
++        uart_puthex32(iter);
++        uart_puts(" final_RDSR=");
++        uart_puthex32(last_sr);
++        uart_puts("\r\n");
++    }
++
++    /* I6: read back 8 bytes via FAST_READ one-byte-per-op + compare */
++    {
++        uint32_t i;
++        uint32_t match = 0;
++        for (i = 0; i < 8u; i++) {
++            *DP_CTRL = DC_RESET;
++            for (volatile int d = 0; d < 32; d++) {}
++            *DP_ADDR = 0x00100000u + i;
++            *DP_CTRL = DC_FAST_READ;
++            uint32_t s = 0; uint32_t wi;
++            for (wi = 0; wi < 1000000u; wi++) { s = *DP_STATUS; if (s & 0x2u) break; }
++            uint32_t b = (s & 0x2u) ? *DP_DATAOUT : 0xFFu;
++            *DP_CTRL = 0;
++            for (wi = 0; wi < 10000u; wi++) if (!(*DP_STATUS & 0x1u)) break;
++            uart_puts("[P] I6 addr=0x100000+");
++            uart_puthex32(i);
++            uart_puts(" got=");
++            uart_puthex32(b);
++            uart_puts(" want=");
++            uart_puthex32(pat[i]);
++            if ((b & 0xFFu) == pat[i]) { uart_puts(" OK\r\n"); match++; }
++            else                       { uart_puts(" MISMATCH\r\n"); }
++        }
++        uart_puts("[P] I-verdict match=");
++        uart_puthex32(match);
++        uart_puts("/8\r\n");
++    }
++
++    #undef DP_DATAIN
++    #undef DC_WREN
++    #undef DC_SEC_ERASE
++    #undef DC_WRITE
++
+     uart_puts("[P] diagnostic DONE\r\n");
+ 
+     #undef DP_BASE
+-- 
+2.43.0
+
