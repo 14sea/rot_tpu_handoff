@@ -1,0 +1,134 @@
+From 695a25aa9786c663e6121b9a3fdab6927a76155f Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 22:17:36 +0100
+Subject: [PATCH] Phase 8 mode_g: wire EPCS write_image + verify + reconfig to
+ slot 1
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes audit gaps #3 (mode_g step 8-9 write_image + verify) and #4
+(mode_g step 10 reconfig pgm_sel = EPCS_TPU_BASE, not 0).
+
+After step 7 (post-edit SHA), mode_g now:
+- Idempotently reads EPCS slot 1 + SHA-compares to result SHA; skip
+  write if already up-to-date (closes audit #5 for mode_g).
+- Else: epcs_write_image(EPCS_TPU_BASE, ...) → epcs_fast_read back →
+  SHA-256 verify against result.  Halts on FAIL.
+- Reconfig: epcs_remote_reconfig(EPCS_TPU_BASE) — slot 1, not page 0.
+
+Stage2 ELF: 22456 → 22760 B (+304 for the wiring).
+
+Silicon-validated 2026-05-19 (capture diag_phase8_mode_g_crtm_2213):
+- Full mode_g path executes end-to-end through the reconfig trigger.
+- EPCS write 368 KB OK, read-back VERIFY OK.
+- altremote_update fires successfully (pgm_sel=0x80000 → FPGA reconfigs).
+- FPGA falls back to factory ALINX (page 0) because TPU.rbf at slot 1
+  fails chip-side AS configuration — TPU.rbf was not built with
+  INTERNAL_FLASH_UPDATE_MODE for application slot.  RoT-side firmware
+  path silicon-closed; TPU-bitstream-build is a separate follow-up.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 83 +++++++++++++++++++++++++++++++----------
+ 1 file changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 45d1e22..35c495d 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1830,28 +1830,71 @@ static void mode_generate(void)
+     lc_patch_rbf_crc_frames(rbf, mode_g_dirty);
+     uart_puts("[rot] CRC patched (dirty frames only)\r\n");
+ 
+-    /* === Step 7: SHA-256 of result (informational, no golden compare) === */
++    /* === Step 7: SHA-256 of post-edit result (design-time unknown,
++     * but reproducible: same base+edits → same SHA, used below for
++     * idempotency check + post-write verify). === */
++    uint32_t H_result[8];
++    sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H_result);
++    uart_puts("[rot] result sha256=");
++    for (int i = 0; i < 8; i++) uart_puthex32(H_result[i]);
++    uart_puts("\r\n");
++
++    /* === Step 8: Idempotent EPCS write + read-back SHA verify ===
++     * Same pattern as mode_t (Phase 3): read slot 1, compare to the
++     * post-edit SHA; only erase+program if mismatch.  Saves EPCS wear
++     * if the same edits.bin is applied repeatedly. */
+     {
+-        uint32_t H[8];
+-        sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H);
+-        uart_puts("[rot] result sha256=");
+-        for (int i = 0; i < 8; i++) uart_puthex32(H[i]);
+-        uart_puts("\r\n");
+-    }
++        uint8_t *rb = (uint8_t *)EPCS_READBACK_ADDR;
++        uint32_t H_flash[8];
+ 
+-    /* === Steps 8-10: EPCS write + verify + ALTREMOTE_UPDATE === */
+-    uart_puts("[rot] Phase 8 software path complete — "
+-              "generated bitstream ready in SDRAM at ");
+-    uart_puthex32(TPU_SCRATCH_ADDR);
+-    uart_puts(".\r\n[rot] Phase 2-3 EPCS write/verify not yet wired into "
+-              "mode 'g' tail; proceeding directly to Phase 4 remote reconfig.\r\n");
+-
+-    /* Phase 4: trigger remote-update reconfig to EPCS page 0 (factory
+-     * ALINX).  In production this slot would be the freshly-written RoT
+-     * page; here we close the loop on the altremote path itself. */
+-    uart_puts("[rot] altremote: pgm_sel=0x000000 WD_EN=0 AP_CONFIG_SEL=0 — "
+-              "triggering reconfig\r\n");
+-    epcs_remote_reconfig(0);
++        uart_puts("[rot] EPCS slot 1 idempotency check (read ");
++        uart_puthex32(h->tpu_sz); uart_puts(" B @"); uart_puthex32(EPCS_TPU_BASE);
++        uart_puts(")\r\n");
++        epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
++        sha256_hw(rb, h->tpu_sz, H_flash);
++        uart_puts("[rot] EPCS sha256=");
++        for (int i = 0; i < 8; i++) uart_puthex32(H_flash[i]);
++        int already = 1;
++        for (int i = 0; i < 8; i++)
++            if (H_flash[i] != H_result[i]) { already = 0; break; }
++        if (already) {
++            uart_puts(" [MATCH] — slot already up-to-date, skipping write\r\n");
++        } else {
++            uart_puts(" [MISMATCH] — writing image\r\n");
++            int rc = epcs_write_image(EPCS_TPU_BASE,
++                                      (const uint8_t *)TPU_SCRATCH_ADDR,
++                                      h->tpu_sz);
++            if (rc != 0) {
++                uart_puts("[!] epcs_write_image FAIL rc=");
++                uart_puthex32((uint32_t)rc);
++                uart_puts("\r\n"); while (1) {}
++            }
++            uart_puts("[rot] write OK — reading back for SHA verify\r\n");
++            epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
++            sha256_hw(rb, h->tpu_sz, H_flash);
++            uart_puts("[rot] EPCS sha256=");
++            for (int i = 0; i < 8; i++) uart_puthex32(H_flash[i]);
++            int verify = 1;
++            for (int i = 0; i < 8; i++)
++                if (H_flash[i] != H_result[i]) { verify = 0; break; }
++            if (!verify) {
++                uart_puts(" [VERIFY FAIL] — EPCS persist broken\r\n");
++                while (1) {}
++            }
++            uart_puts(" [VERIFY OK]\r\n");
++        }
++        uart_puts("[rot] Phase 8 steps 1-9 complete — slot 1 holds the "
++                  "edited bitstream.\r\n");
++    }
++
++    /* === Step 10: ALTREMOTE_UPDATE reconfig into the freshly-written
++     * slot (NOT page 0).  This is the CRTM closed-loop trigger:
++     * altremote_update shifts pgm_sel into rublock then asserts rconfig,
++     * which causes FPGA to reload its configuration from EPCS at the
++     * specified byte address.  Point of no return. */
++    uart_puts("[rot] altremote: pgm_sel="); uart_puthex32(EPCS_TPU_BASE);
++    uart_puts(" WD_EN=0 AP_CONFIG_SEL=0 — triggering reconfig into slot 1\r\n");
++    epcs_remote_reconfig(EPCS_TPU_BASE);
+ }
+ 
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+-- 
+2.43.0
+
