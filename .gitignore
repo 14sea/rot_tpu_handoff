@@ -11,3 +11,4 @@ __pycache__/
 .cnxerr
 qmegawiz_errors_log.txt
 .cnx
+.claude/
