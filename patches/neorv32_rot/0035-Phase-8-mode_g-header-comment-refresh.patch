@@ -1,0 +1,40 @@
+From d0b7110341b41aa2e4484e412e1d97a509c9e69d Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 22:19:18 +0100
+Subject: [PATCH] Phase 8 mode_g: refresh stale header comment (audit #13)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The mode_g block header still claimed 'Phases 2-4 not yet on silicon —
+halts here'; now silicon-closed via patches 0031-0034.  Update the
+step 8-10 description to match current behavior.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 35c495d..11d1410 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1640,10 +1640,11 @@ static void mode_tpu_verify(void)
+  *   6.  lc_patch_rbf_crc_frames — only dirty frames.
+  *   7.  SHA-256 of the resulting RBF → print to UART (informational;
+  *       no golden compare — the output is design-time-unknown).
+- *   8–10. EPCS write + read-back verify + ALTREMOTE_UPDATE reconfig —
+- *       NOT in this phase (Phases 2-4 not yet on silicon).  Halts here.
+- *
+- * Step 4 (pre-erase EPCS hash check) lands with Phase 3.
++ *   8.  Idempotent EPCS slot 1 read + SHA-compare to result; skip
++ *       write if already up-to-date (idempotency check).
++ *   9.  Else: epcs_write_image → epcs_fast_read + SHA-256 verify.
++ *   10. epcs_remote_reconfig(EPCS_TPU_BASE) — point of no return; FPGA
++ *       reconfigures from slot 1 (NOT page 0).
+  */
+ 
+ /* Header laid down by host/gen_edits.py.  Field order MUST mirror
+-- 
+2.43.0
+
