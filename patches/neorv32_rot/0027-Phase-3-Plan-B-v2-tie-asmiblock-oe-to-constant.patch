@@ -1,0 +1,108 @@
+From b4a3ab2f2ee69d89c051c1462db367bd8e0cffe1 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 19:46:48 +0100
+Subject: [PATCH] Phase 3 Plan B v2: tie asmiblock oe to constant 1'b0
+ (mirroring altasmi)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hypothesis: Info 17011 "WYSIWYG SPI primitive miso_in converted to
+equivalent logic" was caused by dynamically toggling oe (1 in IDLE/TAIL,
+0 during op).  altasmi's megafunction permanently ties oe_wire=1'b0
+(epcs_ctrl.v line 1799); CS-line deselection is handled by scein
+(cs_n_q) staying high in IDLE/TAIL.
+
+Result: refuted as load-bearing.  Info 17011 still fires; HW capture
+md5 byte-identical to v1 (50f8a01703e391aaa83054909e9b6eec) — Phase E
+addrs 0..3 all return 0xff, Phase F same.  Synthesis at 8669 LE
+(was 8682, -13 LE for removed oe_q reg).
+
+This commit retained as defensive (matches altasmi's known-working
+pattern) but is NOT the fix.  Root cause of all-0xff reads remains
+OPEN — likely a deeper Quartus 21.1 Lite + Cyclone IV E asmiblock
+synthesis behavior where hand-rolled SPI masters fail to drive the
+dedicated AS pins despite the pin map appearing correct in fit.rpt.
+---
+ rtl/wb_altasmi_parallel.v | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 1542dfd..4eecb1d 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -180,10 +180,21 @@ module wb_altasmi_parallel (
+ 
+     // Outputs to the asmiblock primitive.
+     reg cs_n_q;
+-    reg oe_q;        // 0 = user logic drives AS pins; 1 = hi-Z
+     reg mosi_q;
+     wire miso_in;
+ 
++    // oe MUST be tied to a constant 1'b0 for the asmiblock primitive to
++    // be preserved by Quartus 21.1 Lite as a hardware cell rather than
++    // "converted to equivalent logic" (Info 17010/17011).  altasmi's
++    // megafunction does the same (`oe_wire = 1'b0` in epcs_ctrl.v line
++    // 1799).  Dynamically toggling oe drops the synthesis route to the
++    // dedicated AS pins, leaving MISO floating high (silicon evidence:
++    // 2026-05-18 Plan B v1 — all bytes 0xff at every address; fit.rpt
++    // showed AS-pin map intact but synthesis info reported the
++    // conversion).  CS-line semantics (active deselect when idle) are
++    // already handled by `cs_n_q` driving scein high in S_IDLE/S_TAIL.
++    wire oe_const = 1'b0;
++
+     // Forward-declared so FSM can read it for the resume-decision in S_PAUSE
+     reg flag_data_valid;
+ 
+@@ -198,7 +209,6 @@ module wb_altasmi_parallel (
+             byte_valid  <= 1'b0;
+             raddr_q     <= 24'd0;
+             cs_n_q      <= 1'b1;
+-            oe_q        <= 1'b1;
+             mosi_q      <= 1'b0;
+             sck_active  <= 1'b0;
+         end else begin
+@@ -213,7 +223,6 @@ module wb_altasmi_parallel (
+                 tick_cnt   <= 4'd0;
+                 raddr_q    <= 24'd0;
+                 cs_n_q     <= 1'b1;
+-                oe_q       <= 1'b1;
+                 mosi_q     <= 1'b0;
+                 sck_active <= 1'b0;
+             end else begin
+@@ -221,7 +230,6 @@ module wb_altasmi_parallel (
+                     // -----------------------------------------------------
+                     S_IDLE: begin
+                         cs_n_q     <= 1'b1;
+-                        oe_q       <= 1'b1;
+                         mosi_q     <= 1'b0;
+                         sck_active <= 1'b0;
+                         if (ctrl_fast_read) begin
+@@ -229,7 +237,6 @@ module wb_altasmi_parallel (
+                             raddr_q  <= addr_reg;
+                             tick_cnt <= 4'd0;
+                             cs_n_q   <= 1'b0;
+-                            oe_q     <= 1'b0;
+                             state    <= S_PRE;
+                         end
+                     end
+@@ -316,7 +323,6 @@ module wb_altasmi_parallel (
+                         cs_n_q     <= 1'b1;
+                         if (tick_cnt == 4'd3) begin
+                             tick_cnt <= 4'd0;
+-                            oe_q     <= 1'b1;
+                             state    <= S_IDLE;
+                         end else tick_cnt <= tick_cnt + 4'd1;
+                     end
+@@ -425,7 +431,7 @@ module wb_altasmi_parallel (
+     cycloneive_asmiblock u_asmi (
+         .dclkin   (sck_q),
+         .scein    (cs_n_q),
+-        .oe       (oe_q),
++        .oe       (oe_const),
+         .sdoin    (mosi_q),
+         .data0out (miso_in)
+     );
+-- 
+2.43.0
+
