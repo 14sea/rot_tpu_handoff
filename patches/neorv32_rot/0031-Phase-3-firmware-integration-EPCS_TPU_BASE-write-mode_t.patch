@@ -1,0 +1,621 @@
+From 8341a5fc8cfa8ca629933a52b64f11e3cc7fe19a Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 20:47:26 +0100
+Subject: [PATCH] Phase 3 firmware integration: EPCS_TPU_BASE +
+ epcs_write_image + mode_t EPCS persist
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes audit gaps #1, #2, #5, #6, #7 (project-phase-status).
+
+epcs.h / epcs.c rewrite:
+- Add EPCS_TPU_BASE = 0x80000 (slot 1, sector 8) — plan-canonical TPU
+  image location.  Page 0 reserved for boot bitstream.
+- Add epcs_write_image(base, src, len) — composed sector-erase + page
+  program loop, base must be sector-aligned.
+- Rewrite epcs_fast_read / epcs_read_status / epcs_erase_sector /
+  epcs_program_page to match Plan B wrapper silicon-validated patterns
+  from mode_epcs_probe Phase G/H/I (one-byte-per-op reads with
+  DC_RESET, STATUS.DV-paced page programming, bounded WIP-poll).  Prior
+  helpers were written for the megafunction wrapper and would deadlock
+  on the Plan B FSM.
+
+main.c:
+- sdram_test_scratch() — 32-word write/readback at TPU_SCRATCH_ADDR
+  pre-flight (the existing sdram_test() only covers 0x41F00000).
+- mode_tpu_verify rewired: SDRAM pre-flight → SD SHA gate → idempotent
+  EPCS slot 1 hash check (skip if up-to-date) → epcs_write_image →
+  epcs_fast_read read-back → SHA verify.  Stale 'Phases 2-4 not
+  implemented' comment removed.
+- mode_t does NOT reconfig — reconfig is mode_g's job (the trust gate
+  here halts for operator inspection / power-cycle).
+
+Stage2 ELF: 20416 → 22260 B (+1844 B, IMEM has ~10 KB headroom).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/epcs.c | 222 ++++++++++++++++++++++------------------
+ sw/stage2_loader/epcs.h |  92 ++++++++++-------
+ sw/stage2_loader/main.c | 117 ++++++++++++++++++---
+ 3 files changed, 277 insertions(+), 154 deletions(-)
+
+diff --git a/sw/stage2_loader/epcs.c b/sw/stage2_loader/epcs.c
+index ae91eff..9a1777c 100644
+--- a/sw/stage2_loader/epcs.c
++++ b/sw/stage2_loader/epcs.c
+@@ -1,29 +1,16 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * epcs.c — Phase 3 EPCS16 driver against wb_altasmi_parallel @0xF2000000.
++ * epcs.c — Phase 3 EPCS16 driver (Plan B wrapper silicon-validated
++ * 2026-05-18).  Each helper's handshake pattern mirrors a
++ * silicon-validated phase in mode_epcs_probe:
+  *
+- * Per-byte handshake summary (verified against altasmi_parallel doc +
+- * the wrapper RTL):
++ *   epcs_read_status     ← Phase G1/G3 RDSR cycle
++ *   epcs_fast_read       ← Phase I6 one-byte-per-op + DC_RESET between
++ *   epcs_erase_sector    ← Phase H  (WREN + SEC_ERASE + WIP-poll)
++ *   epcs_program_page    ← Phase I  (WREN + PP + STATUS.DV pacing)
++ *   epcs_write_image     ← composed erase + program loop
+  *
+- *   READ: set ADDR; set CTRL.read=1; for each byte { pulse shift_bytes;
+- *         wait STATUS.data_valid; read DATAOUT (clears DV) }; clear
+- *         CTRL.read.  The megafunction sends READ opcode + 24-bit addr
+- *         on the rising edge of `read`, asserts /CS for the duration,
+- *         deasserts /CS on the falling edge of `read`.
+- *
+- *   WRITE (program page): pulse wren; wait !busy; set ADDR; set
+- *         CTRL.write=1; wait !busy; for each byte (≤256) { write
+- *         DATAIN; pulse shift_bytes; wait !busy }; clear CTRL.write.
+- *         /CS is asserted while write is high; deasserting kicks the
+- *         flash to start internal programming.  Poll RDSR.WIP until
+- *         clear (typical 1-3 ms).
+- *
+- *   SECTOR_ERASE: pulse wren; wait !busy; set ADDR; set
+- *         CTRL.sec_erase=1; wait !busy; clear CTRL.sec_erase.  Poll
+- *         RDSR.WIP until clear (typical 100-500 ms).
+- *
+- *   READ_STATUS: set CTRL.rd_status=1; wait !busy; read ESTAT; clear
+- *         CTRL.rd_status.
++ * Cross-verified 2026-05-18 against openFPGALoader external dump.
+  */
+ 
+ #include "epcs.h"
+@@ -37,9 +24,6 @@
+ #define WB_AM_DATAOUT   ((volatile uint32_t *)(WB_AM_BASE + 0x10))
+ #define WB_AM_ESTAT     ((volatile uint32_t *)(WB_AM_BASE + 0x14))
+ 
+-/* NH9: CTRL.b0 (plain READ) was removed when port_fast_read=PORT_USED
+- * was added in the megafunction regen — qmegawiz 21.1 Lite treats
+- * read/fast_read as a mutex.  Use CTRL_FAST_READ instead. */
+ #define CTRL_WRITE         (1u << 1)
+ #define CTRL_SEC_ERASE     (1u << 2)
+ #define CTRL_RD_STATUS     (1u << 3)
+@@ -54,96 +38,91 @@
+ #define STATUS_ILL_ERASE   (1u << 2)
+ #define STATUS_ILL_WRITE   (1u << 3)
+ 
+-static inline void am_ctrl_write(uint32_t levels_plus_pulses)
++static inline uint32_t am_status(void) { return *WB_AM_STATUS; }
++
++/* Bounded busy-clear wait — caps iter so a hung wrapper does not
++ * deadlock the entire firmware. */
++static void wait_busy_clear(uint32_t iter_cap)
+ {
+-    /* The wrapper's CTRL register is W-only for pulse bits; level bits
+-     * stay set until firmware writes a CTRL with the bit cleared. */
+-    *WB_AM_CTRL = levels_plus_pulses;
++    for (uint32_t wi = 0; wi < iter_cap; wi++) {
++        if (!(am_status() & STATUS_BUSY)) return;
++    }
+ }
+ 
+-static inline uint32_t am_status(void) { return *WB_AM_STATUS; }
++/* Wait for STATUS.DV_sticky=1.  Returns 1 on assertion, 0 on timeout. */
++static int wait_dv(uint32_t iter_cap)
++{
++    for (uint32_t wi = 0; wi < iter_cap; wi++) {
++        if (am_status() & STATUS_DV) return 1;
++    }
++    return 0;
++}
+ 
+-static inline void wait_not_busy(void)
++uint8_t epcs_read_status(void)
+ {
+-    /* Two-phase wait to dodge a 1-cycle race window in altasmi_parallel.
+-     * The megafunction has 1-cycle register latency from CTRL.read (or
+-     * write/wren/sec_erase/rd_status) input to busy_wire assertion
+-     * (epcs_ctrl.v `read_reg` → `read_wire` → `do_read` → `busy_wire`).
+-     * If NEORV32 issues this STATUS poll's bus_stb at the cycle
+-     * immediately after the CTRL store completes, the wrapper samples
+-     * am_busy=0 (stale) and we'd skip the wait entirely — corrupting
+-     * the subsequent shift_bytes pulse because the megafunction hasn't
+-     * actually entered the operation yet.  First-phase: bounded spin
+-     * for busy-rise (cap at 64 iters so degenerate-fast operations
+-     * don't hang us if busy already came and went).  Second-phase:
+-     * wait for busy-fall as before. */
+-    for (int i = 0; i < 64; i++) {
+-        if (am_status() & STATUS_BUSY) break;
++    *WB_AM_CTRL = CTRL_RD_STATUS;
++    if (!wait_dv(100000u)) {
++        /* DV timeout — return WIP=1 so the caller's poll loop keeps
++         * retrying instead of accepting a stale "ready". */
++        return 0xFFu;
+     }
+-    while (am_status() & STATUS_BUSY) { }
++    uint8_t sr = (uint8_t)(*WB_AM_DATAOUT);
++    wait_busy_clear(1000u);
++    return sr;
+ }
+ 
+-static inline void wait_data_valid(void)
++/* Poll RDSR.WIP until clear or `iter_cap` cycles elapse.  Returns 0 on
++ * clear, -1 on timeout.  Inter-poll spacing matches Phase H3 (~64
++ * dead-loop cycles). */
++static int poll_wip_clear(uint32_t iter_cap)
+ {
+-    while (!(am_status() & STATUS_DV)) { }
++    for (uint32_t iter = 0; iter < iter_cap; iter++) {
++        uint8_t sr = epcs_read_status();
++        if (!(sr & EPCS_STATUS_WIP)) return 0;
++        for (volatile int d = 0; d < 64; d++) { }
++    }
++    return -1;
+ }
+ 
+-uint8_t epcs_read_status(void)
++void epcs_fast_read(uint32_t addr, uint32_t len, uint8_t *buf)
+ {
+-    am_ctrl_write(CTRL_RD_STATUS);     /* assert rd_status → megafunction cycles RDSR */
+-    wait_not_busy();
+-    uint8_t s = (uint8_t)(*WB_AM_ESTAT);
+-    am_ctrl_write(0);                  /* deassert */
+-    return s;
++    for (uint32_t i = 0; i < len; i++) {
++        *WB_AM_CTRL = CTRL_RESET;
++        for (volatile int d = 0; d < 32; d++) { }
++        *WB_AM_ADDR = (addr + i) & 0x00FFFFFFu;
++        *WB_AM_CTRL = CTRL_FAST_READ;
++        if (!wait_dv(1000000u)) {
++            buf[i] = 0xFFu;
++        } else {
++            buf[i] = (uint8_t)(*WB_AM_DATAOUT);
++        }
++        *WB_AM_CTRL = 0;
++        wait_busy_clear(10000u);
++    }
+ }
+ 
+-static void poll_wip_clear(void)
++static void epcs_wren_pulse(void)
+ {
+-    /* Spin until flash WIP bit clears.  No external timeout — caller
+-     * trusts the chip's datasheet timing.  Worst case: ~3 s for sector
+-     * erase per EPCS16 spec; at 30 MHz that's ~100 M status reads. */
+-    while (epcs_read_status() & EPCS_STATUS_WIP) { }
++    *WB_AM_CTRL = CTRL_WREN;
++    wait_busy_clear(10000u);
+ }
+ 
+ int epcs_erase_sector(uint32_t addr)
+ {
+-    am_ctrl_write(CTRL_WREN);          /* one-cycle pulse: send WREN command */
+-    wait_not_busy();
++    epcs_wren_pulse();
+ 
+     *WB_AM_ADDR = addr & 0x00FFFFFFu;
+-    am_ctrl_write(CTRL_SEC_ERASE);     /* assert sec_erase: send SE opcode+addr */
+-    wait_not_busy();
+-    am_ctrl_write(0);                  /* deassert → flash starts internal erase */
++    *WB_AM_CTRL = CTRL_SEC_ERASE;
++    wait_busy_clear(10000u);
+ 
+-    poll_wip_clear();
++    int rc = poll_wip_clear(500000u);
+ 
+     if (am_status() & STATUS_ILL_ERASE) {
+-        am_ctrl_write(CTRL_RESET);     /* clear sticky for next op */
++        *WB_AM_CTRL = CTRL_RESET;
++        wait_busy_clear(1000u);
+         return -1;
+     }
+-    return 0;
+-}
+-
+-void epcs_fast_read(uint32_t addr, uint32_t len, uint8_t *buf)
+-{
+-    /* FAST_READ path (opcode 0x0B + 24-bit addr + 1 dummy byte).
+-     * Do NOT wait_not_busy() between CTRL=FAST_READ and the shift-byte
+-     * loop — busy_wire stays asserted for the entire operation
+-     * (do_fast_read=1 → busy_wire=1) and would always hang.  The
+-     * pre-amble (opcode + addr + dummy) runs inside the first
+-     * SHIFT_BYTES iteration's wait_data_valid window. */
+-    *WB_AM_ADDR = addr & 0x00FFFFFFu;
+-    *WB_AM_CTRL = CTRL_FAST_READ;
+-
+-    for (uint32_t i = 0; i < len; i++) {
+-        *WB_AM_CTRL = CTRL_FAST_READ | CTRL_SHIFT_BYTES;
+-        wait_data_valid();
+-        buf[i] = (uint8_t)(*WB_AM_DATAOUT);
+-    }
+-
+-    *WB_AM_CTRL = CTRL_FAST_READ | CTRL_RDEN_DROP;  /* fire end_read_reg */
+-    wait_not_busy();
+-    *WB_AM_CTRL = 0;
++    return rc == 0 ? 0 : -2;
+ }
+ 
+ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+@@ -151,26 +130,65 @@ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+     if (len == 0) return 0;
+     if (len > EPCS_PAGE_SIZE) return -1;
+ 
+-    am_ctrl_write(CTRL_WREN);
+-    wait_not_busy();
+-
+-    *WB_AM_ADDR = addr & 0x00FFFFFFu;
+-    am_ctrl_write(CTRL_WRITE);         /* assert write: send PROGRAM opcode+addr */
+-    wait_not_busy();
+-
+-    for (uint32_t i = 0; i < len; i++) {
++    epcs_wren_pulse();
++
++    /* First byte: addr + DATAIN + WRITE level (no SHIFT_BYTES yet). */
++    *WB_AM_ADDR   = addr & 0x00FFFFFFu;
++    *WB_AM_DATAIN = buf[0];
++    *WB_AM_CTRL   = CTRL_WRITE;
++
++    /* Bytes 1..len-1: wait DV (wrapper paused after prior byte) →
++     * refill DATAIN → SHIFT_BYTES pulse (DV auto-clears on the pulse). */
++    for (uint32_t i = 1; i < len; i++) {
++        if (!wait_dv(1000000u)) {
++            *WB_AM_CTRL = 0;
++            wait_busy_clear(10000u);
++            return -2;
++        }
+         *WB_AM_DATAIN = buf[i];
+-        am_ctrl_write(CTRL_WRITE | CTRL_SHIFT_BYTES);
+-        wait_not_busy();
++        *WB_AM_CTRL = CTRL_WRITE | CTRL_SHIFT_BYTES;
+     }
+ 
+-    am_ctrl_write(0);                  /* deassert → flash starts programming */
++    /* Wait for last byte's "shifted in" signal before /CS-high. */
++    if (!wait_dv(1000000u)) {
++        *WB_AM_CTRL = 0;
++        wait_busy_clear(10000u);
++        return -2;
++    }
+ 
+-    poll_wip_clear();
++    *WB_AM_CTRL = 0;                       /* /CS rises → chip programs */
++    wait_busy_clear(10000u);
++
++    int rc = poll_wip_clear(200000u);
+ 
+     if (am_status() & STATUS_ILL_WRITE) {
+-        am_ctrl_write(CTRL_RESET);
++        *WB_AM_CTRL = CTRL_RESET;
++        wait_busy_clear(1000u);
+         return -1;
+     }
++    return rc == 0 ? 0 : -2;
++}
++
++int epcs_write_image(uint32_t base, const uint8_t *src, uint32_t len)
++{
++    if (base & (EPCS_SECTOR_SIZE - 1u)) return -1;
++    if ((uint64_t)base + (uint64_t)len > (uint64_t)EPCS_TOTAL_BYTES) return -1;
++    if (len == 0) return 0;
++
++    uint32_t n_sectors = (len + EPCS_SECTOR_SIZE - 1u) / EPCS_SECTOR_SIZE;
++    for (uint32_t s = 0; s < n_sectors; s++) {
++        int rc = epcs_erase_sector(base + s * EPCS_SECTOR_SIZE);
++        if (rc != 0) return rc;
++    }
++
++    uint32_t off = 0;
++    while (off < len) {
++        uint32_t chunk = EPCS_PAGE_SIZE;
++        if (chunk > len - off) chunk = len - off;
++        int rc = epcs_program_page(base + off, chunk, src + off);
++        if (rc != 0) return rc;
++        off += chunk;
++    }
++
+     return 0;
+ }
+diff --git a/sw/stage2_loader/epcs.h b/sw/stage2_loader/epcs.h
+index 47b4f68..2757811 100644
+--- a/sw/stage2_loader/epcs.h
++++ b/sw/stage2_loader/epcs.h
+@@ -2,23 +2,27 @@
+ /*
+  * epcs.h — Phase 3 EPCS16 driver for the RoT stage2 loader.
+  *
+- * Drives the wb_altasmi_parallel wrapper at 0xF2000000 (Phase 2 silicon),
+- * which is a thin pass-through to the qmegawiz-generated altasmi_parallel
+- * megafunction (EPCS16 / 256 B page / USE_ASMIBLOCK=ON).
++ * Drives the wb_altasmi_parallel wrapper at 0xF2000000 (Plan B silicon).
++ * The wrapper is a hand-rolled SPI master against cycloneive_asmiblock
++ * primitive — the qmegawiz altasmi_parallel megafunction path was
++ * abandoned after wrapper-layer races (NH15+NH16+NH17) and write API
++ * stripping; see [[reference-rublock-complexity]] for the reasoning trail.
+  *
+- * The wrapper's register map (see rtl/wb_altasmi_parallel.v:14-30):
+- *   0x00 CTRL    {read, write, sec_erase, rd_status} (level)
+- *                {shift_bytes, wren, reset} (1-cycle pulse)
++ * READ/WRITE/ERASE/RDSR all silicon-validated 2026-05-18 via Phase G/H/I
++ * in mode_epcs_probe + openFPGALoader external dump cross-verify.  The
++ * helpers below mirror those silicon-validated patterns.
++ *
++ * Wrapper register map (rtl/wb_altasmi_parallel.v):
++ *   0x00 CTRL    levels: {write, sec_erase, rd_status, fast_read}
++ *                pulses: {shift_bytes, wren, reset, rden_drop}
+  *   0x04 ADDR    [23:0]
+  *   0x08 DATAIN  [7:0]
+- *   0x0C STATUS  {busy, data_valid_sticky, illegal_erase, illegal_write}
+- *   0x10 DATAOUT [7:0] (reading clears data_valid)
+- *   0x14 ESTAT   [7:0] flash status_out (most-recent RDSR result)
++ *   0x0C STATUS  {ill_w, ill_e, dv_sticky, busy}
++ *   0x10 DATAOUT [7:0] (reading clears dv_sticky)
++ *   0x14 ESTAT   [7:0] flash status_out latched (RDSR shadow)
+  *
+- * Note: Phase 4 epcs_remote_reconfig() is intentionally NOT declared here
+- * — it lives in a different IP (wb_altremote_update @ 0xF3000000) and the
+- * direct-primitive wrapper for it is currently blocked.  See
+- * [[reference-rublock-complexity]] (memory) for the path back to Phase 4.
++ * Phase 4 epcs_remote_reconfig() lives in remote_update.h — it drives a
++ * different IP (wb_altremote_update @ 0xF3000000) and is decoupled here.
+  */
+ 
+ #ifndef ROT_EPCS_H
+@@ -26,47 +30,63 @@
+ 
+ #include <stdint.h>
+ 
+-#define EPCS_PAGE_SIZE     256u      /* program page */
+-#define EPCS_SECTOR_SIZE   65536u    /* 64 KB sector (EPCS16) */
+-#define EPCS_TOTAL_BYTES   0x200000u /* EPCS16 = 2 MB */
++#define EPCS_PAGE_SIZE     256u       /* program page */
++#define EPCS_SECTOR_SIZE   65536u     /* 64 KB sector (EPCS16 = M25P16) */
++#define EPCS_TOTAL_BYTES   0x200000u  /* EPCS16 = 2 MB */
++
++/* TPU image slot — sector-aligned offset within EPCS.  Sector 0
++ * (bytes 0..0xFFFF) is reserved for the bitstream that the rublock
++ * loads on boot (factory ALINX in current devkit images, or the RoT
++ * bitstream in production).  Slot 1 starts at byte 0x80000 (sector 8 =
++ * 512 KB), giving room for a ~368 KB TPU.rbf image plus headroom.  See
++ * docs/plan.md §Phase 3 for canonical layout. */
++#define EPCS_TPU_BASE      0x00080000u
+ 
+ /* SPI status register bit 0 = WIP (Write In Progress, 1 = busy). */
+ #define EPCS_STATUS_WIP    0x01u
+ 
+ /*
+- * Read len bytes from EPCS starting at addr into buf using FAST_READ
+- * (opcode 0x0B + 24-bit addr + 1 dummy byte).  Plain READ (opcode 0x03)
+- * is unavailable: the megafunction regen with port_fast_read=PORT_USED
+- * caused qmegawiz 21.1 Lite to strip the `read` input port as a mutex.
+- * The stage3 do_wait_dummyclk FSM-unlock (epcs_ctrl.v line 383 OR-term)
+- * is fast_read-exclusive and the only working path on this silicon.
+- * No length cap from the wrapper.
++ * Read len bytes from EPCS into buf using FAST_READ (opcode 0x0B +
++ * 24-bit addr + 1 dummy byte).  Uses one-byte-per-op with DC_RESET
++ * between bytes to dodge the dvalid_reg level-lock race documented
++ * in [[reference-rublock-complexity]].  No length cap.
+  */
+ void epcs_fast_read(uint32_t addr, uint32_t len, uint8_t *buf);
+ 
+ /*
+- * Read flash status register.  Returns the 8-bit status_out byte.
+- * Bit 0 = WIP.  Used after erase/program to poll for completion.
++ * Read flash status register (RDSR opcode 0x05).  Returns the 8-bit
++ * status byte; bit 0 = WIP, bit 1 = WEL.  Returns 0xFF on wrapper DV
++ * timeout (caller's WIP check stays "busy", caller will retry).
+  */
+ uint8_t epcs_read_status(void);
+ 
+ /*
+- * Erase the 64 KB sector containing addr.  Issues WREN then SE-with-
+- * address; polls flash status until WIP clears (typical 100-500 ms,
+- * max ~3 s per EPCS16 datasheet).  Returns 0 on success, -1 if the
+- * wrapper's illegal_erase sticky flag fired (e.g. addr beyond chip).
++ * Erase the 64 KB sector containing addr.  Issues WREN, SEC_ERASE
++ * (opcode 0xD8 + 24-bit addr), then polls WIP until clear (tSE max
++ * ~3 s per EPCS16 spec).  Returns 0 on success, -1 on illegal_erase
++ * sticky, -2 on WIP-poll timeout.
+  */
+ int epcs_erase_sector(uint32_t addr);
+ 
+ /*
+- * Program up to len bytes (≤ EPCS_PAGE_SIZE) starting at addr.
+- * Caller must ensure (addr + len) does not cross a page boundary
+- * (the flash itself wraps within the page, which would corrupt the
+- * write — checked by the wrapper's illegal_write sticky).
+- * Issues WREN, sets write level, streams bytes via DATAIN +
+- * shift_bytes pulses, then deasserts write and polls until WIP clears
+- * (typical 1-3 ms).  Returns 0 on success, -1 on illegal_write.
++ * Program up to len bytes (≤ EPCS_PAGE_SIZE) starting at addr.  Caller
++ * must ensure (addr & ~(EPCS_PAGE_SIZE-1)) + len-1 stays within the
++ * page (the flash wraps within the page silently, which would corrupt
++ * data).  Returns 0 on success, -1 on illegal_write sticky, -2 on
++ * WIP-poll or DV timeout.
+  */
+ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf);
+ 
++/*
++ * High-level: erase enough sectors then program all bytes of `src`
++ * into EPCS starting at `base`.  base MUST be sector-aligned.  Does
++ * NOT verify — caller should follow with epcs_fast_read + SHA-256.
++ *
++ * Returns 0 on full success.  On the first failed sector or page,
++ * returns the helper's error code (-1 ill_flag, -2 timeout) without
++ * unwinding earlier-erased sectors — the EPCS region is in an
++ * inconsistent state on error and caller MUST retry from scratch.
++ */
++int epcs_write_image(uint32_t base, const uint8_t *src, uint32_t len);
++
+ #endif /* ROT_EPCS_H */
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index a9c0da8..45d1e22 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -31,6 +31,10 @@
+ /* mode_g scratch for edits.bin — 1 MB before DTB, 32 KB max
+  * (EDITS_MAX_SEC = 64 sectors per sd_layout.py v4). */
+ #define EDITS_SCRATCH_ADDR 0x41E00000UL
++/* mode_t / mode_g EPCS read-back scratch — 4 MB above TPU_SCRATCH_ADDR,
++ * 10 MB below EDITS_SCRATCH_ADDR.  Fits the same ~368 KB image used as
++ * the source, lets us SHA the EPCS contents without clobbering source. */
++#define EPCS_READBACK_ADDR 0x41400000UL
+ #define UART_BAUD         115200
+ 
+ #define SOH   0x01
+@@ -135,6 +139,37 @@ static int sdram_test(void)
+     return 0;
+ }
+ 
++/* Pre-flight SDRAM check on TPU_SCRATCH_ADDR (the 368 KB region the
++ * mode_t / mode_g paths fill from SD before EPCS write).  sdram_test()
++ * above only covers 0x41F00000 — a single gross failure in the scratch
++ * region would otherwise corrupt the SHA-verified TPU image silently. */
++static int sdram_test_scratch(void)
++{
++    volatile uint32_t *base = (volatile uint32_t *)TPU_SCRATCH_ADDR;
++    const uint32_t n = 32;
++
++    uart_puts("[stage2] SDRAM scratch test @");
++    uart_puthex32(TPU_SCRATCH_ADDR);
++    uart_puts("...");
++
++    for (uint32_t i = 0; i < n; i++)
++        base[i] = 0xCAFE0000u ^ (i * 0x01010101u);
++
++    for (uint32_t i = 0; i < n; i++) {
++        uint32_t got = base[i];
++        uint32_t exp = 0xCAFE0000u ^ (i * 0x01010101u);
++        if (got != exp) {
++            uart_puts(" FAIL[");  uart_puthex32(i);
++            uart_puts("] exp=");  uart_puthex32(exp);
++            uart_puts(" got=");   uart_puthex32(got);
++            uart_puts("\r\n");
++            return 0;
++        }
++    }
++    uart_puts(" PASS\r\n");
++    return 1;
++}
++
+ static uint32_t xmodem_receive(uint8_t *dest)
+ {
+     uint8_t blk_num = 1;
+@@ -1464,19 +1499,28 @@ static void mode_sd_boot(void)
+     jump_to_kernel();
+ }
+ 
+-/* Mode 't' (Phase 1 of ROT→TPU EPCS handoff plan):
+- *   1. Read SD header at LBA 0; verify magic + layout_version >= 3.
+- *   2. Read TPU.rbf from h->tpu_lba (368 KB) into TPU_SCRATCH_ADDR.
+- *   3. Hash via wb_sha256 → compare to baked rot_golden_tpu_bitstream.
+- *   4. Halt with [OK] or [MISMATCH] — Phase 1 does NOT touch EPCS.
+- *
+- * This is the trust gate: any TPU.rbf whose SHA-256 doesn't match the
+- * constant baked into ROT's bitstream-resident IMEM is refused before
+- * any EPCS write or ALTREMOTE_UPDATE trigger (Phases 3+4).
++/* Mode 't' (Phase 1+3 of ROT→TPU EPCS handoff plan):
++ *   1. SDRAM scratch test at TPU_SCRATCH_ADDR (pre-flight, audit #7).
++ *   2. Read SD header at LBA 0; verify magic + layout_version >= 3.
++ *   3. Read TPU.rbf from h->tpu_lba (368 KB) into TPU_SCRATCH_ADDR.
++ *   4. Hash via wb_sha256 → compare to baked rot_golden_tpu_bitstream
++ *      (trust gate; reject before any EPCS touch).
++ *   5. Idempotent check: read EPCS slot 1 (EPCS_TPU_BASE..+tpu_sz) into
++ *      EPCS_READBACK_ADDR, SHA-256, compare to source SHA.  Skip the
++ *      write if already up-to-date (audit #5).
++ *   6. Else: epcs_write_image() → read-back via epcs_fast_read →
++ *      SHA-256 verify.  Halts on any failure (audit #2).
++ *   7. mode_t does NOT reconfig — that's mode_g's job.  Halts after
++ *      verify for the operator to inspect or power-cycle.
+  */
+ static void mode_tpu_verify(void)
+ {
+-    uart_puts("[stage2] Mode: TPU bitstream verify (Phase 1)\r\n");
++    uart_puts("[stage2] Mode: TPU bitstream verify + EPCS persist (Phase 1+3)\r\n");
++
++    if (!sdram_test_scratch()) {
++        uart_puts("[!] SDRAM scratch test FAIL — refusing to proceed\r\n");
++        while (1) {}
++    }
+ 
+     extern int sd_init(void);
+     extern int sd_read_block(uint32_t lba, uint8_t *dst);
+@@ -1528,16 +1572,57 @@ static void mode_tpu_verify(void)
+     int match = 1;
+     for (int i = 0; i < 8; i++)
+         if (H[i] != rot_golden_tpu_bitstream[i]) { match = 0; break; }
+-    if (match) {
+-        uart_puts(" [OK]\r\n");
+-        uart_puts("[rot] Phase 1 complete — TPU bitstream verified.\r\n");
+-        uart_puts("[rot] Phases 2-4 (EPCS write + ALTREMOTE_UPDATE) "
+-                  "not implemented yet; halting before any EPCS touch.\r\n");
+-    } else {
++    if (!match) {
+         uart_puts(" [MISMATCH] golden=");
+         for (int i = 0; i < 8; i++) uart_puthex32(rot_golden_tpu_bitstream[i]);
+         uart_puts("\r\n[!] TPU SHA mismatch — refusing EPCS write\r\n");
++        while (1) {}
+     }
++    uart_puts(" [OK]\r\n");
++    uart_puts("[rot] Phase 1 SD-side SHA verified.\r\n");
++
++    /* === Phase 3: idempotent EPCS write + read-back SHA verify === */
++    uint8_t *rb = (uint8_t *)EPCS_READBACK_ADDR;
++    uint32_t Hflash[8];
++
++    uart_puts("[rot] EPCS slot 1 idempotency check (read ");
++    uart_puthex32(h->tpu_sz); uart_puts(" B @"); uart_puthex32(EPCS_TPU_BASE);
++    uart_puts(")\r\n");
++    epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
++    sha256_hw(rb, h->tpu_sz, Hflash);
++    uart_puts("[rot] EPCS sha256=");
++    for (int i = 0; i < 8; i++) uart_puthex32(Hflash[i]);
++    int already = 1;
++    for (int i = 0; i < 8; i++) if (Hflash[i] != H[i]) { already = 0; break; }
++    if (already) {
++        uart_puts(" [MATCH] — slot already up-to-date, skipping write\r\n");
++        uart_puts("[rot] Phase 3 complete (idempotent skip).\r\n");
++    } else {
++        uart_puts(" [MISMATCH] — writing image\r\n");
++        int rc = epcs_write_image(EPCS_TPU_BASE,
++                                  (const uint8_t *)TPU_SCRATCH_ADDR,
++                                  h->tpu_sz);
++        if (rc != 0) {
++            uart_puts("[!] epcs_write_image FAIL rc=");
++            uart_puthex32((uint32_t)rc);
++            uart_puts("\r\n"); while (1) {}
++        }
++        uart_puts("[rot] write OK — reading back for SHA verify\r\n");
++        epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
++        sha256_hw(rb, h->tpu_sz, Hflash);
++        uart_puts("[rot] EPCS sha256=");
++        for (int i = 0; i < 8; i++) uart_puthex32(Hflash[i]);
++        int verify = 1;
++        for (int i = 0; i < 8; i++) if (Hflash[i] != H[i]) { verify = 0; break; }
++        if (!verify) {
++            uart_puts(" [VERIFY FAIL] — EPCS persist broken\r\n");
++            while (1) {}
++        }
++        uart_puts(" [VERIFY OK]\r\n");
++        uart_puts("[rot] Phase 3 complete — EPCS slot 1 written + verified.\r\n");
++    }
++
++    uart_puts("[rot] mode 't' done.  Power-cycle or run 'g' to exercise slot 1.\r\n");
+     while (1) {}
+ }
+ 
+-- 
+2.43.0
+

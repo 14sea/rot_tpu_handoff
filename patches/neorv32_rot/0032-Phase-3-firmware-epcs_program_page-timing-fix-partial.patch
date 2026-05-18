@@ -1,0 +1,88 @@
+From e69eb741bc1b0992893947fa0ceb735a6f39eede Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 21:44:30 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20firmware:=20epcs=5Fprogram=5Fpage?=
+ =?UTF-8?q?=20timing=20fix=20(partial=20=E2=80=94=20sectors=2010/12=20anom?=
+ =?UTF-8?q?aly)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bug observed in mode_t HW test (capture diag_phase3_mode_t_run3 +
+external openFPGALoader dump): epcs_write_image wrote 368 KB into
+EPCS slot 1 but only ~61% of bytes matched src.  Pattern was 'byte 1
+of each page dropped' — chip received [buf[0], buf[2..255]] instead
+of [buf[0..255]].
+
+Root cause: in the per-page program loop, the iter-1
+ctrl_shift_bytes pulse arrives too close to S_PAUSE entry (tick_cnt
+ramp 0→3) — within the 'tick_cnt!=3' window where S_PAUSE doesn't
+check the resume condition, so iter-1's pulse is lost.  Phase I3's
+silicon-validated 8-byte case worked only because the per-iter
+uart_puts created multi-µs spacing that hid the race.
+
+Fix: insert CTRL_RESET pulse at start of epcs_program_page to clear
+any stale flag_data_valid, plus an 8-cycle dead-loop between DATAIN
+write and CTRL pulse in the inner loop.
+
+Result (capture diag_phase3_mode_t_fix1 + dump fix1_epcs_dump.bin):
+byte match 61.17% → 94.42%.  Sectors 8, 9, 11, 13 program byte-
+identical to src.  Sectors 10 and 12 (EPCS 0xA0000 and 0xC0000)
+still program a deterministic but wrong pattern (~38 mismatches per
+page, no obvious shift/AND model).  Page 0 still fails entirely.
+
+Open: residual sector-10/12 anomaly + page-0 failure.  Deterministic
+(2 runs byte-identical), so not a race.  Cause unclear — patches
+into a separate investigation.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/epcs.c | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/sw/stage2_loader/epcs.c b/sw/stage2_loader/epcs.c
+index 9a1777c..fe9f15d 100644
+--- a/sw/stage2_loader/epcs.c
++++ b/sw/stage2_loader/epcs.c
+@@ -130,6 +130,15 @@ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+     if (len == 0) return 0;
+     if (len > EPCS_PAGE_SIZE) return -1;
+ 
++    /* Clear any stale flag_data_valid from prior op (e.g. last
++     * byte_valid of an earlier WIP-poll cycle).  Without this the
++     * first iter's wait_dv could return immediately on stale flag,
++     * causing the iter-1 CTRL_SHIFT_BYTES pulse to fire while the
++     * wrapper is still mid-CMD-shift (pulse missed by S_PAUSE). */
++    *WB_AM_CTRL = CTRL_RESET;
++    for (volatile int d = 0; d < 32; d++) { }
++    wait_busy_clear(1000u);
++
+     epcs_wren_pulse();
+ 
+     /* First byte: addr + DATAIN + WRITE level (no SHIFT_BYTES yet). */
+@@ -138,7 +147,13 @@ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+     *WB_AM_CTRL   = CTRL_WRITE;
+ 
+     /* Bytes 1..len-1: wait DV (wrapper paused after prior byte) →
+-     * refill DATAIN → SHIFT_BYTES pulse (DV auto-clears on the pulse). */
++     * refill DATAIN → SHIFT_BYTES pulse (DV auto-clears on the pulse).
++     * The dead-loop between DATAIN write and CTRL pulse ensures that
++     * datain_reg is committed AND tick_cnt in S_PAUSE has reached 3
++     * before ctrl_shift_bytes asserts; matches the ~few-µs spacing
++     * that Phase I3's uart_puts inserted (which silicon-validated the
++     * 8-byte case).  Without the delay, iter 1's pulse arrives within
++     * 6-8 sysclks of byte_valid and falls in the tick_cnt<3 window. */
+     for (uint32_t i = 1; i < len; i++) {
+         if (!wait_dv(1000000u)) {
+             *WB_AM_CTRL = 0;
+@@ -146,6 +161,7 @@ int epcs_program_page(uint32_t addr, uint32_t len, const uint8_t *buf)
+             return -2;
+         }
+         *WB_AM_DATAIN = buf[i];
++        for (volatile int d = 0; d < 8; d++) { }
+         *WB_AM_CTRL = CTRL_WRITE | CTRL_SHIFT_BYTES;
+     }
+ 
+-- 
+2.43.0
+
