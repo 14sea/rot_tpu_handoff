@@ -174,7 +174,7 @@ engineering the qmegawiz CLI flow (cf. [[feedback-quartus-clearbox-
 megafunctions]]) and discovering that altremote_update REMOTE-mode
 silently drops write-side ports in Lite Edition.
 
-### Phase 3 — ROT firmware: EPCS write driver + post-write verify
+### Phase 3 — ROT firmware: EPCS write driver + post-write verify  ✅ DONE (silicon-closed 2026-05-19, patches 0031-0033)
 
 **Adds:**
 - `/home/test/neorv32_rot/sw/stage2_loader/epcs.c` + `epcs.h`:
@@ -1258,7 +1258,32 @@ canonical `sha256sum neorv32_tpu.rbf`.
   + `LutCodec.from_cram_model` Python output. Generated `lutcodec_data.c`
   + `.h` get committed (or auto-regenerated at build time).
 
-### Phase 6 — HW validation flow
+### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; TPU-bitstream-side blocks closure)
+
+mode_t end-to-end silicon-validated: SDRAM pre-flight → SD SHA → EPCS
+idempotent check → write_image → read-back VERIFY OK → byte-identical
+via independent openFPGALoader external dump.  Capture
+`docs/captures/diag_phase3_mode_t_prod_write_2201.log` +
+`diag_phase3_mode_t_prod_epcs_dump.bin`.
+
+mode_g end-to-end silicon-validated on the RoT firmware side: SD
+read base+edits → CRC patch → write_image → verify → altremote_update
+trigger fires (`pgm_sel=0x80000`).  Capture
+`docs/captures/diag_phase8_mode_g_crtm_2213.log`.
+
+**Blocker for full CRTM observable demo**: after reconfig trigger,
+FPGA falls back to factory ALINX (page 0) instead of booting from
+slot 1.  Root cause is TPU-bitstream-side: `neorv32_tpu.rbf` was not
+compiled with AS REMOTE update flags (`INTERNAL_FLASH_UPDATE_MODE`
++ application-slot base address).  Fix path: rebuild neorv32_tpu with
+appropriate qsf so it boots cleanly from EPCS byte 0x80000.  Until
+then, the chip-side hardware fallback masks the TPU bitstream as a
+"failed image" and reverts to factory.
+
+The original expected trace below is preserved for reference once the
+TPU bitstream fix lands.
+
+
 
 **SD prep**:
 ```
@@ -1442,7 +1467,7 @@ the validation + tuning loop.)*
 
 </details>
 
-### Phase 8 — Track B: `mode_g` (generate) handler  ✅ DONE (software path)
+### Phase 8 — Track B: `mode_g` (generate) handler  ✅ DONE (silicon-closed 2026-05-19 RoT-side, patch 0034; full demo gated on Phase 6 TPU-side fix)
 
 Wire Phase 7 into stage2's dispatcher.
 
