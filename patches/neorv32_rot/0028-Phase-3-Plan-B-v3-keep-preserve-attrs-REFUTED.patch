@@ -1,0 +1,77 @@
+From 58a205d180744bb6e4249ee58dc064dee065120d Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Mon, 18 May 2026 19:53:50 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=203=20Plan=20B=20v3:=20(*=20keep=20*)=20m?=
+ =?UTF-8?q?iso=5Fin=20+=20(*=20preserve,=20noprune=20*)=20u=5Fasmi=20?=
+ =?UTF-8?q?=E2=80=94=20REFUTED?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Hypothesis: Info 17011 "WYSIWYG SPI primitive miso_in converted to
+equivalent logic" caused by Quartus optimizing away the asmiblock's
+data0out path due to single-fanout pattern.  Tested by adding
+(* keep = 1, noprune *) attribute on miso_in wire AND
+(* preserve, noprune *) on u_asmi instance.
+
+Result: REFUTED.  Info 17011 still fires; message now identifies
+"u_asmi" instead of "miso_in" (the attribute moved the report
+target to the instance itself, confirming the conversion is at
+INSTANCE level, not net level).  HW capture md5
+50f8a01703e391aaa83054909e9b6eec — byte-IDENTICAL to v1+v2 across all
+3 builds.  Phase E addrs 0..3 still all return 0xff.
+
+**Final verdict on Plan B**: hand-rolled SPI master against
+cycloneive_asmiblock primitive is architecturally INFEASIBLE in
+Quartus 21.1 Lite + Cyclone IV E + INTERNAL_FLASH_UPDATE_MODE=REMOTE.
+The toolchain reduces hand-instantiated asmiblock cells to equivalent
+combinational logic that does NOT route to the silicon AS pins,
+regardless of attribute hints (keep, noprune, preserve).  The only
+known path to AS-pin access in this toolchain is via the
+altasmi_parallel megafunction (epcs_ctrl.v), which itself has
+internal pipeline timing races that NH15+NH16-fw+NH17 wrapper-layer
+patches could not eliminate.
+
+Both wrapper paths exhausted; Phase 3 content-read closure requires
+either: (a) toolchain change (Quartus Pro / different version), (b)
+firmware-side approach using altasmi but with different pacing
+strategy (e.g., wrapping altasmi with a FIFO + length counter to
+break the megafunction's internal stream-overflow), or (c) deferring
+Phase 3 to focus on Phase 6/9 progress while content-read remains
+PARTIAL (blank-flash detect already silicon-closed via NH10).
+---
+ rtl/wb_altasmi_parallel.v | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/rtl/wb_altasmi_parallel.v b/rtl/wb_altasmi_parallel.v
+index 4eecb1d..c43c2d4 100644
+--- a/rtl/wb_altasmi_parallel.v
++++ b/rtl/wb_altasmi_parallel.v
+@@ -181,7 +181,14 @@ module wb_altasmi_parallel (
+     // Outputs to the asmiblock primitive.
+     reg cs_n_q;
+     reg mosi_q;
+-    wire miso_in;
++    // Plan B v3 (2026-05-18): explicit (* keep *) on miso_in to test
++    // whether Info 17011 "WYSIWYG SPI primitive miso_in converted to
++    // equivalent logic" in Plan B v1+v2 was caused by Quartus optimizing
++    // away the asmiblock primitive's data0out path.  altasmi-based
++    // builds don't trigger 17011; hand-rolled v1+v2 do and produce
++    // all-0xff reads.  This attribute forces Quartus to preserve the
++    // wire as a real net rather than fold it into combinational logic.
++    (* keep = 1, noprune *) wire miso_in;
+ 
+     // oe MUST be tied to a constant 1'b0 for the asmiblock primitive to
+     // be preserved by Quartus 21.1 Lite as a hardware cell rather than
+@@ -428,7 +435,7 @@ module wb_altasmi_parallel (
+     // 5-port single-bit SPI to dedicated AS pins
+     // (cycloneive_atoms.v line 7017).  oe=0 → user logic drives DCLK
+     // / nCSO / ASDO; data0out reads DATA0 (MISO).
+-    cycloneive_asmiblock u_asmi (
++    (* preserve, noprune *) cycloneive_asmiblock u_asmi (
+         .dclkin   (sck_q),
+         .scein    (cs_n_q),
+         .oe       (oe_const),
+-- 
+2.43.0
+
