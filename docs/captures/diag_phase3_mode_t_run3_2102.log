@@ -1,0 +1,17 @@
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe r=reconfig
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: TPU bitstream verify + EPCS persist (Phase 1+3)
+[stage2] SDRAM scratch test @0x41000000... PASS
+[sd] tpu_lba=0x00001f49 tpu_sz=0x00059d8b
+[sd] reading TPU.rbf
+[rot] TPU sha256=0x6fe905400xdc191aba0x81d95dd40xfaa6bed80xa65abbda0xede05c230x29ea1f000x5f1a8c50 [OK]
+[rot] Phase 1 SD-side SHA verified.
+[rot] EPCS slot 1 idempotency check (read 0x00059d8b B @0x00080000)
+[rot] EPCS sha256=0x37b56eeb0xbeefdbe40xf9f6129b0x3eb8b6690x5713e7750x4d9d21b90x5d5974920xd3d5d5e0 [MISMATCH] — writing image
+[rot] write OK — reading back for SHA verify
+[rot] EPCS sha256=0x6b2100e00x9dcea30f0x8a7e62430x97663b410xc443a2560x400af7560x93ffaf990x9826f1dd [VERIFY FAIL] — EPCS persist broken
