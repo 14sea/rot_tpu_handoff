@@ -1258,7 +1258,7 @@ canonical `sha256sum neorv32_tpu.rbf`.
   + `LutCodec.from_cram_model` Python output. Generated `lutcodec_data.c`
   + `.h` get committed (or auto-regenerated at build time).
 
-### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; TPU-bitstream-side blocks closure)
+### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; CRTM closure gated on chip-side AS REMOTE rublock-wrapper bug — TPU REMOTE qsf hypothesis empirically REFUTED 2026-05-19 night)
 
 mode_t end-to-end silicon-validated: SDRAM pre-flight → SD SHA → EPCS
 idempotent check → write_image → read-back VERIFY OK → byte-identical
@@ -1271,17 +1271,61 @@ read base+edits → CRC patch → write_image → verify → altremote_update
 trigger fires (`pgm_sel=0x80000`).  Capture
 `docs/captures/diag_phase8_mode_g_crtm_2213.log`.
 
-**Blocker for full CRTM observable demo**: after reconfig trigger,
-FPGA falls back to factory ALINX (page 0) instead of booting from
-slot 1.  Root cause is TPU-bitstream-side: `neorv32_tpu.rbf` was not
-compiled with AS REMOTE update flags (`INTERNAL_FLASH_UPDATE_MODE`
-+ application-slot base address).  Fix path: rebuild neorv32_tpu with
-appropriate qsf so it boots cleanly from EPCS byte 0x80000.  Until
-then, the chip-side hardware fallback masks the TPU bitstream as a
-"failed image" and reverts to factory.
+**2026-05-19 night Phase 6 push** — the TPU-bitstream-side hypothesis
+was empirically refuted.  Trail:
+
+1. Patch `patches/neorv32_tpu/0001`: rebuild `neorv32_tpu.rbf` with
+   `INTERNAL_FLASH_UPDATE_MODE=REMOTE` + USE_CONFIGURATION_DEVICE /
+   EPCS16 / "ACTIVE SERIAL".  ζ-verified, 368011 B, sd-pack written
+   to slot 1, mode_g run — chip STILL falls back to factory ALINX.
+   `diag_phase6_tpu_remote_*.log`.
+2. Patch 0036 (Audit #9): fallback detect added.  Re-run — fallback
+   detect never fires, meaning the chip honours rconfig but loads
+   from byte 0 regardless of pgm_sel.  Refutes "TPU image fails CRC
+   so chip auto-falls-back".
+3. Patch 0037 audit-#8 part: change firmware to set AP_CONFIG_SEL=1
+   (wrapper had it hardcoded to 0 = factory boot next).  Re-run —
+   same fallback to factory.  Refutes "AP_CONFIG_SEL=0 was sole bug".
+4. Flashed RoT.rbf (REMOTE-compiled) to EPCS page 0 so the chip
+   cold-boots from a REMOTE-mode bitstream.  `diag_phase6_page0_flash_*
+   .log` shows clean transition from factory ALINX RTC chatter to
+   RoT stage2 banner.  Re-run mode_g with AP_CONFIG_SEL=1 + pgm_sel
+   = 0x80000 — still falls back to page-0 RoT (not slot-1 TPU).
+   Refutes "chip needs REMOTE-compiled page-0 bitstream to enter
+   REMOTE mode".
+5. Patch 0037 mode 'X': parametric reconfig + echo-check via new
+   RTL CMD bit 4 SHIFT_IN_ONLY.  Sweep over pgm_sel encodings
+   (byte verbatim / byte>>2 word / Arria-style ANF-at-LSB) — every
+   trial falls back to page-0 RoT.
+6. Echo-check (mode X Phase 1 SHIFT_IN_ONLY + Phase 2
+   SHIFT_OUT_CAPTURE): sent 0x12345678 → echo 0x02100000, sent
+   0x1FFFFFFF → echo 0x1FFFE000.  Echo IS input-dependent but isn't
+   a clean writeback — bottom 13 bits of trial 2 zeroed, set bits
+   of trial 1 scattered.  Working hypothesis: wrapper's S_SHIFT_OUT
+   with `captnupdt=1` is capturing the rublock STATUS_REG (chip
+   read-only state), not CONFIG_REG (what we wrote).
+   `diag_phase6_echo_check_*.log`.
+
+**Current state at session end (2026-05-19 night)**: EPCS page 0
+holds the REMOTE-compiled RoT firmware (md5
+`6610003c25f10345d182d6e3f20a0415`, includes mode Q + mode X + the
+SHIFT_IN_ONLY RTL).  Slot 1 (0x80000) holds the REMOTE-compiled
+TPU.rbf (sha256 `6fe90540…`).  Two EPCS backups for recovery:
+`docs/safety/epcs_backup_2026_05_18.bin` (factory ALINX) and
+`docs/safety/epcs_backup_20260519_2049.bin` (pre-page-0-flash).
+Restore with `openFPGALoader -c usb-blaster -B
+spiOverJtag_ep4ce1017.rbf.gz -f <backup>`.
+
+**Next-session blocker analysis**: need to nail down the
+cycloneive_rublock primitive's exact pin semantics (PGM_SEL units —
+bytes vs 32-bit words vs pages; bit ordering at regin/regout; whether
+S_LOAD_POST's 1-cycle shiftnld=0 is sufficient to commit; whether
+captnupdt distinguishes config vs status register paths) from
+AN603 + Cyclone IV Handbook Vol 1 Ch 8 BEFORE more iron iteration.
+Then one targeted RTL+firmware iteration on the wrapper's bug.
 
 The original expected trace below is preserved for reference once the
-TPU bitstream fix lands.
+chip-side rublock-wrapper bug lands.
 
 
 
