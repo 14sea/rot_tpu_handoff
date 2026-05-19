@@ -28,6 +28,10 @@ PATCH_DIR    := $(REPO)/patches/neorv32_rot
 PATCHES      := $(sort $(wildcard $(PATCH_DIR)/*.patch))
 APPLIED_TAG  := $(ROT_REPO)/.rot_tpu_handoff_applied
 
+TPU_PATCH_DIR    := $(REPO)/patches/neorv32_tpu
+TPU_PATCHES      := $(sort $(wildcard $(TPU_PATCH_DIR)/*.patch))
+TPU_APPLIED_TAG  := $(TPU_REPO)/.rot_tpu_handoff_applied
+
 TPU_QUARTUS  := $(TPU_REPO)/quartus
 TPU_PROJECT  := neorv32_tpu
 TPU_RBF_SRC  := $(TPU_REPO)/$(TPU_PROJECT).rbf
@@ -47,9 +51,9 @@ help:
 	@echo "rot_tpu_handoff — cross-repo orchestrator"
 	@echo
 	@echo "Patch management:"
-	@echo "  apply-patches      git am the patches into \$$ROT_REPO ($(ROT_REPO))"
-	@echo "  unapply-patches    git reset \$$ROT_REPO back to pre-apply state"
-	@echo "  verify-pristine    abort if \$$ROT_REPO has uncommitted changes"
+	@echo "  apply-patches      git am ROT + TPU patches into \$$ROT_REPO + \$$TPU_REPO"
+	@echo "  unapply-patches    git reset both repos back to pre-apply state"
+	@echo "  verify-pristine    abort if either repo has uncommitted changes"
 	@echo
 	@echo "Build chain (requires apply-patches first):"
 	@echo "  tpu-then-rot       full chain: TPU bitstream → copy → ROT firmware → ROT bitstream"
@@ -86,6 +90,15 @@ verify-pristine:
 	      exit 1; \
 	  fi
 	@echo "[ok] $(ROT_REPO) is pristine (submodule + untracked artifacts ignored)"
+	@if [ -n "$(TPU_PATCHES)" ]; then \
+	  cd $(TPU_REPO) && \
+	    if ! git diff --quiet HEAD -- ':!neorv32' ':!neorv32_tpu.rbf' 2>/dev/null; then \
+	        echo "[!] $(TPU_REPO) has uncommitted changes — refusing to apply patches"; \
+	        git status --short | head; \
+	        exit 1; \
+	    fi; \
+	  echo "[ok] $(TPU_REPO) is pristine (submodule + rbf artifact ignored)"; \
+	fi
 
 apply-patches: verify-pristine
 	@if [ -f $(APPLIED_TAG) ]; then \
@@ -98,8 +111,24 @@ apply-patches: verify-pristine
 	@cd $(ROT_REPO) && git rev-parse HEAD > $(APPLIED_TAG)
 	@echo "[apply] DONE — head now $$(cd $(ROT_REPO) && git rev-parse --short HEAD)"
 	@echo "       saved tip to $(APPLIED_TAG) for unapply"
+	@if [ -n "$(TPU_PATCHES)" ]; then \
+	    if [ -f $(TPU_APPLIED_TAG) ]; then \
+	        echo "[!] TPU patches already applied (marker $(TPU_APPLIED_TAG))"; \
+	        exit 1; \
+	    fi; \
+	    echo "[apply] git am $(words $(TPU_PATCHES)) patches into $(TPU_REPO)"; \
+	    cd $(TPU_REPO) && git am --keep-cr $(TPU_PATCHES); \
+	    cd $(TPU_REPO) && git rev-parse HEAD > $(TPU_APPLIED_TAG); \
+	    echo "[apply] DONE — TPU head now $$(cd $(TPU_REPO) && git rev-parse --short HEAD)"; \
+	fi
 
 unapply-patches:
+	@if [ -f $(TPU_APPLIED_TAG) ]; then \
+	    target=$$(cd $(TPU_REPO) && git rev-parse "HEAD~$(words $(TPU_PATCHES))"); \
+	      echo "[unapply] git reset --hard $$target in $(TPU_REPO)"; \
+	      cd $(TPU_REPO) && git reset --hard $$target; \
+	    rm -f $(TPU_APPLIED_TAG); \
+	fi
 	@if [ ! -f $(APPLIED_TAG) ]; then \
 	    echo "[!] no apply marker $(APPLIED_TAG) — nothing to unapply"; \
 	    exit 1; \
@@ -121,8 +150,9 @@ tpu-bitstream: $(TPU_RBF_SRC)
 $(TPU_RBF_SRC): $(TPU_QUARTUS)/$(TPU_PROJECT).qsf
 	@echo "[tpu] quartus_sh --flow compile in $(TPU_QUARTUS)"
 	@cd $(TPU_QUARTUS) && PATH="$(PATH_FULL)" $(QSH) --flow compile $(TPU_PROJECT)
+	@# TPU project keeps .sof in quartus/ (no output_files/ subdir).
 	@cd $(TPU_QUARTUS) && PATH="$(PATH_FULL)" $(QCPF) -c -o bitstream_compression=off \
-	    output_files/$(TPU_PROJECT).sof ../$(TPU_PROJECT).rbf
+	    $(TPU_PROJECT).sof ../$(TPU_PROJECT).rbf
 	@ls -la $(TPU_RBF_SRC)
 
 tpu-zeta-verify: $(TPU_RBF_SRC)
@@ -142,10 +172,8 @@ rot-firmware: $(TPU_RBF_DST)
 
 rot-bitstream: rot-firmware
 	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QSH) --flow compile $(ROT_PROJECT)
-	@# ROT qsf doesn't set PROJECT_OUTPUT_DIRECTORY → .sof lands in
-	@# $(ROT_QUARTUS) itself, not output_files/.  TPU project sets the
-	@# directory so its sof is under output_files/ — see tpu-bitstream
-	@# target above for the asymmetric handling.
+	@# Neither project sets PROJECT_OUTPUT_DIRECTORY → .sof lands in
+	@# $(ROT_QUARTUS) / $(TPU_QUARTUS) itself, not output_files/.
 	@cd $(ROT_QUARTUS) && PATH="$(PATH_FULL)" $(QCPF) -c -o bitstream_compression=off \
 	    $(ROT_PROJECT).sof ../output/$(ROT_PROJECT).rbf
 	@ls -la $(ROT_RBF)
