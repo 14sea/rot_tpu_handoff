@@ -1,0 +1,24 @@
+
+=== TRIAL A_arria_bytes: pgm_sel=0x00100001 AP=0 ===
+[stage2] Mode: parametric reconfig
+[host] send 8 hex digits for pgm_sel, then '0' or '1' for AP_CONFIG_SEL
+[rot] pgm_sel=0x00100001 AP_CONFIG_SEL=0x00000000
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
+
+=== TRIAL B_arria_words: pgm_sel=0x00040001 AP=0 ===
+[stage2] Mode: parametric reconfig
+[host] send 8 hex digits for pgm_sel, then '0' or '1' for AP_CONFIG_SEL
+[rot] pgm_sel=0x00040001 AP_CONFIG_SEL=0x00000000
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command

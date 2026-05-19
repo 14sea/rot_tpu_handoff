@@ -1,0 +1,11 @@
+
+[host: sent 'Q' at 20:46:52]
+[stage2] Mode: rublock capture probe
+[rot] STATUS pre  = 0x00000000
+[rot] STATUS post = 0x00000002
+[rot] capture_reg = 0x00000000
+[rot]   PGM_SEL[23:0]   = 0x00000000
+[rot]   WD_EN[24]       = 0x00000000
+[rot]   WD_TMR[27:25]   = 0x00000000
+[rot]   AP_CONFIG[28]   = 0x00000000
+[stage2] ready for next cmd

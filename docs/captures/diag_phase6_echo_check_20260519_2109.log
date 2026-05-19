@@ -1,0 +1,21 @@
+=== cold-boot ===
+
+=== TRIAL 1: payload 0x12345678 echo-check ===
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x12345678
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x02100000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+[rot] aborted, no reconfig
+[stage2] ready for next cmd
+
+=== TRIAL 2: payload 0x1FFFFFFF echo-check ===
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x1fffffff
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x1fffe000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+[rot] aborted, no reconfig
+[stage2] ready for next cmd

@@ -1,0 +1,33 @@
+
+=== Q probe at 20:53:11 ===
+[stage2] Mode: rublock capture probe
+[rot] STATUS pre  = 0x00000000
+[rot] STATUS post = 0x00000002
+[rot] capture_reg = 0x00000000
+[rot]   PGM_SEL[23:0]   = 0x00000000
+[rot]   WD_EN[24]       = 0x00000000
+[rot]   WD_TMR[27:25]   = 0x00000000
+[rot]   AP_CONFIG[28]   = 0x00000000
+[stage2] ready for next cmd
+
+=== sent 'g' at 20:53:14 ===
+[stage2] Mode: generate (Phase 8 — LUT mask editor)
+[sd] tpu_lba=0x00001f49 tpu_sz=0x00059d8b edits_lba=0x00002219 edits_sz=0x00000018
+[sd] reading base.rbf
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000001
+[rot] base sha256=0x6fe905400xdc191aba0x81d95dd40xfaa6bed80xa65abbda0xede05c230x29ea1f000x5f1a8c50 [OK]
+[rot] applied 0x00000001 edits
+[rot] CRC patched (dirty frames only)
+[rot] result sha256=0x6fe905400xdc191aba0x81d95dd40xfaa6bed80xa65abbda0xede05c230x29ea1f000x5f1a8c50
+[rot] EPCS slot 1 idempotency check (read 0x00059d8b B @0x00080000)
+[rot] EPCS sha256=0x6fe905400xdc191aba0x81d95dd40xfaa6bed80xa65abbda0xede05c230x29ea1f000x5f1a8c50 [MATCH] — slot already up-to-date, skipping write
+[rot] Phase 8 steps 1-9 complete — slot 1 holds the edited bitstream.
+[rot] altremote: pgm_sel=0x00080000 WD_EN=0 AP_CONFIG_SEL=1 — triggering reconfig into slot 1
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery r=reconfig
+[stage2] CRTM locked — waiting for host command
