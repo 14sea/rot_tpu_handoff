@@ -1,0 +1,164 @@
+From 1ec2ae7c439eb02035d9dbcb8f96e631883981ca Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Tue, 19 May 2026 20:05:09 +0100
+Subject: [PATCH] Phase 8 / Audit #9: mode_g + mode_r fallback detect
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+After epcs_remote_reconfig() triggers SHIFT_IN_AND_RECONFIG the wrapper
+FSM completes its 29-bit shift + rconfig pulse + 16-cycle hold in ~1 us.
+If the chip honours rconfig the CPU is wiped before any subsequent
+instruction can execute; if the chip ignores rconfig (e.g. not in REMOTE
+mode, or pgm_sel pointed at an image whose AS header fails validation
+and the chip auto-fell-back to page 0 without ever applying our pulse)
+the FSM still completes and STATUS.done_sticky goes high.
+
+Drop the __noreturn__ attribute, poll STATUS for done_sticky (or busy
+gate / timeout), and return an enumerated error code so callers can:
+  - mode_g (mode_generate): print '[rot] FALLBACK — TPU image bad,
+    staying in ROT' and fall through to the persistent command loop.
+  - mode_r: print '[rot] FALLBACK — page 0 reconfig failed' similarly.
+
+This is the audit #9 follow-up to the 2026-05-19 Phase 8 silicon test
+where mode_g reconfig'd to slot 1 and the chip fell back to factory
+ALINX — without fallback detect the only way to confirm the fall back
+was to wait and watch the UART for the ALINX banner.  Now the RoT
+itself surfaces the diagnostic before yielding control to whatever the
+chip ends up running.
+
+Stage2 ELF 22760 B → 22920 B (+160 B for the polling loop, FALLBACK
+strings, and the two-call-site dispatch).
+---
+ sw/stage2_loader/main.c          | 11 ++++++++--
+ sw/stage2_loader/remote_update.c | 35 ++++++++++++++++++++++++--------
+ sw/stage2_loader/remote_update.h | 27 ++++++++++++------------
+ 3 files changed, 50 insertions(+), 23 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 11d1410..8f5ad16 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1895,7 +1895,11 @@ static void mode_generate(void)
+      * specified byte address.  Point of no return. */
+     uart_puts("[rot] altremote: pgm_sel="); uart_puthex32(EPCS_TPU_BASE);
+     uart_puts(" WD_EN=0 AP_CONFIG_SEL=0 — triggering reconfig into slot 1\r\n");
+-    epcs_remote_reconfig(EPCS_TPU_BASE);
++    int rr = epcs_remote_reconfig(EPCS_TPU_BASE);
++    /* Audit #9: any return is a failure — the success path reboots the
++     * chip and the CPU is wiped before this line executes. */
++    uart_puts("[rot] FALLBACK — TPU image bad, staying in ROT (status=");
++    uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
+ }
+ 
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+@@ -2054,7 +2058,10 @@ int main(void)
+                       "page 0 (factory ALINX)\r\n");
+             uart_puts("[rot] altremote: pgm_sel=0x000000 WD_EN=0 "
+                       "AP_CONFIG_SEL=0 — triggering reconfig\r\n");
+-            epcs_remote_reconfig(0);   /* noreturn */
++            int rr = epcs_remote_reconfig(0);
++            /* Audit #9: success path never returns. */
++            uart_puts("[rot] FALLBACK — page 0 reconfig failed (status=");
++            uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
+         } else {
+             uart_puts("[!] unknown mode byte — ignored\r\n");
+         }
+diff --git a/sw/stage2_loader/remote_update.c b/sw/stage2_loader/remote_update.c
+index 1fb419b..37ac8ad 100644
+--- a/sw/stage2_loader/remote_update.c
++++ b/sw/stage2_loader/remote_update.c
+@@ -1,11 +1,20 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * remote_update.c — Phase 4 EPCS remote-update trigger.
+- * See remote_update.h for protocol notes.
++ * remote_update.c — Phase 4 EPCS remote-update trigger + Audit #9
++ * fallback detect.  See remote_update.h for protocol notes.
+  */
+ #include "remote_update.h"
+ 
+-void epcs_remote_reconfig(uint32_t pgm_sel)
++/* Wrapper FSM (rtl/wb_altremote_update.v) finishes its 29-bit shift +
++ * rconfig pulse + 16-cycle hold in ~51 clk at 50 MHz (~1 us).  If the
++ * chip honours rconfig the CPU is wiped within microseconds of the
++ * pulse, so the polling loop below NEVER observes done_sticky in the
++ * success path.  If done_sticky comes back high we know the rconfig
++ * pulse fired but the chip stayed alive — that's the fallback signal
++ * Audit #9 wants surfaced to the caller. */
++#define RR_POLL_ITERS  500000u  /* worst-case ~50 ms on a small RV32 core */
++
++int epcs_remote_reconfig(uint32_t pgm_sel)
+ {
+     /* Drain UART TX FIFO so the caller's "triggering reconfig" line
+      * finishes before rconfig fires.  Same idiom as mode_set_baud. */
+@@ -13,14 +22,24 @@ void epcs_remote_reconfig(uint32_t pgm_sel)
+     while (!(uart_ctrl[0] & (1u << 18))) { /* TX_EMPTY */ }
+     for (volatile int i = 0; i < 2000; i++) { }
+ 
+-    /* WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 — payload is just PGM_SEL. */
+-    volatile uint32_t *altru_data = (volatile uint32_t *)0xF3000000UL;
+-    volatile uint32_t *altru_cmd  = (volatile uint32_t *)0xF3000004UL;
++    volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
++    volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
++    volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
+ 
++    /* Refuse to trigger if FSM is already busy. */
++    if ((*altru_status) & 0x1u) return RR_BUSY;
++
++    /* WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 — payload is just PGM_SEL. */
+     altru_data[0] = pgm_sel & 0x00FFFFFFu;
+     /* SHIFT_IN_AND_RECONFIG: FSM shifts 29 bits in then pulses rconfig.
+-     * Point of no return — FPGA reloads from new page in ~150 ms. */
++     * Point of no return — FPGA reloads from new page in ~150 ms IF the
++     * chip is in REMOTE mode and the target image is valid. */
+     altru_cmd[0]  = 0x1u;
+ 
+-    while (1) { __asm__ volatile ("nop"); }
++    /* Poll STATUS for done_sticky.  Observing it means the FSM finished
++     * but the chip ignored rconfig — Audit #9 fallback path. */
++    for (uint32_t i = 0; i < RR_POLL_ITERS; i++) {
++        if ((*altru_status) & 0x2u) return RR_FALLBACK;
++    }
++    return RR_TIMEOUT;
+ }
+diff --git a/sw/stage2_loader/remote_update.h b/sw/stage2_loader/remote_update.h
+index b404990..6dd6c6e 100644
+--- a/sw/stage2_loader/remote_update.h
++++ b/sw/stage2_loader/remote_update.h
+@@ -25,18 +25,19 @@
+ 
+ #include <stdint.h>
+ 
+-/*
+- * Trigger a remote-update reconfig to the given EPCS byte address with
+- * WD_EN=0 and AP_CONFIG_SEL=0.  Does not return — the FPGA reloads its
+- * configuration from the target page within ~150 ms.
+- *
+- * Caller should print any final diagnostics BEFORE calling this; the
+- * function drains the UART TX FIFO immediately on entry, but no further
+- * output is guaranteed after the SHIFT_IN_AND_RECONFIG trigger.
+- *
+- * If the FSM fails to accept the trigger (busy gate) the function hangs
+- * in an infinite NOP loop rather than returning.
+- */
+-void epcs_remote_reconfig(uint32_t pgm_sel) __attribute__((noreturn));
++/* Audit #9 (2026-05-19): epcs_remote_reconfig is no longer __noreturn__.
++ * In the success path the chip reboots within ~1 us of the rconfig pulse
++ * and the function never returns; in the fallback path (chip ignores
++ * rconfig because it is not in REMOTE mode or the target image's header
++ * fails AS validation) the wrapper FSM completes normally and the
++ * function returns RR_FALLBACK so callers can print a diagnostic and
++ * stay in RoT instead of hanging in a noreturn nop loop. */
++enum {
++    RR_FALLBACK = -1,  /* FSM completed, chip stayed alive */
++    RR_BUSY     = -2,  /* FSM was busy at trigger time */
++    RR_TIMEOUT  = -3   /* FSM neither completed nor caused reboot */
++};
++
++int epcs_remote_reconfig(uint32_t pgm_sel);
+ 
+ #endif
+-- 
+2.43.0
+

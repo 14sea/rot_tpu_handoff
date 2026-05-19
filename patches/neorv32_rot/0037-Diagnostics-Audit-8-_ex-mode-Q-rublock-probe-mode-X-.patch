@@ -1,0 +1,346 @@
+From 5330eb587c06eb89736faa30fb975fd84e5a5a44 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Tue, 19 May 2026 21:58:22 +0100
+Subject: [PATCH] Diagnostics: Audit #8 _ex, mode Q rublock probe, mode X
+ param-reconfig, SHIFT_IN_ONLY RTL
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Audit #8 (parameterization):
+ - epcs_remote_reconfig_ex(pgm_sel, wd_en, wd_tmr, ap_config_sel) exposes
+   all four 29-bit payload fields.  mode_g now uses AP_CONFIG_SEL=1 so
+   the chip honours pgm_sel instead of falling back to factory page 0.
+ - Bare epcs_remote_reconfig() kept as compat wrapper with the original
+   (0, 0, 0) defaults; used by mode 'r' (factory boot test).
+
+Mode 'Q' (rublock SHIFT_OUT_CAPTURE probe):
+ - Non-destructive query that issues CMD=0x2 (SHIFT_OUT_CAPTURE) and
+   prints STATUS pre/post + the 29-bit capture_reg with field decode
+   (PGM_SEL / WD_EN / WD_TMR / AP_CONFIG_SEL).  2026-05-19 silicon: after
+   cold-boot from EPCS page 0 the capture is all zeros — consistent
+   with the rublock register at its reset state, but does NOT
+   discriminate REMOTE vs regular AS mode (both can read as zero).
+
+Mode 'X' (parametric reconfig + echo-check):
+ - Reads 8 hex digits as a raw 29-bit payload (masked 0x1FFFFFFF).
+ - Phase 1: SHIFT_IN_ONLY via the new wrapper CMD bit 4 — loads the
+   rublock register without firing rconfig.
+ - Phase 2: SHIFT_OUT_CAPTURE — reads back and compares vs the sent
+   payload.  Used to verify the rublock register retains writes.
+ - Phase 3: prompts 'y' to fire SHIFT_IN_AND_RECONFIG with that payload;
+   any other char aborts so we can iterate test values without rebooting.
+
+RTL: CMD bit 4 = SHIFT_IN_ONLY in rtl/wb_altremote_update.v:
+ - New trig_shift_in_only latch parallel to trig_shift_in.
+ - S_IDLE branches to S_LOAD_PRE with auto_reconfig=0, so S_LOAD_POST
+   transitions to S_DONE instead of S_RECONFIG.
+
+Empirical findings (2026-05-19 night):
+ - After cold-boot from EPCS page-0 REMOTE-compiled RoT, mode_g with
+   AP_CONFIG_SEL=1 still falls back to page 0 RoT (not slot 1 TPU).
+ - fallback detect never fires — chip honours rconfig pulse but loads
+   from byte 0 regardless of pgm_sel.
+ - Echo-check via SHIFT_IN_ONLY + SHIFT_OUT_CAPTURE shows partial
+   bleed-through: sending 0x12345678 echoes 0x02100000, sending
+   0x1FFFFFFF echoes 0x1FFFE000.  The rublock's SHIFT_OUT (captnupdt=1)
+   captures the STATUS register (read-only chip state), NOT the
+   CONFIG register we wrote — so the echo isn't a clean writeback test.
+   Different SHIFT_IN inputs still produce different echoes, suggesting
+   the wrapper FSM's S_CAP_PRE / S_SHIFT_OUT may not be fully isolating
+   the two register paths.
+
+Stage2 ELF 22920 → 24384 B (+1464 B for Audit #8 _ex + Q + X with hex
+parse + echo-check + abort prompt).
+---
+ rtl/wb_altremote_update.v        | 50 +++++++++++-------
+ sw/stage2_loader/main.c          | 91 ++++++++++++++++++++++++++++++--
+ sw/stage2_loader/remote_update.c | 30 +++++++++--
+ sw/stage2_loader/remote_update.h |  7 +++
+ 4 files changed, 153 insertions(+), 25 deletions(-)
+
+diff --git a/rtl/wb_altremote_update.v b/rtl/wb_altremote_update.v
+index 51bbd61..33bcc7a 100644
+--- a/rtl/wb_altremote_update.v
++++ b/rtl/wb_altremote_update.v
+@@ -35,6 +35,11 @@
+ //                       this is the factory image — useful for testing).
+ //                  b3 = RESET_TIMER           : pulse rsttimer
+ //                       (watchdog clear; cheap when WD_EN=0).
++//                  b4 = SHIFT_IN_ONLY         : load DATA, shift it
++//                       into rublock (29 cycles), but DO NOT pulse
++//                       rconfig.  Diagnostic to verify the rublock
++//                       register retains writes — pair with
++//                       SHIFT_OUT_CAPTURE to read back.
+ //                  CMD writes are level-edge: any high bit triggers
+ //                  the corresponding action.  STATUS.busy gates new
+ //                  triggers.
+@@ -111,6 +116,7 @@ module wb_altremote_update (
+     reg trig_shift_out;
+     reg trig_reconfig;
+     reg trig_rsttimer;
++    reg trig_shift_in_only;  /* 2026-05-19 diagnostic */
+ 
+     // NH12 (2026-05-17 silicon): the bus block clears trig_* one cycle
+     // after CMD write, but S_LOAD_POST reads them ~31 cycles later — so
+@@ -153,6 +159,11 @@ module wb_altremote_update (
+                         // so this is unconditional in the shift_in branch.
+                         auto_reconfig <= 1'b1;
+                         state         <= S_LOAD_PRE;
++                    end else if (trig_shift_in_only) begin
++                        /* 2026-05-19 diagnostic: shift in but don't reconfig. */
++                        shift_buf     <= data_reg;
++                        auto_reconfig <= 1'b0;
++                        state         <= S_LOAD_PRE;
+                     end else if (trig_shift_out) begin
+                         state <= S_CAP_PRE;
+                     end else if (trig_reconfig) begin
+@@ -251,22 +262,24 @@ module wb_altremote_update (
+     // ── Wishbone bus transaction ─────────────────────────────────────
+     always @(posedge clk or negedge rst_n) begin
+         if (!rst_n) begin
+-            xbus_ack        <= 1'b0;
+-            xbus_dat_r      <= 32'd0;
+-            data_reg        <= 29'd0;
+-            trig_shift_in   <= 1'b0;
+-            trig_shift_out  <= 1'b0;
+-            trig_reconfig   <= 1'b0;
+-            trig_rsttimer   <= 1'b0;
+-            status_read_req <= 1'b0;
++            xbus_ack            <= 1'b0;
++            xbus_dat_r          <= 32'd0;
++            data_reg            <= 29'd0;
++            trig_shift_in       <= 1'b0;
++            trig_shift_out      <= 1'b0;
++            trig_reconfig       <= 1'b0;
++            trig_rsttimer       <= 1'b0;
++            trig_shift_in_only  <= 1'b0;
++            status_read_req     <= 1'b0;
+         end else begin
+-            xbus_ack        <= 1'b0;
++            xbus_ack            <= 1'b0;
+             // Auto-clear triggers (consumed by FSM on next IDLE check)
+-            trig_shift_in   <= 1'b0;
+-            trig_shift_out  <= 1'b0;
+-            trig_reconfig   <= 1'b0;
+-            trig_rsttimer   <= 1'b0;
+-            status_read_req <= 1'b0;
++            trig_shift_in       <= 1'b0;
++            trig_shift_out      <= 1'b0;
++            trig_reconfig       <= 1'b0;
++            trig_rsttimer       <= 1'b0;
++            trig_shift_in_only  <= 1'b0;
++            status_read_req     <= 1'b0;
+ 
+             if (xbus_cyc && xbus_stb && in_range && !xbus_ack) begin
+                 xbus_ack <= 1'b1;
+@@ -276,10 +289,11 @@ module wb_altremote_update (
+                         8'h04: begin
+                             // Only accept new trigger when idle
+                             if (!busy) begin
+-                                trig_shift_in  <= xbus_dat_w[0];
+-                                trig_shift_out <= xbus_dat_w[1];
+-                                trig_reconfig  <= xbus_dat_w[2];
+-                                trig_rsttimer  <= xbus_dat_w[3];
++                                trig_shift_in      <= xbus_dat_w[0];
++                                trig_shift_out     <= xbus_dat_w[1];
++                                trig_reconfig      <= xbus_dat_w[2];
++                                trig_rsttimer      <= xbus_dat_w[3];
++                                trig_shift_in_only <= xbus_dat_w[4];
+                             end
+                         end
+                         default: ;
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 8f5ad16..1fc9239 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1894,8 +1894,11 @@ static void mode_generate(void)
+      * which causes FPGA to reload its configuration from EPCS at the
+      * specified byte address.  Point of no return. */
+     uart_puts("[rot] altremote: pgm_sel="); uart_puthex32(EPCS_TPU_BASE);
+-    uart_puts(" WD_EN=0 AP_CONFIG_SEL=0 — triggering reconfig into slot 1\r\n");
+-    int rr = epcs_remote_reconfig(EPCS_TPU_BASE);
++    uart_puts(" WD_EN=0 AP_CONFIG_SEL=1 — triggering reconfig into slot 1\r\n");
++    /* Audit #8: AP_CONFIG_SEL=1 so the chip honours pgm_sel and boots
++     * the application image at 0x80000, instead of ignoring pgm_sel
++     * and falling back to factory page 0 (the 2026-05-19 silicon bug). */
++    int rr = epcs_remote_reconfig_ex(EPCS_TPU_BASE, 0u, 0u, 1u);
+     /* Audit #9: any return is a failure — the success path reboots the
+      * chip and the CPU is wiped before this line executes. */
+     uart_puts("[rot] FALLBACK — TPU image bad, staying in ROT (status=");
+@@ -2021,7 +2024,7 @@ int main(void)
+      * ROM to fall back to, so we must NOT drop into mode_uboot on timeout.
+      * Sit forever waiting for a host byte — same idle behavior as the
+      * re-prompt loop. */
+-    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe r=reconfig\r\n");
++    uart_puts("[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig\r\n");
+     uart_puts("[stage2] CRTM locked — waiting for host command\r\n");
+     int mode;
+     while ((mode = uart_getc_timeout(3600000)) < 0) { }
+@@ -2062,6 +2065,88 @@ int main(void)
+             /* Audit #9: success path never returns. */
+             uart_puts("[rot] FALLBACK — page 0 reconfig failed (status=");
+             uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
++        } else if (mode == 'X') {
++            /* 2026-05-19 diagnostic: parametric reconfig with rublock-
++             * register echo-check.  Reads 8 hex digits as a full 29-bit
++             * payload (mask 0x1FFFFFFF), shifts it in non-destructively,
++             * captures the rublock register back, prints the comparison,
++             * then asks the host whether to actually fire reconfig. */
++            volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
++            volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
++            volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
++            uart_puts("[stage2] Mode: parametric reconfig + echo-check\r\n");
++            uart_puts("[host] send 8 hex digits for raw 29-bit payload\r\n");
++            uint32_t raw = 0;
++            for (int i = 0; i < 8; i++) {
++                int c = -1;
++                while ((c = uart_getc_timeout(60000)) < 0) {}
++                uint32_t nib;
++                if      (c >= '0' && c <= '9') nib = c - '0';
++                else if (c >= 'a' && c <= 'f') nib = c - 'a' + 10;
++                else if (c >= 'A' && c <= 'F') nib = c - 'A' + 10;
++                else { uart_puts("[!] bad hex char — abort\r\n"); goto x_abort; }
++                raw = (raw << 4) | nib;
++            }
++            raw &= 0x1FFFFFFFu;  /* 29-bit */
++            uart_puts("[rot] payload  = "); uart_puthex32(raw); uart_puts("\r\n");
++
++            /* Phase 1: SHIFT_IN_ONLY — load rublock register without firing rconfig */
++            altru_data[0] = raw;
++            altru_cmd[0]  = 0x10u;  /* CMD bit 4 = SHIFT_IN_ONLY */
++            for (volatile int i = 0; i < 100000; i++) {}  /* wait FSM */
++            uart_puts("[rot] STATUS post-shift-in = "); uart_puthex32(*altru_status);
++            uart_puts("\r\n");
++
++            /* Phase 2: SHIFT_OUT_CAPTURE — read back the rublock register */
++            altru_cmd[0]  = 0x02u;
++            for (volatile int i = 0; i < 100000; i++) {}
++            uint32_t echo = (*altru_data) & 0x1FFFFFFFu;
++            uart_puts("[rot] echo     = "); uart_puthex32(echo);
++            if (echo == raw) uart_puts("  [MATCH — rublock honoured the write]");
++            else             uart_puts("  [MISMATCH — rublock did NOT honour the write]");
++            uart_puts("\r\n");
++
++            /* Phase 3: ask the host whether to fire reconfig */
++            uart_puts("[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort\r\n");
++            int fc;
++            while ((fc = uart_getc_timeout(60000)) < 0) {}
++            if (fc == 'y' || fc == 'Y') {
++                altru_data[0] = raw;
++                altru_cmd[0]  = 0x01u;  /* SHIFT_IN_AND_RECONFIG */
++                /* Poll done_sticky (fallback detect) */
++                for (uint32_t i = 0; i < 500000u; i++) {
++                    if ((*altru_status) & 0x2u) {
++                        uart_puts("[rot] FALLBACK — chip ignored rconfig\r\n");
++                        goto x_abort;
++                    }
++                }
++                uart_puts("[rot] TIMEOUT — chip neither rebooted nor signalled\r\n");
++            } else {
++                uart_puts("[rot] aborted, no reconfig\r\n");
++            }
++        x_abort: ;
++        } else if (mode == 'Q') {
++            /* 2026-05-19 diagnostic: SHIFT_OUT_CAPTURE the rublock register
++             * to learn the chip's current remote-update state.  Tells us
++             * whether the AP_CONFIG_SEL=1 reconfig actually changed the
++             * chip's mode or whether the chip is in regular AS (not REMOTE)
++             * and ignores pgm_sel entirely. */
++            volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
++            volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
++            volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
++            uart_puts("[stage2] Mode: rublock capture probe\r\n");
++            uart_puts("[rot] STATUS pre  = "); uart_puthex32(*altru_status);
++            uart_puts("\r\n");
++            altru_cmd[0] = 0x2u;  /* SHIFT_OUT_CAPTURE */
++            for (volatile int i = 0; i < 100000; i++) { /* ~10 ms wait */ }
++            uint32_t s   = *altru_status;
++            uint32_t cap = *altru_data;
++            uart_puts("[rot] STATUS post = "); uart_puthex32(s); uart_puts("\r\n");
++            uart_puts("[rot] capture_reg = "); uart_puthex32(cap); uart_puts("\r\n");
++            uart_puts("[rot]   PGM_SEL[23:0]   = "); uart_puthex32(cap & 0x00FFFFFFu); uart_puts("\r\n");
++            uart_puts("[rot]   WD_EN[24]       = "); uart_puthex32((cap >> 24) & 0x1u); uart_puts("\r\n");
++            uart_puts("[rot]   WD_TMR[27:25]   = "); uart_puthex32((cap >> 25) & 0x7u); uart_puts("\r\n");
++            uart_puts("[rot]   AP_CONFIG[28]   = "); uart_puthex32((cap >> 28) & 0x1u); uart_puts("\r\n");
+         } else {
+             uart_puts("[!] unknown mode byte — ignored\r\n");
+         }
+diff --git a/sw/stage2_loader/remote_update.c b/sw/stage2_loader/remote_update.c
+index 37ac8ad..61fc9ad 100644
+--- a/sw/stage2_loader/remote_update.c
++++ b/sw/stage2_loader/remote_update.c
+@@ -1,7 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+  * remote_update.c — Phase 4 EPCS remote-update trigger + Audit #9
+- * fallback detect.  See remote_update.h for protocol notes.
++ * fallback detect + Audit #8 parameterization.  See remote_update.h
++ * for protocol notes.
+  */
+ #include "remote_update.h"
+ 
+@@ -14,7 +15,8 @@
+  * Audit #9 wants surfaced to the caller. */
+ #define RR_POLL_ITERS  500000u  /* worst-case ~50 ms on a small RV32 core */
+ 
+-int epcs_remote_reconfig(uint32_t pgm_sel)
++int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
++                            uint32_t wd_tmr, uint32_t ap_config_sel)
+ {
+     /* Drain UART TX FIFO so the caller's "triggering reconfig" line
+      * finishes before rconfig fires.  Same idiom as mode_set_baud. */
+@@ -29,8 +31,20 @@ int epcs_remote_reconfig(uint32_t pgm_sel)
+     /* Refuse to trigger if FSM is already busy. */
+     if ((*altru_status) & 0x1u) return RR_BUSY;
+ 
+-    /* WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 — payload is just PGM_SEL. */
+-    altru_data[0] = pgm_sel & 0x00FFFFFFu;
++    /* 29-bit payload (see remote_update.h for full layout):
++     *   [23:0]  PGM_SEL
++     *   [24]    WD_EN
++     *   [27:25] WD_TMR
++     *   [28]    AP_CONFIG_SEL (0 = factory page 0 next, 1 = application)
++     * Empirical (2026-05-19 silicon, mode_g HW test): AP_CONFIG_SEL=0
++     * causes the chip to ignore PGM_SEL and boot factory page 0 — that
++     * was the actual cause of the Phase 8 fall-back, NOT the missing
++     * INTERNAL_FLASH_UPDATE_MODE=REMOTE qsf on the TPU side. */
++    uint32_t payload = (pgm_sel & 0x00FFFFFFu)
++                     | ((wd_en        & 0x1u) << 24)
++                     | ((wd_tmr       & 0x7u) << 25)
++                     | ((ap_config_sel & 0x1u) << 28);
++    altru_data[0] = payload;
+     /* SHIFT_IN_AND_RECONFIG: FSM shifts 29 bits in then pulses rconfig.
+      * Point of no return — FPGA reloads from new page in ~150 ms IF the
+      * chip is in REMOTE mode and the target image is valid. */
+@@ -43,3 +57,11 @@ int epcs_remote_reconfig(uint32_t pgm_sel)
+     }
+     return RR_TIMEOUT;
+ }
++
++/* Backwards-compat wrapper: pre-Audit-#8 callers pass only pgm_sel and
++ * get the original WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 (factory boot)
++ * defaults.  Used by mode 'r' which wants exactly that semantics. */
++int epcs_remote_reconfig(uint32_t pgm_sel)
++{
++    return epcs_remote_reconfig_ex(pgm_sel, 0u, 0u, 0u);
++}
+diff --git a/sw/stage2_loader/remote_update.h b/sw/stage2_loader/remote_update.h
+index 6dd6c6e..a78cd2c 100644
+--- a/sw/stage2_loader/remote_update.h
++++ b/sw/stage2_loader/remote_update.h
+@@ -40,4 +40,11 @@ enum {
+ 
+ int epcs_remote_reconfig(uint32_t pgm_sel);
+ 
++/* Audit #8 (2026-05-19): full-parameterized variant exposing WD_EN /
++ * WD_TMR / AP_CONFIG_SEL.  mode_g uses this with AP_CONFIG_SEL=1 so the
++ * chip honours pgm_sel; mode_r keeps the old defaults (factory boot)
++ * via the bare epcs_remote_reconfig wrapper. */
++int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
++                            uint32_t wd_tmr, uint32_t ap_config_sel);
++
+ #endif
+-- 
+2.43.0
+

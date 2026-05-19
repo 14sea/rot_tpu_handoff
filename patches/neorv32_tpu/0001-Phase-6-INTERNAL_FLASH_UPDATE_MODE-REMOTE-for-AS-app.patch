@@ -1,0 +1,52 @@
+From ca9295d7c2aa9a5bf8cc1ef9524809c8c0380912 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Tue, 19 May 2026 19:57:54 +0100
+Subject: [PATCH] Phase 6: INTERNAL_FLASH_UPDATE_MODE=REMOTE for AS application
+ image
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add the four AS REMOTE configuration assignments (USE_CONFIGURATION_DEVICE,
+CYCLONEIII_CONFIGURATION_DEVICE=EPCS16, CYCLONEIII_CONFIGURATION_SCHEME=
+"ACTIVE SERIAL", INTERNAL_FLASH_UPDATE_MODE=REMOTE) so this bitstream
+is encoded as a valid AS REMOTE application image.
+
+Context: the neorv32_rot factory bitstream (EPCS page 0) was already built
+with INTERNAL_FLASH_UPDATE_MODE=REMOTE so its cycloneive_rublock primitive
+can drive pgm_sel and trigger reconfig.  When mode_g wrote a byte-identical
+copy of the prior (non-REMOTE) TPU.rbf to EPCS slot 1 @0x80000 and triggered
+reconfig, the chip fell back to factory ALINX — the AS controller could not
+decode the application image because the non-REMOTE bitstream lacks the
+matching configuration-header bits that REMOTE mode requires.
+
+This change does not add new RTL or alter the TPU design; it only changes
+the way Quartus encodes the configuration header, so the AS controller in
+REMOTE mode will accept the image as a valid application slot.
+---
+ quartus/neorv32_tpu.qsf | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/quartus/neorv32_tpu.qsf b/quartus/neorv32_tpu.qsf
+index 6f7e8e1..84e7f12 100644
+--- a/quartus/neorv32_tpu.qsf
++++ b/quartus/neorv32_tpu.qsf
+@@ -161,3 +161,15 @@ set_global_assignment -name OPTIMIZATION_MODE "HIGH PERFORMANCE EFFORT"
+ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 4.0
+ set_global_assignment -name FITTER_EFFORT "STANDARD FIT"
+ set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT EXTRA
++
++# ── Active Serial REMOTE update — application image at EPCS 0x80000 ─────────
++# Factory bitstream (neorv32_rot) lives at page 0 and uses the cycloneive_rublock
++# primitive to trigger reconfig into this TPU image at slot 1.  Both factory
++# and application images must be compiled with INTERNAL_FLASH_UPDATE_MODE=REMOTE
++# so the AS configuration controller honours the rublock-driven pgm_sel and
++# decodes the application image with the matching watchdog / page-select bits.
++# Quartus 21.1 uses CYCLONEIII_* assignment names for the Cyclone IV E family.
++set_global_assignment -name USE_CONFIGURATION_DEVICE ON
++set_global_assignment -name CYCLONEIII_CONFIGURATION_DEVICE EPCS16
++set_global_assignment -name CYCLONEIII_CONFIGURATION_SCHEME "ACTIVE SERIAL"
++set_global_assignment -name INTERNAL_FLASH_UPDATE_MODE "REMOTE"
+-- 
+2.43.0
+
