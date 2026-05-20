@@ -1,0 +1,291 @@
+--altremote_update CBX_DECLARE_ALL_CONNECTED_PORTS="OFF" check_app_pof="false" config_device_addr_width=24 DEVICE_FAMILY="Cyclone IV E" in_data_width=24 is_epcq="false" operation_mode="remote" out_data_width=29 support_write_check="1" busy clock data_in data_out param read_param read_source reconfig reset reset_timer write_param CARRY_CHAIN="MANUAL" CARRY_CHAIN_LENGTH=48
+--VERSION_BEGIN 21.1 cbx_altremote_update 2021:10:21:11:02:24:SJ cbx_cycloneii 2021:10:21:11:02:24:SJ cbx_lpm_add_sub 2021:10:21:11:02:24:SJ cbx_lpm_compare 2021:10:21:11:02:24:SJ cbx_lpm_counter 2021:10:21:11:02:24:SJ cbx_lpm_decode 2021:10:21:11:02:24:SJ cbx_lpm_shiftreg 2021:10:21:11:02:24:SJ cbx_mgl 2021:10:21:11:11:47:SJ cbx_nadder 2021:10:21:11:02:24:SJ cbx_nightfury 2021:10:21:11:02:24:SJ cbx_stratix 2021:10:21:11:02:24:SJ cbx_stratixii 2021:10:21:11:02:24:SJ  VERSION_END
+
+
+-- Copyright (C) 2021  Intel Corporation. All rights reserved.
+--  Your use of Intel Corporation's design tools, logic functions 
+--  and other software and tools, and any partner logic 
+--  functions, and any output files from any of the foregoing 
+--  (including device programming or simulation files), and any 
+--  associated documentation or information are expressly subject 
+--  to the terms and conditions of the Intel Program License 
+--  Subscription Agreement, the Intel Quartus Prime License Agreement,
+--  the Intel FPGA IP License Agreement, or other applicable license
+--  agreement, including, without limitation, that your use is for
+--  the sole purpose of programming logic devices manufactured by
+--  Intel and sold by Intel or its authorized distributors.  Please
+--  refer to the applicable agreement for further details, at
+--  https://fpgasoftware.intel.com/eula.
+
+
+FUNCTION cntr_acf (aclr, clock, cnt_en, sclr)
+RETURNS ( q[5..0]);
+FUNCTION cntr_9cf (aclr, clock, cnt_en, sclr)
+RETURNS ( q[4..0]);
+FUNCTION cycloneive_rublock (captnupdt, clk, rconfig, regin, rsttimer, shiftnld)
+RETURNS ( regout);
+
+--synthesis_resources = cycloneive_rublock 1 lut 11 reg 73 
+OPTIONS ALTERA_INTERNAL_OPTION = "suppress_da_rule_internal=c104;suppress_da_rule_internal=C101;suppress_da_rule_internal=C103";
+
+SUBDESIGN rmtupdt_ik21
+( 
+	busy	:	output;
+	clock	:	input;
+	data_in[23..0]	:	input;
+	data_out[28..0]	:	output;
+	param[2..0]	:	input;
+	read_param	:	input;
+	read_source[1..0]	:	input;
+	reconfig	:	input;
+	reset	:	input;
+	reset_timer	:	input;
+	write_param	:	input;
+) 
+VARIABLE 
+	check_busy_dffe[0..0] : dffe;
+	dffe1a[1..0] : dffe;
+	dffe2a[2..0] : dffe;
+	dffe3a[2..0] : dffe;
+	dffe7a[28..0] : dffeas;
+	dffe8 : dffe;
+	dffe9a[6..0] : dffe;
+	idle_state : dffe;
+	idle_write_wait : dffe;
+	read_address_state : dffe;
+	read_data_state : dffe;
+	read_init_counter_state : dffe;
+	read_init_state : dffe;
+	read_post_state : dffe;
+	read_pre_data_state : dffe;
+	read_source_update_state : dffe;
+	write_data_state : dffe;
+	write_init_counter_state : dffe;
+	write_init_state : dffe;
+	write_load_state : dffe;
+	write_post_data_state : dffe;
+	write_pre_data_state : dffe;
+	write_source_update_state : dffe;
+	write_wait_state : dffe;
+	cntr5 : cntr_acf;
+	cntr6 : cntr_9cf;
+	sd4 : cycloneive_rublock;
+	bit_counter_all_done	: WIRE;
+	bit_counter_clear	: WIRE;
+	bit_counter_enable	: WIRE;
+	bit_counter_param_start[5..0]	: WIRE;
+	bit_counter_param_start_match	: WIRE;
+	combine_port[6..0]	: WIRE;
+	global_gnd	: WIRE;
+	global_vcc	: WIRE;
+	idle	: WIRE;
+	param_decoder_param_latch[6..0]	: WIRE;
+	param_decoder_select[22..0]	: WIRE;
+	power_up	: WIRE;
+	read_address	: WIRE;
+	read_data	: WIRE;
+	read_init	: WIRE;
+	read_init_counter	: WIRE;
+	read_post	: WIRE;
+	read_pre_data	: WIRE;
+	read_source_update	: WIRE;
+	rsource_load	: WIRE;
+	rsource_parallel_in[1..0]	: WIRE;
+	rsource_serial_out	: WIRE;
+	rsource_shift_enable	: WIRE;
+	rsource_state_par_ini[2..0]	: WIRE;
+	rsource_update_done	: WIRE;
+	rublock_captnupdt	: WIRE;
+	rublock_clock	: WIRE;
+	rublock_reconfig	: WIRE;
+	rublock_reconfig_st	: WIRE;
+	rublock_regin	: WIRE;
+	rublock_regout	: WIRE;
+	rublock_regout_reg	: WIRE;
+	rublock_shiftnld	: WIRE;
+	select_shift_nloop	: WIRE;
+	shift_reg_clear	: WIRE;
+	shift_reg_load_enable	: WIRE;
+	shift_reg_serial_in	: WIRE;
+	shift_reg_serial_out	: WIRE;
+	shift_reg_shift_enable	: WIRE;
+	start_bit_decoder_out[5..0]	: WIRE;
+	start_bit_decoder_param_select[22..0]	: WIRE;
+	w4w[1..0]	: WIRE;
+	w53w[5..0]	: WIRE;
+	w83w[4..0]	: WIRE;
+	width_counter_all_done	: WIRE;
+	width_counter_clear	: WIRE;
+	width_counter_enable	: WIRE;
+	width_counter_param_width[4..0]	: WIRE;
+	width_counter_param_width_match	: WIRE;
+	width_decoder_out[4..0]	: WIRE;
+	width_decoder_param_select[22..0]	: WIRE;
+	write_data	: WIRE;
+	write_init	: WIRE;
+	write_init_counter	: WIRE;
+	write_load	: WIRE;
+	write_post_data	: WIRE;
+	write_pre_data	: WIRE;
+	write_source_update	: WIRE;
+	write_wait	: WIRE;
+	wsource_state_par_ini[2..0]	: WIRE;
+	wsource_update_done	: WIRE;
+
+BEGIN 
+	dffe1a[].clk = clock;
+	dffe1a[].clrn = (! reset);
+	dffe1a[].d = ( (rsource_parallel_in[1..1] & rsource_load), ((rsource_load & rsource_parallel_in[0..0]) # ((! rsource_load) & dffe1a[1].q)));
+	dffe1a[].ena = (rsource_load # rsource_shift_enable);
+	dffe2a[].clk = clock;
+	dffe2a[].clrn = (! reset);
+	dffe2a[].d = ( (rsource_state_par_ini[2..2] & rsource_load), ((rsource_load & rsource_state_par_ini[1..1]) # ((! rsource_load) & dffe2a[2].q)), ((rsource_load & rsource_state_par_ini[0..0]) # ((! rsource_load) & dffe2a[1].q)));
+	dffe2a[].ena = (rsource_load # global_vcc);
+	dffe3a[].clk = clock;
+	dffe3a[].clrn = (! reset);
+	dffe3a[].d = ( (wsource_state_par_ini[2..2] & rsource_load), ((rsource_load & wsource_state_par_ini[1..1]) # ((! rsource_load) & dffe3a[2].q)), ((rsource_load & wsource_state_par_ini[0..0]) # ((! rsource_load) & dffe3a[1].q)));
+	dffe3a[].ena = (rsource_load # global_vcc);
+	dffe7a[].clk = clock;
+	dffe7a[].clrn = (! reset);
+	dffe7a[].d = ( ((! shift_reg_load_enable) & shift_reg_serial_in), ((! shift_reg_load_enable) & dffe7a[28].q), ((! shift_reg_load_enable) & dffe7a[27].q), ((! shift_reg_load_enable) & dffe7a[26].q), ((! shift_reg_load_enable) & dffe7a[25].q), ((! shift_reg_load_enable) & dffe7a[24].q), ((! shift_reg_load_enable) & dffe7a[23].q), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[23..23]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[21..21]))) # ((! shift_reg_load_enable) & dffe7a[22].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[22..22]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[20..20]))) # ((! shift_reg_load_enable) & dffe7a[21].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[21..21]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[19..19]))) # ((! shift_reg_load_enable) & dffe7a[20].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[20..20]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[18..18]))) # ((! shift_reg_load_enable) & dffe7a[19].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[19..19]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[17..17]))) # ((! shift_reg_load_enable) & dffe7a[18].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[18..18]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[16..16]))) # ((! shift_reg_load_enable) & dffe7a[17].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[17..17]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[15..15]))) # ((! shift_reg_load_enable) & dffe7a[16].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[16..16]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[14..14]))) # ((! shift_reg_load_enable) & dffe7a[15].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[15..15]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[13..13]))) # ((! shift_reg_load_enable) & dffe7a[14].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[14..14]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[12..12]))) # ((! shift_reg_load_enable) & dffe7a[13].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[13..13]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[11..11]))) # ((! shift_reg_load_enable) & dffe7a[12].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[12..12]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[10..10]))) # ((! shift_reg_load_enable) & dffe7a[11].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[11..11]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[9..9]))) # ((! shift_reg_load_enable) & dffe7a[10].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[10..10]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[8..8]))) # ((! shift_reg_load_enable) & dffe7a[9].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[9..9]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[7..7]))) # ((! shift_reg_load_enable) & dffe7a[8].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[8..8]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[6..6]))) # ((! shift_reg_load_enable) & dffe7a[7].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[7..7]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[5..5]))) # ((! shift_reg_load_enable) & dffe7a[6].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[6..6]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[4..4]))) # ((! shift_reg_load_enable) & dffe7a[5].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[5..5]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[3..3]))) # ((! shift_reg_load_enable) & dffe7a[4].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[4..4]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[2..2]))) # ((! shift_reg_load_enable) & dffe7a[3].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[3..3]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[1..1]))) # ((! shift_reg_load_enable) & dffe7a[2].q)), ((shift_reg_load_enable & ((((param[2..2] & (! param[1..1])) & (! param[0..0])) & data_in[2..2]) # ((! ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & data_in[0..0]))) # ((! shift_reg_load_enable) & dffe7a[1].q)));
+	dffe7a[].ena = ((shift_reg_load_enable # shift_reg_shift_enable) # shift_reg_clear);
+	dffe7a[].sclr = shift_reg_clear;
+	dffe8.clk = clock;
+	dffe8.clrn = (! reset);
+	dffe8.d = rublock_regout;
+	dffe8.ena = B"1";
+	dffe9a[].clk = clock;
+	dffe9a[].clrn = (! reset);
+	dffe9a[].d = combine_port[];
+	dffe9a[].ena = (idle & (write_param # read_param));
+	idle_state.clk = clock;
+	idle_state.d = ((((((idle & (! read_param)) & (! write_param)) # write_wait) # (read_data & width_counter_all_done)) # (read_post & width_counter_all_done)) # power_up);
+	idle_state.prn = (! reset);
+	idle_write_wait.clk = clock;
+	idle_write_wait.clrn = (! reset);
+	idle_write_wait.d = (((((((idle & (! read_param)) & (! write_param)) # write_wait) # (read_data & width_counter_all_done)) # (read_post & width_counter_all_done)) # power_up) & write_load);
+	read_address_state.clk = clock;
+	read_address_state.clrn = (! reset);
+	read_address_state.d = (((read_param # write_param) & ((param[2..2] & (! param[1..1])) & (! param[0..0]))) & (! (! idle)));
+	read_address_state.ena = (read_param # write_param);
+	read_data_state.clk = clock;
+	read_data_state.clrn = (! reset);
+	read_data_state.d = (((read_init_counter & bit_counter_param_start_match) # (read_pre_data & bit_counter_param_start_match)) # ((read_data & (! width_counter_param_width_match)) & (! width_counter_all_done)));
+	read_init_counter_state.clk = clock;
+	read_init_counter_state.clrn = (! reset);
+	read_init_counter_state.d = rsource_update_done;
+	read_init_state.clk = clock;
+	read_init_state.clrn = (! reset);
+	read_init_state.d = (idle & read_param);
+	read_post_state.clk = clock;
+	read_post_state.clrn = (! reset);
+	read_post_state.d = (((read_data & width_counter_param_width_match) & (! width_counter_all_done)) # (read_post & (! width_counter_all_done)));
+	read_pre_data_state.clk = clock;
+	read_pre_data_state.clrn = (! reset);
+	read_pre_data_state.d = ((read_init_counter & (! bit_counter_param_start_match)) # (read_pre_data & (! bit_counter_param_start_match)));
+	read_source_update_state.clk = clock;
+	read_source_update_state.clrn = (! reset);
+	read_source_update_state.d = ((read_init # read_source_update) & (! rsource_update_done));
+	write_data_state.clk = clock;
+	write_data_state.clrn = (! reset);
+	write_data_state.d = (((write_init_counter & bit_counter_param_start_match) # (write_pre_data & bit_counter_param_start_match)) # ((write_data & (! width_counter_param_width_match)) & (! bit_counter_all_done)));
+	write_init_counter_state.clk = clock;
+	write_init_counter_state.clrn = (! reset);
+	write_init_counter_state.d = wsource_update_done;
+	write_init_state.clk = clock;
+	write_init_state.clrn = (! reset);
+	write_init_state.d = (idle & write_param);
+	write_load_state.clk = clock;
+	write_load_state.clrn = (! reset);
+	write_load_state.d = ((write_data & bit_counter_all_done) # (write_post_data & bit_counter_all_done));
+	write_post_data_state.clk = clock;
+	write_post_data_state.clrn = (! reset);
+	write_post_data_state.d = (((write_data & width_counter_param_width_match) & (! bit_counter_all_done)) # (write_post_data & (! bit_counter_all_done)));
+	write_pre_data_state.clk = clock;
+	write_pre_data_state.clrn = (! reset);
+	write_pre_data_state.d = ((write_init_counter & (! bit_counter_param_start_match)) # (write_pre_data & (! bit_counter_param_start_match)));
+	write_source_update_state.clk = clock;
+	write_source_update_state.clrn = (! reset);
+	write_source_update_state.d = ((write_init # write_source_update) & (! wsource_update_done));
+	write_wait_state.clk = clock;
+	write_wait_state.clrn = (! reset);
+	write_wait_state.d = write_load;
+	cntr5.aclr = reset;
+	cntr5.clock = clock;
+	cntr5.cnt_en = bit_counter_enable;
+	cntr5.sclr = bit_counter_clear;
+	cntr6.aclr = reset;
+	cntr6.clock = clock;
+	cntr6.cnt_en = width_counter_enable;
+	cntr6.sclr = width_counter_clear;
+	sd4.captnupdt = rublock_captnupdt;
+	sd4.clk = rublock_clock;
+	sd4.rconfig = rublock_reconfig;
+	sd4.regin = rublock_regin;
+	sd4.rsttimer = reset_timer;
+	sd4.shiftnld = rublock_shiftnld;
+	bit_counter_all_done = (((((cntr5.q[0..0] & (! cntr5.q[1..1])) & (! cntr5.q[2..2])) & cntr5.q[3..3]) & (! cntr5.q[4..4])) & cntr5.q[5..5]);
+	bit_counter_clear = (rsource_update_done # wsource_update_done);
+	bit_counter_enable = (((((((((rsource_update_done # wsource_update_done) # read_init_counter) # write_init_counter) # read_pre_data) # write_pre_data) # read_data) # write_data) # read_post) # write_post_data);
+	bit_counter_param_start[] = start_bit_decoder_out[];
+	bit_counter_param_start_match = ((((((! w53w[0..0]) & (! w53w[1..1])) & (! w53w[2..2])) & (! w53w[3..3])) & (! w53w[4..4])) & (! w53w[5..5]));
+	busy = (! idle);
+	combine_port[] = ( read_param, write_param, read_source[], param[]);
+	data_out[] = ( ((read_address & dffe7a[26..26].q) # ((! read_address) & dffe7a[28..28].q)), ((read_address & dffe7a[25..25].q) # ((! read_address) & dffe7a[27..27].q)), ((read_address & dffe7a[24..24].q) # ((! read_address) & dffe7a[26..26].q)), ((read_address & dffe7a[23..23].q) # ((! read_address) & dffe7a[25..25].q)), ((read_address & dffe7a[22..22].q) # ((! read_address) & dffe7a[24..24].q)), ((read_address & dffe7a[21..21].q) # ((! read_address) & dffe7a[23..23].q)), ((read_address & dffe7a[20..20].q) # ((! read_address) & dffe7a[22..22].q)), ((read_address & dffe7a[19..19].q) # ((! read_address) & dffe7a[21..21].q)), ((read_address & dffe7a[18..18].q) # ((! read_address) & dffe7a[20..20].q)), ((read_address & dffe7a[17..17].q) # ((! read_address) & dffe7a[19..19].q)), ((read_address & dffe7a[16..16].q) # ((! read_address) & dffe7a[18..18].q)), ((read_address & dffe7a[15..15].q) # ((! read_address) & dffe7a[17..17].q)), ((read_address & dffe7a[14..14].q) # ((! read_address) & dffe7a[16..16].q)), ((read_address & dffe7a[13..13].q) # ((! read_address) & dffe7a[15..15].q)), ((read_address & dffe7a[12..12].q) # ((! read_address) & dffe7a[14..14].q)), ((read_address & dffe7a[11..11].q) # ((! read_address) & dffe7a[13..13].q)), ((read_address & dffe7a[10..10].q) # ((! read_address) & dffe7a[12..12].q)), ((read_address & dffe7a[9..9].q) # ((! read_address) & dffe7a[11..11].q)), ((read_address & dffe7a[8..8].q) # ((! read_address) & dffe7a[10..10].q)), ((read_address & dffe7a[7..7].q) # ((! read_address) & dffe7a[9..9].q)), ((read_address & dffe7a[6..6].q) # ((! read_address) & dffe7a[8..8].q)), ((read_address & dffe7a[5..5].q) # ((! read_address) & dffe7a[7..7].q)), ((read_address & dffe7a[4..4].q) # ((! read_address) & dffe7a[6..6].q)), ((read_address & dffe7a[3..3].q) # ((! read_address) & dffe7a[5..5].q)), ((read_address & dffe7a[2..2].q) # ((! read_address) & dffe7a[4..4].q)), ((read_address & dffe7a[1..1].q) # ((! read_address) & dffe7a[3..3].q)), ((read_address & dffe7a[0..0].q) # ((! read_address) & dffe7a[2..2].q)), ((! read_address) & dffe7a[1..1].q), ((! read_address) & dffe7a[0..0].q));
+	global_gnd = B"0";
+	global_vcc = B"1";
+	idle = idle_state.q;
+	param_decoder_param_latch[] = dffe9a[].q;
+	param_decoder_select[] = ( (((((((! param_decoder_param_latch[0..0]) & param_decoder_param_latch[1..1]) & param_decoder_param_latch[2..2]) & param_decoder_param_latch[3..3]) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & param_decoder_param_latch[3..3]) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), ((((((param_decoder_param_latch[0..0] & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), ((((((param_decoder_param_latch[0..0] & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & param_decoder_param_latch[1..1]) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & param_decoder_param_latch[5..5]) & (! param_decoder_param_latch[6..6])), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & param_decoder_param_latch[5..5]) & (! param_decoder_param_latch[6..6])), ((((((param_decoder_param_latch[0..0] & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & param_decoder_param_latch[5..5]) & (! param_decoder_param_latch[6..6])), (((((((! param_decoder_param_latch[0..0]) & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & param_decoder_param_latch[5..5]) & (! param_decoder_param_latch[6..6])), ((((((param_decoder_param_latch[0..0] & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & param_decoder_param_latch[5..5]) & (! param_decoder_param_latch[6..6])), ((((((param_decoder_param_latch[0..0] & param_decoder_param_latch[1..1]) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), ((((((param_decoder_param_latch[0..0] & param_decoder_param_latch[1..1]) & param_decoder_param_latch[2..2]) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & param_decoder_param_latch[4..4]) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), ((((((param_decoder_param_latch[0..0] & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & param_decoder_param_latch[1..1]) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & param_decoder_param_latch[3..3]) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & param_decoder_param_latch[2..2]) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]), (((((((! param_decoder_param_latch[0..0]) & (! param_decoder_param_latch[1..1])) & (! param_decoder_param_latch[2..2])) & (! param_decoder_param_latch[3..3])) & (! param_decoder_param_latch[4..4])) & (! param_decoder_param_latch[5..5])) & param_decoder_param_latch[6..6]));
+	power_up = (((((((((((((((! idle) & (! read_init)) & (! read_source_update)) & (! read_init_counter)) & (! read_pre_data)) & (! read_data)) & (! read_post)) & (! write_init)) & (! write_init_counter)) & (! write_source_update)) & (! write_pre_data)) & (! write_data)) & (! write_post_data)) & (! write_load)) & (! write_wait));
+	read_address = read_address_state.q;
+	read_data = read_data_state.q;
+	read_init = read_init_state.q;
+	read_init_counter = read_init_counter_state.q;
+	read_post = read_post_state.q;
+	read_pre_data = read_pre_data_state.q;
+	read_source_update = read_source_update_state.q;
+	rsource_load = (idle & (write_param # read_param));
+	rsource_parallel_in[] = ( ((w4w[1..1] & read_param) # write_param), ((w4w[0..0] & read_param) # write_param));
+	rsource_serial_out = dffe1a[0].q;
+	rsource_shift_enable = (read_source_update # write_source_update);
+	rsource_state_par_ini[] = ( read_param, global_gnd, global_gnd);
+	rsource_update_done = dffe2a[0].q;
+	rublock_captnupdt = (! write_load);
+	rublock_clock = (! (clock # idle_write_wait.q));
+	rublock_reconfig = rublock_reconfig_st;
+	rublock_reconfig_st = (idle & reconfig);
+	rublock_regin = (((((rublock_regout_reg & (! select_shift_nloop)) & (! read_source_update)) & (! write_source_update)) # (((shift_reg_serial_out & select_shift_nloop) & (! read_source_update)) & (! write_source_update))) # ((read_source_update # write_source_update) & rsource_serial_out));
+	rublock_regout = sd4.regout;
+	rublock_regout_reg = dffe8.q;
+	rublock_shiftnld = (((((((read_pre_data # write_pre_data) # read_data) # write_data) # read_post) # write_post_data) # read_source_update) # write_source_update);
+	select_shift_nloop = ((read_data & (! width_counter_param_width_match)) # (write_data & (! width_counter_param_width_match)));
+	shift_reg_clear = rsource_update_done;
+	shift_reg_load_enable = (idle & write_param);
+	shift_reg_serial_in = (rublock_regout_reg & select_shift_nloop);
+	shift_reg_serial_out = dffe7a[0].q;
+	shift_reg_shift_enable = (((read_data # write_data) # read_post) # write_post_data);
+	start_bit_decoder_out[] = ((((((((((((((((((((((( B"0", start_bit_decoder_param_select[0..0], start_bit_decoder_param_select[0..0], start_bit_decoder_param_select[0..0], start_bit_decoder_param_select[0..0], B"0") # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( B"0", start_bit_decoder_param_select[2..2], start_bit_decoder_param_select[2..2], start_bit_decoder_param_select[2..2], start_bit_decoder_param_select[2..2], B"0")) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( B"0", start_bit_decoder_param_select[4..4], start_bit_decoder_param_select[4..4], start_bit_decoder_param_select[4..4], B"0", start_bit_decoder_param_select[4..4])) # ( B"0", start_bit_decoder_param_select[5..5], start_bit_decoder_param_select[5..5], start_bit_decoder_param_select[5..5], start_bit_decoder_param_select[5..5], B"0")) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( B"0", start_bit_decoder_param_select[7..7], start_bit_decoder_param_select[7..7], B"0", B"0", B"0")) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( B"0", start_bit_decoder_param_select[9..9], start_bit_decoder_param_select[9..9], B"0", start_bit_decoder_param_select[9..9], B"0")) # ( B"0", start_bit_decoder_param_select[10..10], start_bit_decoder_param_select[10..10], B"0", B"0", B"0")) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( B"0", start_bit_decoder_param_select[12..12], start_bit_decoder_param_select[12..12], B"0", start_bit_decoder_param_select[12..12], B"0")) # ( start_bit_decoder_param_select[13..13], B"0", B"0", start_bit_decoder_param_select[13..13], B"0", start_bit_decoder_param_select[13..13])) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( start_bit_decoder_param_select[15..15], B"0", B"0", B"0", start_bit_decoder_param_select[15..15], start_bit_decoder_param_select[15..15])) # ( B"0", B"0", start_bit_decoder_param_select[16..16], start_bit_decoder_param_select[16..16], B"0", B"0")) # ( start_bit_decoder_param_select[17..17], B"0", B"0", start_bit_decoder_param_select[17..17], B"0", B"0")) # ( start_bit_decoder_param_select[18..18], B"0", B"0", start_bit_decoder_param_select[18..18], B"0", start_bit_decoder_param_select[18..18])) # ( B"0", B"0", B"0", B"0", B"0", B"0")) # ( start_bit_decoder_param_select[20..20], B"0", B"0", B"0", start_bit_decoder_param_select[20..20], start_bit_decoder_param_select[20..20])) # ( B"0", B"0", start_bit_decoder_param_select[21..21], start_bit_decoder_param_select[21..21], B"0", B"0")) # ( start_bit_decoder_param_select[22..22], B"0", B"0", start_bit_decoder_param_select[22..22], B"0", B"0"));
+	start_bit_decoder_param_select[] = param_decoder_select[];
+	w4w[] = read_source[];
+	w53w[] = (cntr5.q[] $ bit_counter_param_start[]);
+	w83w[] = (cntr6.q[] $ width_counter_param_width[]);
+	width_counter_all_done = (((((! cntr6.q[0..0]) & (! cntr6.q[1..1])) & cntr6.q[2..2]) & cntr6.q[3..3]) & cntr6.q[4..4]);
+	width_counter_clear = (rsource_update_done # wsource_update_done);
+	width_counter_enable = ((read_data # write_data) # read_post);
+	width_counter_param_width[] = width_decoder_out[];
+	width_counter_param_width_match = (((((! w83w[0..0]) & (! w83w[1..1])) & (! w83w[2..2])) & (! w83w[3..3])) & (! w83w[4..4]));
+	width_decoder_out[] = ((((((((((((((((((((((( B"0", B"0", B"0", width_decoder_param_select[0..0], B"0") # ( width_decoder_param_select[1..1], width_decoder_param_select[1..1], B"0", B"0", B"0")) # ( B"0", B"0", B"0", width_decoder_param_select[2..2], B"0")) # ( width_decoder_param_select[3..3], width_decoder_param_select[3..3], width_decoder_param_select[3..3], B"0", width_decoder_param_select[3..3])) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[4..4])) # ( B"0", B"0", B"0", width_decoder_param_select[5..5], B"0")) # ( width_decoder_param_select[6..6], width_decoder_param_select[6..6], B"0", B"0", B"0")) # ( B"0", B"0", B"0", width_decoder_param_select[7..7], B"0")) # ( width_decoder_param_select[8..8], width_decoder_param_select[8..8], B"0", B"0", B"0")) # ( B"0", B"0", width_decoder_param_select[9..9], B"0", width_decoder_param_select[9..9])) # ( B"0", B"0", B"0", width_decoder_param_select[10..10], B"0")) # ( width_decoder_param_select[11..11], width_decoder_param_select[11..11], B"0", B"0", B"0")) # ( B"0", B"0", width_decoder_param_select[12..12], B"0", width_decoder_param_select[12..12])) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[13..13])) # ( B"0", width_decoder_param_select[14..14], width_decoder_param_select[14..14], B"0", B"0")) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[15..15])) # ( width_decoder_param_select[16..16], B"0", width_decoder_param_select[16..16], width_decoder_param_select[16..16], B"0")) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[17..17])) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[18..18])) # ( B"0", width_decoder_param_select[19..19], width_decoder_param_select[19..19], B"0", B"0")) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[20..20])) # ( width_decoder_param_select[21..21], B"0", width_decoder_param_select[21..21], width_decoder_param_select[21..21], B"0")) # ( B"0", B"0", B"0", B"0", width_decoder_param_select[22..22]));
+	width_decoder_param_select[] = param_decoder_select[];
+	write_data = write_data_state.q;
+	write_init = write_init_state.q;
+	write_init_counter = write_init_counter_state.q;
+	write_load = write_load_state.q;
+	write_post_data = write_post_data_state.q;
+	write_pre_data = write_pre_data_state.q;
+	write_source_update = write_source_update_state.q;
+	write_wait = write_wait_state.q;
+	wsource_state_par_ini[] = ( write_param, global_gnd, global_gnd);
+	wsource_update_done = dffe3a[0].q;
+END;
+--VALID FILE

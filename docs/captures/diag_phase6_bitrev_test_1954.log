@@ -1,0 +1,33 @@
+[!] unknown mode byte — ignored
+[stage2] ready for next cmd
+[stage2] Mode: megafunction reconfig (Path B)
+[host] send 6 hex digits for 24-bit byte address
+[rot] target byte addr = 0x00080000
+[host] press 'y' to fire reconfig, any other char to abort
+[rot] FALLBACK/TIMEOUT — chip stayed alive (status=0xffffffff)
+[stage2] ready for next cmd
+[stage2] Mode: read reconfig source (Path B)
+[rot] reconfig source = 0x00000004  (nSTATUS asserted)
+[stage2] ready for next cmd
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
+[!] unknown mode byte — ignored
+[stage2] ready for next cmd
+[stage2] Mode: megafunction reconfig (Path B)
+[host] send 6 hex digits for 24-bit byte address
+[rot] target byte addr = 0x00080000
+[host] press 'y' to fire reconfig, any other char to abort
+[rot] FALLBACK/TIMEOUT — chip stayed alive (status=0xffffffff)
+[stage2] ready for next cmd
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
