@@ -1,0 +1,16 @@
+Fitter Status : Successful - Wed May 20 19:36:18 2026
+Quartus Prime Version : 21.1.0 Build 842 10/21/2021 SJ Lite Edition
+Revision Name : neorv32_tpu
+Top-level Entity Name : ax301_top
+Family : Cyclone IV E
+Device : EP4CE10F17C8
+Timing Models : Final
+Total logic elements : 5,431 / 10,320 ( 53 % )
+    Total combinational functions : 4,741 / 10,320 ( 46 % )
+    Dedicated logic registers : 3,032 / 10,320 ( 29 % )
+Total registers : 3085
+Total pins : 51 / 180 ( 28 % )
+Total virtual pins : 0
+Total memory bits : 166,912 / 423,936 ( 39 % )
+Embedded Multiplier 9-bit elements : 15 / 46 ( 33 % )
+Total PLLs : 0 / 2 ( 0 % )
