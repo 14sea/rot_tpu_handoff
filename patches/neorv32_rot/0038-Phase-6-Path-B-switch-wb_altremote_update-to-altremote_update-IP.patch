@@ -1,0 +1,815 @@
+From 57f5c23228bac271abab4238f786a21b77c6b181 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 19:43:27 +0100
+Subject: [PATCH] Phase 6 Path B: switch wb_altremote_update wrapper to
+ altremote_update IP
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Replace direct cycloneive_rublock primitive instantiation + 29-bit shift
+FSM with a thin wrapper around the altremote_update megafunction.  The
+prior "Lite 21.1 strips write_param/data_in for Cyclone IV E REMOTE"
+memory was REFUTED on 2026-05-20: quartus_map elaborates the IP via the
+Verilog-instantiation + clearbox path and produces a fully-functional
+auto_generated rmtupdt_ik21 with field decoders, rublock_clock divider,
+and the proper write_param/data_in/reconfig protocol.
+
+Switch rationale: 5 sessions of direct-primitive layout/timing debugging
+exhausted.  4 layout hypotheses tested via mode X parametric reconfig on
+2026-05-20, all caused fall-back to RoT.  The megafunction handles
+field encoding + primitive clocking internally, eliminating the entire
+class of layout/timing bugs.
+
+RTL (rtl/wb_altremote_update.v): rewrote ~370 lines → ~170 lines.  New
+register map:
+  0x00 DATA   (R/W) data_in[23:0] write / data_out[28:0] read
+  0x04 CTRL   (W)   [2:0]=param, [3]=write_param pulse, [4]=read_param,
+                     [5]=reset_timer, [6]=reconfig, [9:8]=read_source
+  0x08 STATUS (R)   [0]=busy
+
+Firmware (sw/stage2_loader/remote_update.c): epcs_remote_reconfig_ex
+now sequences 3 write_param calls (PAGE_SELECT=byte_addr, WD_ENABLE=0,
+CD_EARLY=1) then triggers reconfig.  AnF is implicit in Cyclone IV
+(pgm_sel != 0 means application, pgm_sel == 0 means factory) so the
+ap_config_sel parameter is now ignored.
+
+mode X (param reconfig) + mode Q (reconfig source read) updated to use
+the new param protocol.
+
+Iron status (2026-05-20 evening): bitstream md5 bb39b0b09f4f83d8...,
+LE 8729/10320 (85%), flashed to EPCS page 0, mode X with byte_addr=
+0x080000 fires reconfig but chip returns reconfig source = 4 (nSTATUS
+asserted) = configuration error during slot-1 load.  TPU.rbf at slot 1
+verified byte-identical to neorv32_tpu output AND SRAM-loadable via
+openFPGALoader -m (so image is intrinsically valid).  Root cause now
+narrowed to EPCS multi-image layout — slot 1 raw .rbf is missing the
+metadata Quartus would normally inject via multi-page POF generation.
+quartus_cpf -c multi-image .cof fails with "Illegal Configuration
+Scheme does not support dual boot" in 21.1 Lite — needs more research.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ rtl/wb_altremote_update.v        | 371 +++++++++----------------------
+ sw/stage2_loader/main.c          | 100 +++------
+ sw/stage2_loader/remote_update.c | 135 +++++++----
+ sw/stage2_loader/remote_update.h |  39 ++--
+ 4 files changed, 261 insertions(+), 384 deletions(-)
+
+diff --git a/rtl/wb_altremote_update.v b/rtl/wb_altremote_update.v
+index 33bcc7a..88fbb62 100644
+--- a/rtl/wb_altremote_update.v
++++ b/rtl/wb_altremote_update.v
+@@ -1,52 +1,63 @@
+ // wb_altremote_update.v — Wishbone (NEORV32 XBUS) wrapper around the
+-// Cyclone IV E remote-update block (cycloneive_rublock primitive),
+-// implementing the 29-bit shift-register handshake described in the
+-// Cyclone IV Device Handbook (Vol 1, Ch 8 "Remote System Upgrade").
++// Cyclone IV E remote-update megafunction (altremote_update IP).
+ //
+-// We bypass the altremote_update megafunction entirely — its Lite-
+-// Edition qmegawiz silent generator strips write_param/data_in for
+-// Cyclone IV E in REMOTE mode, leaving no way to set PGM_SEL from the
+-// running image.  The underlying rublock primitive supports the full
+-// (write + read + reconfig) interface; we drive it directly with a
+-// small shift FSM.
++// 2026-05-20 REWRITE: switched from direct cycloneive_rublock primitive
++// to megafunction.  Prior wrapper bypassed the megafunction because we
++// thought 21.1 Lite's qmegawiz silent generator strips write_param/data_in
++// — re-tested 2026-05-20 by elaborating altremote_update directly via
++// Verilog-instantiation path through quartus_map, which auto-generates a
++// fully-functional `rmtupdt_ik21` containing all the field decoders, the
++// rublock_clock divider (`! (clock | idle_write_wait)`), and the correct
++// param/data_in interface.  The "Lite strips" hypothesis is REFUTED.
+ //
+-// 29-bit shift-register layout (LSB-first per Cyclone IV handbook):
+-//   bits  0..23 = boot byte address (PGM_SEL[23:0])
+-//   bit      24 = WD_EN  (watchdog enable; 0 = disabled)
+-//   bits 25..27 = WD_TMR[2:0] (watchdog timeout selector — ignored when WD_EN=0)
+-//   bit      28 = AP_CONFIG_SEL (0 = factory boot next, 1 = application)
+-// Firmware writes the full 29-bit value to DATA before kicking SHIFT.
+-// For Phase 2 bring-up we hard-disable the watchdog (bit 24 = 0).
++// Why switch: 5 sessions of direct-primitive layout debugging failed —
++// every 29-bit payload encoding (byte / word / Arria-LSB-AnF / no-AnF)
++// caused chip fall-back to factory.  Empirical: 4 layout hypotheses
++// tested via mode X parametric reconfig on 2026-05-20, all returned to
++// page-0 RoT.  Inferred either chip primitive's actual layout is more
++// complex than 29 flat bits OR the wrapper's 50 MHz clocking violates
++// the primitive's timing.  The megafunction handles both correctly.
++//
++// IP parameters (matches our 24-bit EPCS / Cyclone IV E):
++//   config_device_addr_width = 24     (24-bit byte address)
++//   in_data_width            = 24
++//   out_data_width           = 29
++//   operation_mode           = "REMOTE"
++//   is_epcq                  = "false"  (EPCS, not EPCQ)
++//   support_write_check      = "1"     (need write_param/data_in)
++//   intended_device_family   = "Cyclone IV E"
+ //
+ // Base: 0xF3000000.  1 MB decode (xbus_adr[31:20] == 12'hF30).
+ //
+ // Register map (byte offsets, 32-bit accesses):
+-//   0x00  DATA    (R/W)  [28:0] shift-register payload
+-//                  Reading after SHIFT_OUT_CAPTURE returns the captured
+-//                  rublock state.
+-//   0x04  CMD     (W)
+-//                  b0 = SHIFT_IN_AND_RECONFIG : load DATA, shift it
+-//                       into rublock (29 cycles), pulse rconfig — FPGA
+-//                       reloads from the new boot page (~150 ms).
+-//                  b1 = SHIFT_OUT_CAPTURE     : capture current rublock
+-//                       state, shift 29 bits into DATA over 29 cycles.
+-//                  b2 = RECONFIG_ONLY         : pulse rconfig using
+-//                       whatever rublock currently holds (post-POR
+-//                       this is the factory image — useful for testing).
+-//                  b3 = RESET_TIMER           : pulse rsttimer
+-//                       (watchdog clear; cheap when WD_EN=0).
+-//                  b4 = SHIFT_IN_ONLY         : load DATA, shift it
+-//                       into rublock (29 cycles), but DO NOT pulse
+-//                       rconfig.  Diagnostic to verify the rublock
+-//                       register retains writes — pair with
+-//                       SHIFT_OUT_CAPTURE to read back.
+-//                  CMD writes are level-edge: any high bit triggers
+-//                  the corresponding action.  STATUS.busy gates new
+-//                  triggers.
+-//   0x08  STATUS  (R)
+-//                  b0 = busy (FSM running)
+-//                  b1 = done_sticky (last op completed; clears on read)
+-//                  b4..0 = state[3:0] (debug)
++//   0x00  DATA    (R/W) write side: data_in[23:0] for next write_param
++//                       read side : data_out[28:0] from last read_param
++//   0x04  CTRL    (W)   packed control word; writing triggers actions:
++//                       [2:0]  = param[2:0] (field selector)
++//                       [3]    = pulse write_param this cycle
++//                       [4]    = pulse read_param this cycle
++//                       [5]    = pulse reset_timer this cycle
++//                       [6]    = pulse reconfig this cycle (POINT OF NO RETURN)
++//                       [9:8]  = read_source[1:0] (for read_param)
++//                       Pulses are gated by !busy.
++//   0x08  STATUS  (R)   [0] = busy (from megafunction)
++//
++// Param values (Cyclone IV / Cyclone 10 LP per Intel docs + ALSE app note):
++//   3'b100 = Page Select   (24-bit byte address; chip uses high 22 bits)
++//   3'b011 = Watchdog Enable (data_in[0])
++//   3'b010 = Watchdog Timeout (12 bits)
++//   3'b001 = Early ConfDone Check / Cd_early (data_in[0])
++//   3'b111 = Read reconfig source (use with read_source=01)
++//
++// Firmware sequence to boot application slot 1 (byte 0x80000):
++//   1. wait busy=0
++//   2. DATA = 0x80000;                  CTRL = (100 << 0) | (1 << 3)  // write page
++//   3. wait busy=0
++//   4. DATA = 0x000000;                 CTRL = (011 << 0) | (1 << 3)  // WD disable
++//   5. wait busy=0
++//   6. DATA = 0x000001;                 CTRL = (001 << 0) | (1 << 3)  // Cd_early
++//   7. wait busy=0
++//   8. CTRL = (1 << 6)                                                 // reconfig
+ 
+ module wb_altremote_update (
+     input         clk,
+@@ -67,244 +78,82 @@ module wb_altremote_update (
+     wire in_range = (xbus_adr[31:20] == 12'hF30);
+     wire [7:0] off = xbus_adr[7:0];
+ 
+-    // ── rublock primitive I/O ─────────────────────────────────────────
+-    reg  ru_shiftnld;  // 1 = shift, 0 = load/update
+-    reg  ru_captnupdt; // 1 = capture (read), 0 = update (write)
+-    reg  ru_regin;     // serial in
+-    reg  ru_rsttimer;  // watchdog clear
+-    reg  ru_rconfig;   // pulse → FPGA reloads
+-    wire ru_regout;    // serial out
+-
+-    cycloneive_rublock u_ru (
+-        .clk       (clk),
+-        .shiftnld  (ru_shiftnld),
+-        .captnupdt (ru_captnupdt),
+-        .regin     (ru_regin),
+-        .rsttimer  (ru_rsttimer),
+-        .rconfig   (ru_rconfig),
+-        .regout    (ru_regout)
++    // ── Megafunction signals ──────────────────────────────────────────
++    reg  [23:0] data_in;
++    wire [28:0] data_out;
++    reg  [2:0]  param;
++    reg  [1:0]  read_source;
++    reg         write_param;
++    reg         read_param;
++    reg         reconfig;
++    reg         reset_timer;
++    wire        busy;
++
++    altremote_update #(
++        .config_device_addr_width(24),
++        .in_data_width(24),
++        .out_data_width(29),
++        .operation_mode("REMOTE"),
++        .lpm_type("altremote_update"),
++        .support_write_check("1"),
++        .check_app_pof("false"),
++        .is_epcq("false"),
++        .intended_device_family("Cyclone IV E")
++    ) u_ru (
++        .clock(clk),
++        .reset(~rst_n),
++        .reconfig(reconfig),
++        .reset_timer(reset_timer),
++        .write_param(write_param),
++        .read_param(read_param),
++        .param(param),
++        .data_in(data_in),
++        .read_source(read_source),
++        .data_out(data_out),
++        .busy(busy)
+     );
+ 
+-    // ── User register: 29-bit shift payload (write side) ────────────
+-    reg [28:0] data_reg;
+-    // FSM-owned readback register: holds shift-out capture result.
+-    // Reading DATA returns this so the FSM and bus block don't both
+-    // drive the same net (avoids Quartus error 10028).
+-    reg [28:0] capture_reg;
+-
+-    // ── FSM ──────────────────────────────────────────────────────────
+-    localparam S_IDLE       = 4'd0;
+-    localparam S_LOAD_PRE   = 4'd1;  // capt=0, shiftnld=0 for one clk (latch in)
+-    localparam S_SHIFT_IN   = 4'd2;  // shiftnld=1, regin = data_reg LSB, 29 cycles
+-    localparam S_LOAD_POST  = 4'd3;  // shiftnld=0 for one clk (update PGM_SEL)
+-    localparam S_RECONFIG   = 4'd4;  // rconfig=1 for one clk (point of no return)
+-    localparam S_CAP_PRE    = 4'd5;  // capt=1, shiftnld=0 for one clk (capture)
+-    localparam S_SHIFT_OUT  = 4'd6;  // capt=1, shiftnld=1, shift 29 cycles
+-    localparam S_TIMER_RST  = 4'd7;  // rsttimer=1 for one clk
+-    localparam S_DONE       = 4'd8;
+-
+-    reg [3:0]  state;
+-    reg [4:0]  bit_cnt;       // 0..28 (need 5 bits for value 29)
+-    reg [28:0] shift_buf;     // local shift register (mirror)
+-    reg        done_sticky;
+-    reg        status_read_req;
+-
+-    wire busy = (state != S_IDLE) && (state != S_DONE);
+-
+-    // Trigger latches (so single MMIO write into CMD can start one op)
+-    reg trig_shift_in;
+-    reg trig_shift_out;
+-    reg trig_reconfig;
+-    reg trig_rsttimer;
+-    reg trig_shift_in_only;  /* 2026-05-19 diagnostic */
+-
+-    // NH12 (2026-05-17 silicon): the bus block clears trig_* one cycle
+-    // after CMD write, but S_LOAD_POST reads them ~31 cycles later — so
+-    // SHIFT_IN_AND_RECONFIG never actually pulsed rconfig.  This flop
+-    // latches the "auto-fire reconfig after shift" intent at S_IDLE
+-    // entry so it survives the SHIFT_IN window.
+-    reg auto_reconfig;
+-
+-    always @(posedge clk or negedge rst_n) begin
+-        if (!rst_n) begin
+-            state           <= S_IDLE;
+-            bit_cnt         <= 5'd0;
+-            shift_buf       <= 29'd0;
+-            capture_reg     <= 29'd0;
+-            done_sticky     <= 1'b0;
+-            auto_reconfig   <= 1'b0;
+-            ru_shiftnld     <= 1'b0;
+-            ru_captnupdt    <= 1'b0;
+-            ru_regin        <= 1'b0;
+-            ru_rsttimer     <= 1'b0;
+-            ru_rconfig      <= 1'b0;
+-        end else begin
+-            // defaults each cycle
+-            ru_shiftnld  <= 1'b0;
+-            ru_captnupdt <= 1'b0;
+-            ru_regin     <= 1'b0;
+-            ru_rsttimer  <= 1'b0;
+-            ru_rconfig   <= 1'b0;
+-
+-            // clear done on STATUS read
+-            if (status_read_req) done_sticky <= 1'b0;
+-
+-            case (state)
+-                S_IDLE: begin
+-                    bit_cnt <= 5'd0;
+-                    if (trig_shift_in) begin
+-                        shift_buf     <= data_reg;
+-                        // NH12: latch the "fire reconfig after shift" intent.
+-                        // CMD.b0 alone is documented as SHIFT_IN_AND_RECONFIG,
+-                        // so this is unconditional in the shift_in branch.
+-                        auto_reconfig <= 1'b1;
+-                        state         <= S_LOAD_PRE;
+-                    end else if (trig_shift_in_only) begin
+-                        /* 2026-05-19 diagnostic: shift in but don't reconfig. */
+-                        shift_buf     <= data_reg;
+-                        auto_reconfig <= 1'b0;
+-                        state         <= S_LOAD_PRE;
+-                    end else if (trig_shift_out) begin
+-                        state <= S_CAP_PRE;
+-                    end else if (trig_reconfig) begin
+-                        auto_reconfig <= 1'b0;
+-                        state <= S_RECONFIG;
+-                    end else if (trig_rsttimer) begin
+-                        state <= S_TIMER_RST;
+-                    end
+-                end
+-
+-                S_LOAD_PRE: begin
+-                    // one cycle of shiftnld=0, capt=0 → prepare write
+-                    ru_shiftnld  <= 1'b0;
+-                    ru_captnupdt <= 1'b0;
+-                    state <= S_SHIFT_IN;
+-                end
+-
+-                S_SHIFT_IN: begin
+-                    ru_shiftnld  <= 1'b1;
+-                    ru_captnupdt <= 1'b0;
+-                    ru_regin     <= shift_buf[0];
+-                    shift_buf    <= {1'b0, shift_buf[28:1]};
+-                    if (bit_cnt == 5'd28) begin
+-                        bit_cnt <= 5'd0;
+-                        state   <= S_LOAD_POST;
+-                    end else begin
+-                        bit_cnt <= bit_cnt + 5'd1;
+-                    end
+-                end
+-
+-                S_LOAD_POST: begin
+-                    // shiftnld=0, capt=0 → register loaded into PGM_SEL
+-                    ru_shiftnld  <= 1'b0;
+-                    ru_captnupdt <= 1'b0;
+-                    // NH12: use the latched intent instead of the
+-                    // long-since-cleared bus-side trig_* signals.
+-                    if (auto_reconfig) begin
+-                        auto_reconfig <= 1'b0;
+-                        state         <= S_RECONFIG;
+-                    end else begin
+-                        state <= S_DONE;
+-                    end
+-                end
+-
+-                S_RECONFIG: begin
+-                    // NH11 (2026-05-17 silicon): the original 1-cycle pulse
+-                    // (~20 ns @ 50 MHz) is below the Cyclone IV E rublock
+-                    // rconfig min pulse width (~250 ns).  Hold HIGH for 16
+-                    // sysclk cycles = 320 ns to clear the spec with margin.
+-                    // bit_cnt is already 0 when we enter this state via
+-                    // either S_LOAD_POST or S_IDLE (RECONFIG_ONLY path).
+-                    ru_rconfig <= 1'b1;
+-                    if (bit_cnt == 5'd15) begin
+-                        bit_cnt <= 5'd0;
+-                        state   <= S_DONE;
+-                    end else begin
+-                        bit_cnt <= bit_cnt + 5'd1;
+-                    end
+-                end
+-
+-                S_CAP_PRE: begin
+-                    // capt=1, shiftnld=0 for one clk → snapshot PGM_SEL
+-                    ru_shiftnld  <= 1'b0;
+-                    ru_captnupdt <= 1'b1;
+-                    state <= S_SHIFT_OUT;
+-                end
+-
+-                S_SHIFT_OUT: begin
+-                    ru_shiftnld  <= 1'b1;
+-                    ru_captnupdt <= 1'b1;
+-                    shift_buf <= {ru_regout, shift_buf[28:1]};
+-                    if (bit_cnt == 5'd28) begin
+-                        bit_cnt     <= 5'd0;
+-                        capture_reg <= {ru_regout, shift_buf[28:1]};
+-                        state       <= S_DONE;
+-                    end else begin
+-                        bit_cnt <= bit_cnt + 5'd1;
+-                    end
+-                end
+-
+-                S_TIMER_RST: begin
+-                    ru_rsttimer <= 1'b1;
+-                    state <= S_DONE;
+-                end
+-
+-                S_DONE: begin
+-                    done_sticky <= 1'b1;
+-                    state       <= S_IDLE;
+-                end
+-
+-                default: state <= S_IDLE;
+-            endcase
+-        end
+-    end
+-
+     // ── Wishbone bus transaction ─────────────────────────────────────
+     always @(posedge clk or negedge rst_n) begin
+         if (!rst_n) begin
+-            xbus_ack            <= 1'b0;
+-            xbus_dat_r          <= 32'd0;
+-            data_reg            <= 29'd0;
+-            trig_shift_in       <= 1'b0;
+-            trig_shift_out      <= 1'b0;
+-            trig_reconfig       <= 1'b0;
+-            trig_rsttimer       <= 1'b0;
+-            trig_shift_in_only  <= 1'b0;
+-            status_read_req     <= 1'b0;
++            xbus_ack    <= 1'b0;
++            xbus_dat_r  <= 32'd0;
++            data_in     <= 24'd0;
++            param       <= 3'd0;
++            read_source <= 2'd0;
++            write_param <= 1'b0;
++            read_param  <= 1'b0;
++            reconfig    <= 1'b0;
++            reset_timer <= 1'b0;
+         end else begin
+-            xbus_ack            <= 1'b0;
+-            // Auto-clear triggers (consumed by FSM on next IDLE check)
+-            trig_shift_in       <= 1'b0;
+-            trig_shift_out      <= 1'b0;
+-            trig_reconfig       <= 1'b0;
+-            trig_rsttimer       <= 1'b0;
+-            trig_shift_in_only  <= 1'b0;
+-            status_read_req     <= 1'b0;
++            xbus_ack    <= 1'b0;
++            // Auto-clear single-cycle pulses (megafunction needs only 1 cycle assertion)
++            write_param <= 1'b0;
++            read_param  <= 1'b0;
++            reconfig    <= 1'b0;
++            reset_timer <= 1'b0;
+ 
+             if (xbus_cyc && xbus_stb && in_range && !xbus_ack) begin
+                 xbus_ack <= 1'b1;
+                 if (xbus_we) begin
+                     case (off)
+-                        8'h00: data_reg <= xbus_dat_w[28:0];
++                        8'h00: data_in <= xbus_dat_w[23:0];
+                         8'h04: begin
+-                            // Only accept new trigger when idle
++                            param       <= xbus_dat_w[2:0];
++                            read_source <= xbus_dat_w[9:8];
+                             if (!busy) begin
+-                                trig_shift_in      <= xbus_dat_w[0];
+-                                trig_shift_out     <= xbus_dat_w[1];
+-                                trig_reconfig      <= xbus_dat_w[2];
+-                                trig_rsttimer      <= xbus_dat_w[3];
+-                                trig_shift_in_only <= xbus_dat_w[4];
++                                write_param <= xbus_dat_w[3];
++                                read_param  <= xbus_dat_w[4];
++                                reset_timer <= xbus_dat_w[5];
++                                reconfig    <= xbus_dat_w[6];
+                             end
+                         end
+                         default: ;
+                     endcase
+                 end else begin
+                     case (off)
+-                        8'h00: xbus_dat_r <= {3'd0, capture_reg};
+-                        8'h08: begin
+-                            xbus_dat_r       <= {27'd0, state, done_sticky, busy};
+-                            status_read_req  <= 1'b1;
+-                        end
++                        8'h00: xbus_dat_r <= {3'd0, data_out};
++                        8'h08: xbus_dat_r <= {31'd0, busy};
+                         default: xbus_dat_r <= 32'd0;
+                     endcase
+                 end
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 1fc9239..96f3c70 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -2066,87 +2066,59 @@ int main(void)
+             uart_puts("[rot] FALLBACK — page 0 reconfig failed (status=");
+             uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
+         } else if (mode == 'X') {
+-            /* 2026-05-19 diagnostic: parametric reconfig with rublock-
+-             * register echo-check.  Reads 8 hex digits as a full 29-bit
+-             * payload (mask 0x1FFFFFFF), shifts it in non-destructively,
+-             * captures the rublock register back, prints the comparison,
+-             * then asks the host whether to actually fire reconfig. */
+-            volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
+-            volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
+-            volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
+-            uart_puts("[stage2] Mode: parametric reconfig + echo-check\r\n");
+-            uart_puts("[host] send 8 hex digits for raw 29-bit payload\r\n");
+-            uint32_t raw = 0;
+-            for (int i = 0; i < 8; i++) {
++            /* 2026-05-20 Path B: megafunction-based parametric reconfig.
++             * Accepts 6 hex digits = 24-bit byte address; sets page +
++             * WD-disable + Cd_early via megafunction param protocol then
++             * fires reconfig.  Replaces the prior direct-primitive 29-bit
++             * shift hex-payload interface. */
++            uart_puts("[stage2] Mode: megafunction reconfig (Path B)\r\n");
++            uart_puts("[host] send 6 hex digits for 24-bit byte address\r\n");
++            uint32_t addr = 0;
++            for (int i = 0; i < 6; i++) {
+                 int c = -1;
+                 while ((c = uart_getc_timeout(60000)) < 0) {}
+                 uint32_t nib;
+                 if      (c >= '0' && c <= '9') nib = c - '0';
+                 else if (c >= 'a' && c <= 'f') nib = c - 'a' + 10;
+                 else if (c >= 'A' && c <= 'F') nib = c - 'A' + 10;
+-                else { uart_puts("[!] bad hex char — abort\r\n"); goto x_abort; }
+-                raw = (raw << 4) | nib;
++                else { uart_puts("[!] bad hex — abort\r\n"); goto x_abort; }
++                addr = (addr << 4) | nib;
+             }
+-            raw &= 0x1FFFFFFFu;  /* 29-bit */
+-            uart_puts("[rot] payload  = "); uart_puthex32(raw); uart_puts("\r\n");
+-
+-            /* Phase 1: SHIFT_IN_ONLY — load rublock register without firing rconfig */
+-            altru_data[0] = raw;
+-            altru_cmd[0]  = 0x10u;  /* CMD bit 4 = SHIFT_IN_ONLY */
+-            for (volatile int i = 0; i < 100000; i++) {}  /* wait FSM */
+-            uart_puts("[rot] STATUS post-shift-in = "); uart_puthex32(*altru_status);
+-            uart_puts("\r\n");
+-
+-            /* Phase 2: SHIFT_OUT_CAPTURE — read back the rublock register */
+-            altru_cmd[0]  = 0x02u;
+-            for (volatile int i = 0; i < 100000; i++) {}
+-            uint32_t echo = (*altru_data) & 0x1FFFFFFFu;
+-            uart_puts("[rot] echo     = "); uart_puthex32(echo);
+-            if (echo == raw) uart_puts("  [MATCH — rublock honoured the write]");
+-            else             uart_puts("  [MISMATCH — rublock did NOT honour the write]");
+-            uart_puts("\r\n");
+-
+-            /* Phase 3: ask the host whether to fire reconfig */
+-            uart_puts("[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort\r\n");
++            addr &= 0x00FFFFFFu;
++            uart_puts("[rot] target byte addr = "); uart_puthex32(addr); uart_puts("\r\n");
++            uart_puts("[host] press 'y' to fire reconfig, any other char to abort\r\n");
+             int fc;
+             while ((fc = uart_getc_timeout(60000)) < 0) {}
+             if (fc == 'y' || fc == 'Y') {
+-                altru_data[0] = raw;
+-                altru_cmd[0]  = 0x01u;  /* SHIFT_IN_AND_RECONFIG */
+-                /* Poll done_sticky (fallback detect) */
+-                for (uint32_t i = 0; i < 500000u; i++) {
+-                    if ((*altru_status) & 0x2u) {
+-                        uart_puts("[rot] FALLBACK — chip ignored rconfig\r\n");
+-                        goto x_abort;
+-                    }
+-                }
+-                uart_puts("[rot] TIMEOUT — chip neither rebooted nor signalled\r\n");
++                int rr = epcs_remote_reconfig_ex(addr, 0u, 0u, 1u);
++                uart_puts("[rot] FALLBACK/TIMEOUT — chip stayed alive (status=");
++                uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
+             } else {
+                 uart_puts("[rot] aborted, no reconfig\r\n");
+             }
+         x_abort: ;
+         } else if (mode == 'Q') {
+-            /* 2026-05-19 diagnostic: SHIFT_OUT_CAPTURE the rublock register
+-             * to learn the chip's current remote-update state.  Tells us
+-             * whether the AP_CONFIG_SEL=1 reconfig actually changed the
+-             * chip's mode or whether the chip is in regular AS (not REMOTE)
+-             * and ignores pgm_sel entirely. */
++            /* 2026-05-20 Path B: megafunction-based status read.  Reads
++             * Reconfig-Source register via param=111 + read_source=01. */
+             volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
+-            volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
++            volatile uint32_t *altru_ctrl   = (volatile uint32_t *)0xF3000004UL;
+             volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
+-            uart_puts("[stage2] Mode: rublock capture probe\r\n");
+-            uart_puts("[rot] STATUS pre  = "); uart_puthex32(*altru_status);
+-            uart_puts("\r\n");
+-            altru_cmd[0] = 0x2u;  /* SHIFT_OUT_CAPTURE */
+-            for (volatile int i = 0; i < 100000; i++) { /* ~10 ms wait */ }
+-            uint32_t s   = *altru_status;
+-            uint32_t cap = *altru_data;
+-            uart_puts("[rot] STATUS post = "); uart_puthex32(s); uart_puts("\r\n");
+-            uart_puts("[rot] capture_reg = "); uart_puthex32(cap); uart_puts("\r\n");
+-            uart_puts("[rot]   PGM_SEL[23:0]   = "); uart_puthex32(cap & 0x00FFFFFFu); uart_puts("\r\n");
+-            uart_puts("[rot]   WD_EN[24]       = "); uart_puthex32((cap >> 24) & 0x1u); uart_puts("\r\n");
+-            uart_puts("[rot]   WD_TMR[27:25]   = "); uart_puthex32((cap >> 25) & 0x7u); uart_puts("\r\n");
+-            uart_puts("[rot]   AP_CONFIG[28]   = "); uart_puthex32((cap >> 28) & 0x1u); uart_puts("\r\n");
++            uart_puts("[stage2] Mode: read reconfig source (Path B)\r\n");
++            /* wait busy */
++            for (volatile int i = 0; i < 100000 && ((*altru_status) & 0x1u); i++) {}
++            *altru_ctrl = 0x7u | (1u << 4) | (1u << 8);  /* param=111, read_param=1, read_source=01 */
++            /* wait busy clear */
++            for (volatile int i = 0; i < 100000 && ((*altru_status) & 0x1u); i++) {}
++            uint32_t src = (*altru_data) & 0x1Fu;
++            uart_puts("[rot] reconfig source = "); uart_puthex32(src);
++            switch (src) {
++                case 0x10: uart_puts("  (nCONFIG external)\r\n"); break;
++                case 0x08: uart_puts("  (CRC error)\r\n"); break;
++                case 0x04: uart_puts("  (nSTATUS asserted)\r\n"); break;
++                case 0x02: uart_puts("  (Watchdog timer)\r\n"); break;
++                case 0x01: uart_puts("  (core nCONFIG / runtime)\r\n"); break;
++                default:   uart_puts("  (unknown)\r\n"); break;
++            }
+         } else {
+             uart_puts("[!] unknown mode byte — ignored\r\n");
+         }
+diff --git a/sw/stage2_loader/remote_update.c b/sw/stage2_loader/remote_update.c
+index 61fc9ad..cf91772 100644
+--- a/sw/stage2_loader/remote_update.c
++++ b/sw/stage2_loader/remote_update.c
+@@ -1,66 +1,113 @@
+ // SPDX-License-Identifier: GPL-2.0+
+ /*
+- * remote_update.c — Phase 4 EPCS remote-update trigger + Audit #9
+- * fallback detect + Audit #8 parameterization.  See remote_update.h
+- * for protocol notes.
++ * remote_update.c — Megafunction-based remote-reconfig driver.
++ *
++ * Path B (2026-05-20): switched from direct cycloneive_rublock primitive
++ * to altremote_update megafunction.  The megafunction handles field
++ * layout, primitive clocking (rublock_clock divider), and the
++ * write_param sequencing internally — frees us from the 5-session
++ * direct-primitive layout/timing rabbit hole.
++ *
++ * Wrapper (rtl/wb_altremote_update.v) register map:
++ *   0xF3000000 DATA   (R/W) data_in[23:0] write / data_out[28:0] read
++ *   0xF3000004 CTRL   (W)   bit-packed control:
++ *                            [2:0] = param  (field selector)
++ *                            [3]   = write_param pulse
++ *                            [4]   = read_param pulse
++ *                            [5]   = reset_timer pulse
++ *                            [6]   = reconfig pulse (POINT OF NO RETURN)
++ *                            [9:8] = read_source
++ *   0xF3000008 STATUS (R)   [0] = busy
++ *
++ * Sequence: write all needed params, then trigger reconfig.
+  */
+ #include "remote_update.h"
+ 
+-/* Wrapper FSM (rtl/wb_altremote_update.v) finishes its 29-bit shift +
+- * rconfig pulse + 16-cycle hold in ~51 clk at 50 MHz (~1 us).  If the
+- * chip honours rconfig the CPU is wiped within microseconds of the
+- * pulse, so the polling loop below NEVER observes done_sticky in the
+- * success path.  If done_sticky comes back high we know the rconfig
+- * pulse fired but the chip stayed alive — that's the fallback signal
+- * Audit #9 wants surfaced to the caller. */
+-#define RR_POLL_ITERS  500000u  /* worst-case ~50 ms on a small RV32 core */
++static volatile uint32_t * const altru_data   = (volatile uint32_t *)0xF3000000UL;
++static volatile uint32_t * const altru_ctrl   = (volatile uint32_t *)0xF3000004UL;
++static volatile uint32_t * const altru_status = (volatile uint32_t *)0xF3000008UL;
++
++/* Param values per Intel Remote Update IP User Guide + ALSE app note */
++#define PARAM_PAGE_SELECT  0x4u  /* 3'b100 — boot byte address */
++#define PARAM_WD_ENABLE    0x3u  /* 3'b011 — watchdog enable (data_in[0]) */
++#define PARAM_WD_TIMEOUT   0x2u  /* 3'b010 — watchdog timeout (data_in[11:0]) */
++#define PARAM_CD_EARLY     0x1u  /* 3'b001 — early ConfDone check (data_in[0]) */
++#define PARAM_RECONFIG_SRC 0x7u  /* 3'b111 — read reconfig source (use read_source=01) */
++
++#define CTRL_WRITE_PARAM   (1u << 3)
++#define CTRL_READ_PARAM    (1u << 4)
++#define CTRL_RESET_TIMER   (1u << 5)
++#define CTRL_RECONFIG      (1u << 6)
++
++/* Megafunction busy can stay high for ~50 cycles per write_param (per
++ * Arria 10 IP analog).  Pick a generous polling limit. */
++#define BUSY_POLL_ITERS    100000u
++
++static int wait_busy_clear(void)
++{
++    for (uint32_t i = 0; i < BUSY_POLL_ITERS; i++) {
++        if (((*altru_status) & 0x1u) == 0u) return 0;
++    }
++    return -1;
++}
++
++static int write_field(uint32_t param, uint32_t data)
++{
++    if (wait_busy_clear() < 0) return RR_BUSY;
++    *altru_data = data & 0x00FFFFFFu;
++    *altru_ctrl = (param & 0x7u) | CTRL_WRITE_PARAM;
++    return 0;
++}
+ 
+ int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
+                             uint32_t wd_tmr, uint32_t ap_config_sel)
+ {
+-    /* Drain UART TX FIFO so the caller's "triggering reconfig" line
+-     * finishes before rconfig fires.  Same idiom as mode_set_baud. */
++    (void)ap_config_sel;  /* implicit in Cyclone IV: pgm_sel=0 = factory,
++                             pgm_sel != 0 = application */
++
++    /* Drain UART TX FIFO so any caller's "triggering reconfig" line
++     * finishes before rconfig fires. */
+     volatile uint32_t *uart_ctrl = (volatile uint32_t *)0xFFF50000UL;
+     while (!(uart_ctrl[0] & (1u << 18))) { /* TX_EMPTY */ }
+     for (volatile int i = 0; i < 2000; i++) { }
+ 
+-    volatile uint32_t *altru_data   = (volatile uint32_t *)0xF3000000UL;
+-    volatile uint32_t *altru_cmd    = (volatile uint32_t *)0xF3000004UL;
+-    volatile uint32_t *altru_status = (volatile uint32_t *)0xF3000008UL;
+-
+-    /* Refuse to trigger if FSM is already busy. */
++    /* Refuse if megafunction is busy. */
+     if ((*altru_status) & 0x1u) return RR_BUSY;
+ 
+-    /* 29-bit payload (see remote_update.h for full layout):
+-     *   [23:0]  PGM_SEL
+-     *   [24]    WD_EN
+-     *   [27:25] WD_TMR
+-     *   [28]    AP_CONFIG_SEL (0 = factory page 0 next, 1 = application)
+-     * Empirical (2026-05-19 silicon, mode_g HW test): AP_CONFIG_SEL=0
+-     * causes the chip to ignore PGM_SEL and boot factory page 0 — that
+-     * was the actual cause of the Phase 8 fall-back, NOT the missing
+-     * INTERNAL_FLASH_UPDATE_MODE=REMOTE qsf on the TPU side. */
+-    uint32_t payload = (pgm_sel & 0x00FFFFFFu)
+-                     | ((wd_en        & 0x1u) << 24)
+-                     | ((wd_tmr       & 0x7u) << 25)
+-                     | ((ap_config_sel & 0x1u) << 28);
+-    altru_data[0] = payload;
+-    /* SHIFT_IN_AND_RECONFIG: FSM shifts 29 bits in then pulses rconfig.
+-     * Point of no return — FPGA reloads from new page in ~150 ms IF the
+-     * chip is in REMOTE mode and the target image is valid. */
+-    altru_cmd[0]  = 0x1u;
+-
+-    /* Poll STATUS for done_sticky.  Observing it means the FSM finished
+-     * but the chip ignored rconfig — Audit #9 fallback path. */
+-    for (uint32_t i = 0; i < RR_POLL_ITERS; i++) {
+-        if ((*altru_status) & 0x2u) return RR_FALLBACK;
++    /* 1. Page select — 24-bit byte address.  Internally the megafunction
++     *    loads data_in[23:2] into the 22-bit page register (chip's silicon
++     *    uses 32-bit word alignment; low 2 bits are forced to 0). */
++    if (write_field(PARAM_PAGE_SELECT, pgm_sel) < 0) return RR_BUSY;
++
++    /* 2. Watchdog enable — disable for now (Phase 9 enables it). */
++    if (write_field(PARAM_WD_ENABLE, wd_en & 0x1u) < 0) return RR_BUSY;
++
++    /* 3. Optional WD timeout (only meaningful if WD_EN=1) */
++    if (wd_en) {
++        if (write_field(PARAM_WD_TIMEOUT, wd_tmr & 0xFFFu) < 0) return RR_BUSY;
++    }
++
++    /* 4. Cd_early check (Altera recommends ON for Cyclone III/IV). */
++    if (write_field(PARAM_CD_EARLY, 1u) < 0) return RR_BUSY;
++
++    /* 5. Wait for all writes to complete, then fire reconfig.  Point of
++     *    no return — chip reloads from page byte_addr in ~150 ms IF the
++     *    target image header validates. */
++    if (wait_busy_clear() < 0) return RR_BUSY;
++    *altru_ctrl = CTRL_RECONFIG;
++
++    /* Poll busy — if reconfig succeeded the CPU is wiped within ~1 us.
++     * If we observe busy go low without rebooting, the chip ignored
++     * rconfig (= fallback). */
++    for (uint32_t i = 0; i < 500000u; i++) {
++        if (((*altru_status) & 0x1u) == 0u) {
++            /* busy cleared without reboot — chip stayed alive */
++            return RR_FALLBACK;
++        }
+     }
+     return RR_TIMEOUT;
+ }
+ 
+-/* Backwards-compat wrapper: pre-Audit-#8 callers pass only pgm_sel and
+- * get the original WD_EN=0, WD_TMR=0, AP_CONFIG_SEL=0 (factory boot)
+- * defaults.  Used by mode 'r' which wants exactly that semantics. */
+ int epcs_remote_reconfig(uint32_t pgm_sel)
+ {
+     return epcs_remote_reconfig_ex(pgm_sel, 0u, 0u, 0u);
+diff --git a/sw/stage2_loader/remote_update.h b/sw/stage2_loader/remote_update.h
+index a78cd2c..ab60734 100644
+--- a/sw/stage2_loader/remote_update.h
++++ b/sw/stage2_loader/remote_update.h
+@@ -2,23 +2,32 @@
+ /*
+  * remote_update.h — Phase 4 firmware interface to wb_altremote_update.
+  *
+- * Drives the wb_altremote_update wrapper at 0xF3000000 (Phase 2 silicon),
+- * which is a 29-bit-shift-register FSM around the cycloneive_rublock
+- * primitive — direct-primitive path because the altremote_update
+- * megafunction strips write_param/data_in in 21.1 Lite REMOTE mode even
+- * with SUPPORT_WRITE_CHECK="1" (re-confirmed empirically 2026-05-17).
++ * Drives the wb_altremote_update wrapper at 0xF3000000 — Path B
++ * (megafunction-based) since 2026-05-20.
+  *
+- * Register map (from rtl/wb_altremote_update.v):
+- *   0xF3000000 DATA   (R/W) 29-bit shift payload (write side)
+- *   0xF3000004 CMD    (W)   b0=SHIFT_IN_AND_RECONFIG, b1=SHIFT_OUT_CAPTURE,
+- *                            b2=RECONFIG_ONLY, b3=RESET_TIMER
+- *   0xF3000008 STATUS (R)   b0=busy, b1=done_sticky, b5..2=state
++ * Background: prior direct-primitive wrapper bypassed the altremote_update
++ * megafunction because we believed Lite 21.1 strips write_param/data_in.
++ * Re-tested 2026-05-20 via Verilog-instantiation + quartus_map elaborate
++ * — IP elaborates fully with all I/O alive (199 LE, 35 input / 30 output
++ * pins).  Empirical refutation of "Lite strips" memory.  Switched to
++ * megafunction-based wrapper to eliminate 5 sessions of direct-primitive
++ * layout/timing debugging.
+  *
+- * 29-bit payload layout (LSB-first per Cyclone IV Handbook Vol 1 Ch 8):
+- *   [23:0]  PGM_SEL (boot byte address)
+- *   [24]    WD_EN   (0 = watchdog disabled)
+- *   [27:25] WD_TMR  (timeout select; ignored when WD_EN=0)
+- *   [28]    AP_CONFIG_SEL (0 = factory boot next, 1 = application)
++ * Wrapper register map (rtl/wb_altremote_update.v):
++ *   0xF3000000 DATA   (R/W) data_in[23:0] write / data_out[28:0] read
++ *   0xF3000004 CTRL   (W)   [2:0]=param, [3]=write_param, [4]=read_param,
++ *                            [5]=reset_timer, [6]=reconfig, [9:8]=read_source
++ *   0xF3000008 STATUS (R)   [0]=busy
++ *
++ * Field params:
++ *   3'b100 = Page Select   (24-bit byte address; chip uses [23:2])
++ *   3'b011 = WD enable     (data_in[0])
++ *   3'b010 = WD timeout    (data_in[11:0])
++ *   3'b001 = Cd_early      (data_in[0])
++ *   3'b111 = Reconfig src  (read with read_source=01)
++ *
++ * AnF (application-not-factory) is IMPLICIT in Cyclone IV/10 LP — pgm_sel=0
++ * means factory boot, pgm_sel != 0 means application.  No separate write.
+  */
+ #ifndef ROT_REMOTE_UPDATE_H
+ #define ROT_REMOTE_UPDATE_H
+-- 
+2.43.0
+
