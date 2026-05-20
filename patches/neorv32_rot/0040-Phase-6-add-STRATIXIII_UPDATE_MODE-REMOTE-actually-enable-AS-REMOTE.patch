@@ -1,0 +1,42 @@
+From 4d1b619d3c99a4f840bf0e2a4210bdff379eca21 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 20:47:39 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=206:=20add=20STRATIXIII=5FUPDATE=5FMODE?=
+ =?UTF-8?q?=3DREMOTE=20=E2=80=94=20actually=20enable=20AS=20REMOTE=20in=20?=
+ =?UTF-8?q?Lite=2021.1?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Quartus Lite 21.1 for Cyclone IV E silently ignores INTERNAL_FLASH_UPDATE_MODE
+("Warning (169143): Ignored configuration mode setting -- set configuration
+mode to remote update mode operating in Active Serial programming mode").
+The functioning assignment name for the Cyclone-IV-E-shares-StratixIII-codepath
+family is STRATIXIII_UPDATE_MODE — empirically discovered via
+quartus_sh get_assignment_info probing.
+
+Adding this single line silences 169143 and rewrites 24091 bytes in the
+resulting RoT.rbf, embedding the actual REMOTE-mode logic the chip's AS
+controller validates against.  Without it, AS REMOTE reconfig returns
+nSTATUS-asserted regardless of slot-1 contents — which is exactly the
+2026-05-20 LATE empirical blocker that 5 sessions of rublock-layout /
+wrapper-FSM / multi-image-POF debugging chased.
+
+Keep INTERNAL_FLASH_UPDATE_MODE as well (no harm; ALSE app notes
+recommend it for forward-compat with non-StratixIII families).
+---
+ quartus/neorv32_demo.qsf | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/quartus/neorv32_demo.qsf b/quartus/neorv32_demo.qsf
+index a22f192..06f6068 100644
+--- a/quartus/neorv32_demo.qsf
++++ b/quartus/neorv32_demo.qsf
+@@ -172,3 +172,4 @@ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 4.0
+ set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM
+ set_global_assignment -name FITTER_EFFORT "STANDARD FIT"
+ set_global_assignment -name PHYSICAL_SYNTHESIS_EFFORT EXTRA
++set_global_assignment -name STRATIXIII_UPDATE_MODE "REMOTE"
+-- 
+2.43.0
+

@@ -1,0 +1,33 @@
+From ab058e9df545035db2f1d8f8dd3c79e5b6f94a79 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 20:47:51 +0100
+Subject: [PATCH] =?UTF-8?q?Phase=206:=20add=20STRATIXIII=5FUPDATE=5FMODE?=
+ =?UTF-8?q?=3DREMOTE=20=E2=80=94=20match=20RoT=20side=20AS=20REMOTE=20fix?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Symmetric fix to neorv32_rot patch 0040.  Quartus Lite 21.1 ignores
+INTERNAL_FLASH_UPDATE_MODE=REMOTE (warning 169143); the StratixIII-codepath
+assignment STRATIXIII_UPDATE_MODE=REMOTE actually enables remote-update mode
+in the resulting bitstream.
+
+Without this, the TPU at EPCS slot 1 has the same nSTATUS-asserted failure
+when the chip's AS controller validates the slot during REMOTE reconfig:
+the application image must ALSO be REMOTE-compiled (Intel ALSE app note).
+---
+ quartus/neorv32_tpu.qsf | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/quartus/neorv32_tpu.qsf b/quartus/neorv32_tpu.qsf
+index 84e7f12..c8cbe9d 100644
+--- a/quartus/neorv32_tpu.qsf
++++ b/quartus/neorv32_tpu.qsf
+@@ -173,3 +173,4 @@ set_global_assignment -name USE_CONFIGURATION_DEVICE ON
+ set_global_assignment -name CYCLONEIII_CONFIGURATION_DEVICE EPCS16
+ set_global_assignment -name CYCLONEIII_CONFIGURATION_SCHEME "ACTIVE SERIAL"
+ set_global_assignment -name INTERNAL_FLASH_UPDATE_MODE "REMOTE"
++set_global_assignment -name STRATIXIII_UPDATE_MODE "REMOTE"
+-- 
+2.43.0
+
