@@ -1,0 +1,63 @@
+[!] unknown mode byte — ignored
+[stage2] ready for next cmd
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x00420000
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x00000000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x00040001
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x00000000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x10020000
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x02100000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
+[stage2] Mode: rublock capture probe
+[rot] STATUS pre  = 0x00000000
+[rot] STATUS post = 0x00000002
+[rot] capture_reg = 0x00000000
+[rot]   PGM_SEL[23:0]   = 0x00000000
+[rot]   WD_EN[24]       = 0x00000000
+[rot]   WD_TMR[27:25]   = 0x00000000
+[rot]   AP_CONFIG[28]   = 0x00000000
+[stage2] ready for next cmd
+[stage2] Mode: parametric reconfig + echo-check
+[host] send 8 hex digits for raw 29-bit payload
+[rot] payload  = 0x00020000
+[rot] STATUS post-shift-in = 0x00000002
+[rot] echo     = 0x00000000  [MISMATCH — rublock did NOT honour the write]
+[host] press 'y' to fire SHIFT_IN_AND_RECONFIG with this payload, any other char to abort
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b=bootSD t=tpuVerify g=genRbf P=epcsProbe Q=ruQuery X=paramRcfg r=reconfig
+[stage2] CRTM locked — waiting for host command
