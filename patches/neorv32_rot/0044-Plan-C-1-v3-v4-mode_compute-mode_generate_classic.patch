@@ -1,0 +1,309 @@
+From 0044004400440044004400440044004400440044 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 23:31:00 +0100
+Subject: [PATCH] Plan C-1 v3+v4: mode_compute + mode_generate_classic
+
+Adds two new dispatcher entries to stage2:
+
+  * 'c' -> mode_compute (Plan C-1 v3, LUT-driven TPU compute demo).
+      Clears accumulators, fires CTRL[8]=1 to trigger the tpu_accel
+      LUT->PE auto-load FSM (paired with neorv32_tpu patch 0005),
+      polls STATUS[1] until clear, writes X_IN, fires CTRL[0]=1,
+      polls STATUS[0] until done, prints RES0..RES3.  Proves
+      mode_g/G loads actually change TPU compute outputs, not just
+      stored state.
+
+  * 'G' -> mode_generate_classic (Plan C-1 v4, Phase 7 sigma-inv
+      surgery preserved without .rbf).  Same SD->CRC->whitelist
+      gate as mode 'g', then replays the lut_apply_mask
+      (pair, delta) math per record to produce sigma-inv(mask),
+      and stores THAT pattern (bits [31:16]) in the TPU LUT entry
+      instead of the raw mask.  Phase 7's novel math is exercised
+      end-to-end without touching any .rbf.
+
+Silicon-validated 2026-05-20 23:02
+(uart_20260520_2302_c1v4_g_vs_G.log): with the same 256-record
+edits256.bin on SD, mode 'g' yields RES[0..3] = -502/-542/-582/-622,
+mode 'G' yields RES[0..3] = -66/-66/-322/-322 (Python sigma-inv
+reference byte-perfect).  Different LUT contents from the same input
+edits is the direct silicon proof that the sigma-inv math ran.
+
+Pairs with neorv32_tpu patch 0005 (LUT->PE FSM RTL) and the host
+helper host/gen_edits_256.py (added in neorv32_rot patch 0045).
+---
+ sw/stage2_loader/main.c | 250 +++++++++++++++++++++++++++++++++++++
+ 1 file changed
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 0000000..0000020 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1878,6 +1878,252 @@
+      * bitstream, no second .rbf to write and reconfig into. */
+ }
+ 
++/* Mode 'G' (capital): Plan C-1 v4 — Phase 7 σ⁻¹ bit-flip surgery preserved
++ *
++ * Same SD→CRC→whitelist gate path as mode 'g' (lowercase), but for each
++ * record it computes the σ⁻¹-permuted 16-bit pattern using the Phase 7
++ * LutCodec math (lc_init derives the per-position σ⁻¹ permutation, then
++ * we replay the per-set-bit (pair, delta) formula from lut_apply_mask)
++ * and stores THAT into the TPU LUT memory, not the raw mask.
++ *
++ * Why: under Plan C-1 there's no .rbf to bit-flip, but Phase 7's σ⁻¹
++ * tables + canon-2input choice + per-bit cell-index math are still the
++ * project's novel mathematical contribution.  mode_G replays that math
++ * end-to-end, producing LUT entries that are the exact 16-cell patterns
++ * lut_apply_mask would have XOR'd into a zero-baseline .rbf.  Same
++ * trust chain (CRC + whitelist + readback), same math, no .rbf.
++ *
++ * Storage layout (differs from mode 'g'):
++ *   [31:16] = σ⁻¹(mask)  — 16-cell pattern (Phase 7 math output)
++ *   [15:11] = n[4:0]
++ *   [10: 5] = y[5:0]
++ *   [ 4: 0] = x[4:0]
++ *
++ * mode_c (LUT-driven compute) reads bits [23:16] for the PE weight byte,
++ * which under this packing is σ⁻¹(mask)[7:0] — so the same compute path
++ * that worked for mode 'g' also exercises σ⁻¹ when fed by mode 'G'. */
++static void mode_generate_classic(void)
++{
++    uart_puts("[stage2] Mode: generate-CLASSIC (Plan C-1 v4 — σ⁻¹ surgery)\r\n");
++
++    extern int sd_init(void);
++    extern int sd_read_block(uint32_t lba, uint8_t *dst);
++    extern int sd_read_many(uint32_t lba, uint32_t n, uint8_t *dst);
++
++    if (sd_init()) { uart_puts("[sd] init FAIL\r\n"); while (1) {} }
++
++    static uint8_t hdr_buf[512];
++    if (sd_read_block(0, hdr_buf)) {
++        uart_puts("[sd] read hdr FAIL\r\n"); while (1) {}
++    }
++
++    /* Magic + layout version (Phase 8 trust gate) */
++    const char magic[8] = { 'N','E','O','L','N','X','\0','\0' };
++    for (int i = 0; i < 8; i++) {
++        if (hdr_buf[i] != (uint8_t)magic[i]) {
++            uart_puts("[sd] bad magic\r\n"); while (1) {}
++        }
++    }
++    struct sd_boot_hdr *h = (struct sd_boot_hdr *)hdr_buf;
++    if (h->layout_version < 4) {
++        uart_puts("[!] layout v<4\r\n"); while (1) {}
++    }
++    if (h->edits_sz == 0 || h->edits_sz < sizeof(struct edits_hdr)) {
++        uart_puts("[!] edits_sz invalid\r\n"); while (1) {}
++    }
++
++    /* Read edits.bin */
++    uint32_t edits_blks = (h->edits_sz + 511) / 512;
++    if (sd_read_many(h->edits_lba, edits_blks, (uint8_t *)EDITS_SCRATCH_ADDR)) {
++        uart_puts("[!] SD read FAIL\r\n"); while (1) {}
++    }
++
++    /* Phase 8 CRC-32 + Phase 8 magic/version gate */
++    const struct edits_hdr *eh = (const struct edits_hdr *)EDITS_SCRATCH_ADDR;
++    if (eh->magic != EDITS_MAGIC) {
++        uart_puts("[!] edits.bin bad magic\r\n"); while (1) {}
++    }
++    if (eh->version != EDITS_VERSION) {
++        uart_puts("[!] edits.bin version mismatch\r\n"); while (1) {}
++    }
++    uint32_t need = sizeof(struct edits_hdr)
++                  + (uint32_t)eh->n_records * sizeof(struct edit_rec);
++    if (need > h->edits_sz) {
++        uart_puts("[!] edits.bin truncated\r\n"); while (1) {}
++    }
++    const uint8_t *eb = (const uint8_t *)EDITS_SCRATCH_ADDR;
++    uint32_t records_bytes = (uint32_t)eh->n_records * (uint32_t)sizeof(struct edit_rec);
++    uint32_t got_crc = crc32_two(eb + 4, 8,
++                                 eb + sizeof(struct edits_hdr),
++                                 records_bytes);
++    if (got_crc != eh->crc32) {
++        uart_puts("[!] edits.bin CRC FAIL\r\n"); while (1) {}
++    }
++    uart_puts("[rot] edits.bin CRC OK n_records=");
++    uart_puthex32(eh->n_records); uart_puts("\r\n");
++
++    if (eh->n_records > TPU_LUT_MAX) {
++        uart_puts("[!] n_records exceeds TPU_LUT_MAX\r\n"); while (1) {}
++    }
++
++    /* Per-record: lc_init -> Phase 7 σ⁻¹ math -> pack -> TPU LUT */
++    const struct edit_rec *recs =
++        (const struct edit_rec *)((const uint8_t *)EDITS_SCRATCH_ADDR
++                                  + sizeof(struct edits_hdr));
++    volatile uint32_t *tpu_lut = (volatile uint32_t *)TPU_LUT_BASE;
++    uint32_t applied = 0;
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        lut_codec_t lc;
++        lc_status_t st = lc_init(&lc, recs[i].x, recs[i].y, recs[i].n);
++        if (st != LC_OK) {
++            uart_puts("[!] edit#"); uart_puthex32(i);
++            uart_puts(" rejected by lc_init status=");
++            uart_puthex32((uint32_t)st); uart_puts("\r\n");
++            while (1) {}
++        }
++
++        /* Phase 7 math: replay lut_apply_mask's per-bit cell-index
++         * derivation, accumulating a 16-bit permuted pattern.  This is
++         * what would have been XOR'd into the rbf if we were doing
++         * .rbf surgery (zero-baseline -> σ⁻¹(mask)). */
++        uint16_t permuted = 0;
++        for (uint32_t b = 0; b < 16; b++) {
++            if (!(((uint32_t)recs[i].mask >> b) & 1u)) continue;
++            uint32_t f0 = (b >> lc.sigma[0]) & 1u;
++            uint32_t f1 = (b >> lc.sigma[1]) & 1u;
++            uint32_t f2 = (b >> lc.sigma[2]) & 1u;
++            uint32_t f3 = (b >> lc.sigma[3]) & 1u;
++            uint32_t pair  = ((1u - f0) << 2) | ((1u - f1) << 1) | (1u - f2);
++            uint32_t da    = f3 ^ (1u - f2);
++            uint32_t delta = lc.k_odd ? (1u - da) : da;
++            uint32_t cell_idx = pair * 2u + delta;   /* [0..15] */
++            permuted |= (uint16_t)(1u << cell_idx);
++        }
++
++        uint32_t packed = ((uint32_t)permuted << 16)
++                        | (((uint32_t)recs[i].n & 0x1Fu) << 11)
++                        | (((uint32_t)recs[i].y & 0x3Fu) << 5)
++                        | ( (uint32_t)recs[i].x & 0x1Fu);
++        tpu_lut[i] = packed;
++        applied++;
++    }
++    uart_puts("[rot] wrote "); uart_puthex32(applied);
++    uart_puts(" σ⁻¹-permuted records to TPU LUT\r\n");
++
++    /* Readback verify (recompute σ⁻¹ in the same way) */
++    uint32_t mismatches = 0;
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        lut_codec_t lc;
++        lc_init(&lc, recs[i].x, recs[i].y, recs[i].n);
++        uint16_t expected_permuted = 0;
++        for (uint32_t b = 0; b < 16; b++) {
++            if (!(((uint32_t)recs[i].mask >> b) & 1u)) continue;
++            uint32_t f0 = (b >> lc.sigma[0]) & 1u;
++            uint32_t f1 = (b >> lc.sigma[1]) & 1u;
++            uint32_t f2 = (b >> lc.sigma[2]) & 1u;
++            uint32_t f3 = (b >> lc.sigma[3]) & 1u;
++            uint32_t pair  = ((1u - f0) << 2) | ((1u - f1) << 1) | (1u - f2);
++            uint32_t da    = f3 ^ (1u - f2);
++            uint32_t delta = lc.k_odd ? (1u - da) : da;
++            uint32_t cell_idx = pair * 2u + delta;
++            expected_permuted |= (uint16_t)(1u << cell_idx);
++        }
++        uint32_t expected = ((uint32_t)expected_permuted << 16)
++                          | (((uint32_t)recs[i].n & 0x1Fu) << 11)
++                          | (((uint32_t)recs[i].y & 0x3Fu) << 5)
++                          | ( (uint32_t)recs[i].x & 0x1Fu);
++        uint32_t got = tpu_lut[i];
++        if (got != expected) mismatches++;
++    }
++
++    if (mismatches != 0) {
++        uart_puts("[!] σ⁻¹ readback FAIL mismatches=");
++        uart_puthex32(mismatches); uart_puts("\r\n");
++        while (1) {}
++    }
++    uart_puts("[rot] σ⁻¹ readback OK ("); uart_puthex32(applied);
++    uart_puts(" entries)\r\n");
++    uart_puts("[rot] C-1 v4 mode_G complete — Phase 7 σ⁻¹ math applied "
++              "per record; no .rbf surgery, full trust chain preserved.\r\n");
++}
++
++/* Mode 'c': Plan C-1 v3 — LUT-driven TPU compute demo
++ *
++ * Exercises the v3 hardware path that auto-loads PE weights from the
++ * first 16 LUT entries (CTRL[8] triggers an FSM in tpu_accel that
++ * reads LUT[0..15][23:16] and drives the existing load_weight
++ * machinery).  Bits [23:16] of each LUT entry match mask[7:0] in the
++ * firmware-side packing convention for mode_g records, so weights
++ * vary record-to-record.
++ *
++ * Sequence:
++ *   1. Clear accumulators (CTRL[4]=1)
++ *   2. Trigger LUT->PE auto-load (CTRL[8]=1)
++ *   3. Poll STATUS[1] (lut_load_busy) until 0
++ *   4. Write X_IN with packed signed int8 inputs
++ *   5. Start compute (CTRL[0]=1)
++ *   6. Poll STATUS[0] (done) until 1
++ *   7. Read RES0..RES3 (each is sum of x_k * w_k_row across 4 PEs)
++ *
++ * Demo intent: after mode_g loads a new edits.bin, mode_c output
++ * reflects the loaded data — proving the SD->LUT load actually
++ * changes TPU compute behavior, not just stored state. */
++static void mode_compute(void)
++{
++    uart_puts("[stage2] Mode: TPU compute (Plan C-1 v3 — LUT-driven)\r\n");
++    volatile uint32_t *tpu = (volatile uint32_t *)TPU_BASE;
++
++    /* 1. Clear accumulators (CTRL[4]=1) */
++    tpu[0] = 0x10u;
++    uart_puts("[c] acc cleared\r\n");
++
++    /* 2. Trigger LUT->PE auto-load (CTRL[8]=1) */
++    tpu[0] = 0x100u;
++    uart_puts("[c] LOAD_FROM_LUT triggered (CTRL[8]=1)\r\n");
++
++    /* 3. Poll STATUS[1] (lut_load_busy) until clear */
++    {
++        uint32_t timeout = 100000u;
++        while ((tpu[1] & 0x2u) && --timeout) { /* spin */ }
++        if (timeout == 0u) {
++            uart_puts("[!] LUT->PE load timeout — STATUS=");
++            uart_puthex32(tpu[1]); uart_puts("\r\n");
++            return;
++        }
++    }
++    uart_puts("[c] PE weights loaded from LUT[0..15][23:16]\r\n");
++
++    /* 4. Write X_IN = {x3=4, x2=3, x1=2, x0=1} */
++    tpu[4] = 0x04030201u;
++    uart_puts("[c] X_IN = 0x04030201 (x0=1, x1=2, x2=3, x3=4 as signed int8)\r\n");
++
++    /* 5. Start compute (CTRL[0]=1) */
++    tpu[0] = 0x1u;
++
++    /* 6. Poll STATUS[0] (done) */
++    {
++        uint32_t timeout = 100000u;
++        while (!(tpu[1] & 0x1u) && --timeout) { /* spin */ }
++        if (timeout == 0u) {
++            uart_puts("[!] compute timeout — STATUS=");
++            uart_puthex32(tpu[1]); uart_puts("\r\n");
++            return;
++        }
++    }
++    uart_puts("[c] compute done\r\n");
++
++    /* 7. Read results */
++    for (int i = 0; i < 4; i++) {
++        uart_puts("  RES[");
++        uart_putc((char)('0' + i));
++        uart_puts("] = ");
++        uart_puthex32(tpu[8 + i]);
++        uart_puts("\r\n");
++    }
++    uart_puts("[c] mode_c complete — results above are functions of the "
++              "LUT contents loaded by the most recent mode_g.\r\n");
++}
++
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+ static void mode_linux(void)
+ {
+@@ -2025,7 +2271,11 @@
+         } else if (mode == 't') {
+             mode_tpu_verify();         /* Phase 1: SD-side TPU SHA verify, halts */
+         } else if (mode == 'g') {
+-            mode_generate();           /* Phase 8: LUT mask editor, halts pre-EPCS */
++            mode_generate();           /* Plan C-1 v2: SD→LUT loader (raw mask) */
++        } else if (mode == 'G') {
++            mode_generate_classic();   /* Plan C-1 v4: SD→LUT loader with σ⁻¹ math */
++        } else if (mode == 'c') {
++            mode_compute();            /* Plan C-1 v3: LUT-driven TPU compute demo */
+         } else if (mode == 'P') {
+             mode_epcs_probe();         /* Phase 3: EPCS driver diagnostic */
+         } else if (mode == 'r') {
+-- 
+2.43.0
+

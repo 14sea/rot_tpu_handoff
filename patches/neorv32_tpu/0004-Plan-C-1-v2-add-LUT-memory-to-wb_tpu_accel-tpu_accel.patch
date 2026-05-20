@@ -1,0 +1,188 @@
+From 0004000400040004000400040004000400040004 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 22:30:00 +0100
+Subject: [PATCH] Plan C-1 v2: add 256-entry LUT memory to wb_tpu_accel /
+ tpu_accel
+
+Adds an M9K-backed 256 x 32-bit LUT memory window at byte offsets
+0x040-0x43F inside tpu_accel, exposed to the CPU via wb_tpu_accel's
+existing XBUS slave interface.  The systolic-array region (0x000-0x03F)
+is unchanged; in_systolic gating prevents LUT writes from accidentally
+hitting systolic register decode.
+
+This is the dynamic-load target for Plan C-1 v2 mode_g: RoT firmware
+writes verified records (read from SD, CRC-32-gated, lc_init-whitelist-
+checked) into this LUT memory at runtime.  Replaces the dead two-
+bitstream + AS-REMOTE-reconfig path from Phase 8.
+
+Silicon-validated 2026-05-20 22:17 on AX301 (EP4CE10F17C8) merged
+single-bitstream build: 9,449 LE / 92 %, +1 M9K block, +2 LE for the
+in_systolic/in_lut decode, +1 DSP9 (Quartus moved one mult into DSP).
+
+LUT entry packing convention (firmware-side, BRAM stores 32 bits
+verbatim):
+  [31:16] = mask    [15:11] = n[4:0]
+  [10: 5] = y[5:0]  [ 4: 0] = x[4:0]
+---
+ rtl/wb_tpu_accel.v |  10 +-
+ rtl/tpu_accel.v    | 110 +++++++++++++++++++++++++++++++++++++--
+ 2 files changed
+
+diff --git a/rtl/wb_tpu_accel.v b/rtl/wb_tpu_accel.v
+index 0000000..0000001 100644
+--- a/rtl/wb_tpu_accel.v
++++ b/rtl/wb_tpu_accel.v
+@@ -1,8 +1,12 @@
+ // wb_tpu_accel.v — Wishbone (NEORV32 XBUS) to tpu_accel bridge
+ //
++// v2 (2026-05-20 Plan C-1 dynamic-load demo): widens forwarded address from
++// [5:0] to [11:0] so tpu_accel can host an additional LUT memory window.
++//
+ // Maps NEORV32 XBUS Wishbone cycles to the tpu_accel.v interface.
+-// Only responds to addresses 0xF0000000–0xF000003F (16 registers, 64 bytes).
+-// Other addresses are NOT handled here — top-level address decode must gate xbus_stb.
++// Top-level decode passes anything in 0xF0000000–0xF00FFFFF here; tpu_accel
++// internally selects between systolic regs (0x000-0x03F) and LUT memory
++// (0x040-0x43F).  Above 0x440 is reserved / reads zero.
+ 
+ module wb_tpu_accel (
+     input         clk,
+@@ -63,7 +67,7 @@
+         .clk       (clk),
+         .rst_n     (rst_n),
+         .sel       (pending),
+-        .addr      (xbus_adr[5:0]),
++        .addr      (xbus_adr[11:0]),
+         .wdata     (xbus_dat_w),
+         .wstrb     (xbus_we ? xbus_sel : 4'b0000),
+         .rdata     (tpu_rdata),
+diff --git a/rtl/tpu_accel.v b/rtl/tpu_accel.v
+index 0000000..0000002 100644
+--- a/rtl/tpu_accel.v
++++ b/rtl/tpu_accel.v
+@@ -1,18 +1,30 @@
+ // TPU Accelerator — Memory-mapped wrapper for 4x4 systolic array
++//                   + 256-entry LUT memory (v2, Plan C-1 dynamic-load target)
+ //
+ // Register map (active when sel=1):
+-//   0x00  CTRL    (W)  [0]=sa_en (start compute), [4]=clear (reset acc+done)
+-//   0x04  STATUS  (R)  [0]=done
+-//   0x08  W_ADDR  (W)  [1:0]=col, [3:2]=row
+-//   0x0C  W_DATA  (W)  [7:0]=weight byte (triggers 1-cycle load_weight pulse)
+-//   0x10  X_IN    (W)  [31:0]={x3,x2,x1,x0} packed signed int8
+-//   0x14  W_DATA4 (W)  [31:0]={w3,w2,w1,w0} packed int8
++//   --- Systolic-array region (0x000-0x03F) ---
++//   0x000 CTRL    (W)  [0]=sa_en (start compute), [4]=clear (reset acc+done)
++//   0x004 STATUS  (R)  [0]=done
++//   0x008 W_ADDR  (W)  [1:0]=col, [3:2]=row
++//   0x00C W_DATA  (W)  [7:0]=weight byte (triggers 1-cycle load_weight pulse)
++//   0x010 X_IN    (W)  [31:0]={x3,x2,x1,x0} packed signed int8
++//   0x014 W_DATA4 (W)  [31:0]={w3,w2,w1,w0} packed int8
+ //                       Loads 4 weights into current row (col 0-3), auto-increments row.
+ //                       Bus stalls for 3 extra cycles during bulk load.
+-//   0x20  RES0    (R)  int32 row 0 accumulator
+-//   0x24  RES1    (R)  int32 row 1 accumulator
+-//   0x28  RES2    (R)  int32 row 2 accumulator
+-//   0x2C  RES3    (R)  int32 row 3 accumulator
++//   0x020 RES0    (R)  int32 row 0 accumulator
++//   0x024 RES1    (R)  int32 row 1 accumulator
++//   0x028 RES2    (R)  int32 row 2 accumulator
++//   0x02C RES3    (R)  int32 row 3 accumulator
++//
++//   --- LUT memory region (0x040-0x43F) ---
++//   0x040 + i*4 (R/W)  256 entries × 32 bits, M9K-backed.
++//                       Suggested packing for mode_g records:
++//                         [31:16] = mask, [15:11] = n, [10:5] = y, [4:0] = x
++//                       But the BRAM stores 32 bits verbatim — encoding is a
++//                       firmware-side convention only.  Used by mode_g
++//                       (Plan C-1) to demonstrate SD→on-chip dynamic loading
++//                       with trust-anchor verification, replacing the dead
++//                       AS-REMOTE-driven Phase 8 path.
+ //
+ // Compute sequence (after weights loaded):
+ //   1. Write X_IN with packed inputs
+@@ -26,7 +38,7 @@
+     input  wire        rst_n,
+     // Bus interface
+     input  wire        sel,
+-    input  wire [5:0]  addr,       // byte address [5:0]
++    input  wire [11:0] addr,       // byte address [11:0] (widened from [5:0] in v2)
+     input  wire [31:0] wdata,
+     input  wire [ 3:0] wstrb,
+     output reg  [31:0] rdata,
+@@ -36,6 +48,14 @@
+     output wire [3:0]  debug_led   // optional debug
+ );
+ 
++    // ---- Address-window decode (v2) ----
++    // word_addr is the dword index (byte addr >> 2).
++    wire [9:0] word_addr = addr[11:2];
++    wire       in_systolic = (word_addr[9:4] == 6'h00);                       // 0x000-0x03F
++    wire       in_lut      = (word_addr >= 10'h010) && (word_addr <= 10'h10F); // 0x040-0x43F
++    wire [9:0] lut_off10   = word_addr - 10'h010;
++    wire [7:0] lut_idx     = lut_off10[7:0];
++
+     // ---- Systolic array instance ----
+     reg         sa_en;
+     reg         sa_load_weight;
+@@ -170,9 +190,10 @@
+                     sa_load_weight <= 1'b0;
+             end
+ 
+-            // Bus writes
+-            if (sel && (wstrb != 4'b0000) && !bulk_active) begin
+-                case (addr[5:2])  // word address
++            // Bus writes — gated on systolic region in v2 so LUT writes
++            // don't accidentally hit the systolic register decode
++            if (sel && (wstrb != 4'b0000) && !bulk_active && in_systolic) begin
++                case (addr[5:2])  // word address (within systolic region only)
+                     4'h0: begin // CTRL
+                         if (wdata[0] && !computing) begin
+                             // Start compute
+@@ -218,16 +239,35 @@
+         end
+     end
+ 
++    // ---- LUT memory (256 × 32-bit, M9K-backed) ------------------------------
++    // Style: synchronous read + synchronous write, registered output.
++    // Quartus 21.1 infers a single M9K block from this pattern.
++    reg [31:0] lut_mem [0:255];
++    reg [31:0] lut_rdata_r;
++
++    always @(posedge clk) begin
++        // Synchronous write (only when in_lut, sel asserted, not bulk_active)
++        if (sel && (wstrb != 4'b0000) && in_lut && !bulk_active) begin
++            lut_mem[lut_idx] <= wdata;
++        end
++        // Synchronous read — always update on every cycle; only matters when in_lut
++        lut_rdata_r <= lut_mem[lut_idx];
++    end
++
+     // ---- Bus reads ----
+     always @(*) begin
+-        case (addr[5:2])
+-            4'h1:    rdata = {31'd0, done};          // STATUS
+-            4'h8:    rdata = acc[0];                  // RES0
+-            4'h9:    rdata = acc[1];                  // RES1
+-            4'hA:    rdata = acc[2];                  // RES2
+-            4'hB:    rdata = acc[3];                  // RES3
+-            default: rdata = 32'd0;
+-        endcase
++        if (in_lut) begin
++            rdata = lut_rdata_r;
++        end else begin
++            case (addr[5:2])
++                4'h1:    rdata = {31'd0, done};          // STATUS
++                4'h8:    rdata = acc[0];                  // RES0
++                4'h9:    rdata = acc[1];                  // RES1
++                4'hA:    rdata = acc[2];                  // RES2
++                4'hB:    rdata = acc[3];                  // RES3
++                default: rdata = 32'd0;
++            endcase
++        end
+     end
+ 
+     // ---- Ready signal ----
+-- 
+2.43.0
+

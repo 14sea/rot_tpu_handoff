@@ -1,0 +1,194 @@
+From 0005000500050005000500050005000500050005 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 23:30:00 +0100
+Subject: [PATCH] Plan C-1 v3: LUT-to-PE weight auto-load FSM
+
+Adds CTRL[8] one-shot trigger in tpu_accel that cycles through
+LUT[0..15], reads bits [23:16] as a signed int8 weight byte, and
+drives the existing systolic-array load_weight machinery to place
+each byte at PE(idx/4, idx%4).  2 cycles per LUT entry (phase 0 =
+address present, phase 1 = data captured + load_weight pulse).
+Total ~34 cycles.
+
+The LUT memory read port is now address-muxed: the same M9K block
+serves both XBUS reads (lut_idx, derived from address[11:2]) and
+the FSM's internal sequential access (lut_load_idx).  Quartus 21.1
+infers a single-port M9K from the pattern.
+
+STATUS register gains bit [1] = lut_load_busy so firmware can poll.
+
+LE delta: +9 LE (FSM regs + decode), bits [23:16] choice matches
+mask[7:0] in the firmware-side packing convention for edits.bin
+records, so weights vary record-to-record under the same X_IN.
+
+Silicon-validated 2026-05-20 22:50 (uart_20260520_2250_c1v3_g_then_c.log):
+mode_g (raw-mask path) loads 256 records, then mode_c CTRL[8]=1
+auto-loads PE weights from LUT[0..15][23:16], CTRL[0]=1 computes;
+all 4 result rows byte-match Python compute over the SD-sourced
+record set.
+
+Pairs with neorv32_rot patch 0044 (mode_compute + mode_generate_classic
+firmware additions).
+---
+ rtl/tpu_accel.v | 122 ++++++++++++++++++++++++++++++++++++--
+ 1 file changed
+
+diff --git a/rtl/tpu_accel.v b/rtl/tpu_accel.v
+index 0000000..0000010 100644
+--- a/rtl/tpu_accel.v
++++ b/rtl/tpu_accel.v
+@@ -1,10 +1,17 @@
+ // TPU Accelerator — Memory-mapped wrapper for 4x4 systolic array
+ //                   + 256-entry LUT memory (v2, Plan C-1 dynamic-load target)
++//                   + LUT->weight auto-load FSM (v3, Step 3 compute-path wire-in)
+ //
+ // Register map (active when sel=1):
+ //   --- Systolic-array region (0x000-0x03F) ---
+-//   0x000 CTRL    (W)  [0]=sa_en (start compute), [4]=clear (reset acc+done)
+-//   0x004 STATUS  (R)  [0]=done
++//   0x000 CTRL    (W)  [0]=sa_en (start compute), [4]=clear (reset acc+done),
++//                       [8]=load_from_lut (v3 one-shot: copy LUT[0..15][23:16]
++//                            into PE weights — PE(row,col) gets
++//                            LUT[row*4+col] bits [23:16].  Bits [23:16] match
++//                            mask[7:0] in the firmware-side packing
++//                            convention for edits.bin records, so this byte
++//                            varies across consecutive records.)
++//   0x004 STATUS  (R)  [0]=done, [1]=lut_load_busy (v3)
+ //   0x008 W_ADDR  (W)  [1:0]=col, [3:2]=row
+ //   0x00C W_DATA  (W)  [7:0]=weight byte (triggers 1-cycle load_weight pulse)
+ //   0x010 X_IN    (W)  [31:0]={x3,x2,x1,x0} packed signed int8
+@@ -98,6 +105,16 @@
+     reg [31:0] bulk_data;        // latched packed weights
+     reg [1:0]  bulk_row;         // row being loaded
+ 
++    // ---- LUT->weight auto-load FSM (v3) ----
++    // Triggered by CTRL[8]=1.  Cycles through LUT[0..15] in idx order,
++    // takes each entry's low 8 bits as a signed weight byte, drives the
++    // existing load_weight infrastructure to place it at PE(idx/4, idx%4).
++    // 2 cycles per entry (phase 0 = address present, phase 1 = data
++    // captured + load_weight pulse), so 32 cycles total + 2 finish cycles.
++    reg        lut_load_active;
++    reg [4:0]  lut_load_idx;     // 0..15 valid; 16 = done sentinel
++    reg        lut_load_phase;   // 0 = present addr, 1 = drive load_weight
++
+     // ---- Compute FSM ----
+     reg [3:0] compute_cnt;       // 0 = idle, 1-10 = computing
+     reg       done;
+@@ -136,9 +153,13 @@
+             sa_load_weight <= 1'b0;
+             w_addr_row <= 2'd0;
+             w_addr_col <= 2'd0;
++            lut_load_active <= 1'b0;
++            lut_load_idx <= 5'd0;
++            lut_load_phase <= 1'b0;
+         end else begin
+-            // Weight load pulse — auto-clear after 1 cycle
+-            if (sa_load_weight && !bulk_active)
++            // Weight load pulse — auto-clear after 1 cycle (only when neither
++            // bulk nor LUT-load FSM is actively driving it)
++            if (sa_load_weight && !bulk_active && !lut_load_active)
+                 sa_load_weight <= 1'b0;
+ 
+             // Compute counter
+@@ -185,14 +206,42 @@
+                     default: bulk_active <= 1'b0;
+                 endcase
+             end else begin
+-                // Clear load_weight when not in bulk mode
+-                if (sa_load_weight)
++                // Clear load_weight when not in bulk mode (and not LUT-load)
++                if (sa_load_weight && !lut_load_active)
+                     sa_load_weight <= 1'b0;
+             end
+ 
++            // ---- LUT->weight auto-load FSM (v3) ----
++            // 2 cycles per LUT entry.  Phase 0: BRAM read addr presented
++            // (handled combinationally by lut_rd_addr_mux); phase 1: data
++            // is in lut_rdata_r, drive PE load_weight pulse + advance idx.
++            if (lut_load_active) begin
++                if (lut_load_phase == 1'b0) begin
++                    // Address presented this cycle; LUT data will be in
++                    // lut_rdata_r next cycle.  Nothing to drive yet.
++                    lut_load_phase <= 1'b1;
++                end else begin
++                    // Data captured.  Drive PE weight load.  Use bits
++                    // [23:16] of the LUT entry as the weight byte —
++                    // matches mask[7:0] in the firmware packing
++                    // convention so weights vary record-to-record.
++                    sa_w_data    <= lut_rdata_r[23:16];
++                    sa_w_col_sel <= lut_load_idx[1:0];
++                    sa_w_row_sel <= lut_load_idx[3:2];
++                    sa_load_weight <= 1'b1;
++                    if (lut_load_idx == 5'd15) begin
++                        lut_load_active <= 1'b0;
++                    end else begin
++                        lut_load_idx <= lut_load_idx + 5'd1;
++                        lut_load_phase <= 1'b0;
++                    end
++                end
++            end
++
+             // Bus writes — gated on systolic region in v2 so LUT writes
+-            // don't accidentally hit the systolic register decode
+-            if (sel && (wstrb != 4'b0000) && !bulk_active && in_systolic) begin
++            // don't accidentally hit the systolic register decode.  v3:
++            // also blocked while LUT-load FSM is running.
++            if (sel && (wstrb != 4'b0000) && !bulk_active && !lut_load_active && in_systolic) begin
+                 case (addr[5:2])  // word address (within systolic region only)
+                     4'h0: begin // CTRL
+                         if (wdata[0] && !computing) begin
+@@ -208,6 +257,14 @@
+                             acc[3] <= 32'sd0;
+                             done <= 1'b0;
+                         end
++                        if (wdata[8] && !computing) begin
++                            // v3: trigger LUT->weight auto-load FSM.  Idle-only;
++                            // the firmware should poll STATUS[1] until 0 before
++                            // issuing CTRL[0]=1 to compute.
++                            lut_load_active <= 1'b1;
++                            lut_load_idx <= 5'd0;
++                            lut_load_phase <= 1'b0;
++                        end
+                     end
+                     4'h2: begin // W_ADDR
+                         w_addr_col <= wdata[1:0];
+@@ -242,16 +299,23 @@
+     // ---- LUT memory (256 × 32-bit, M9K-backed) ------------------------------
+     // Style: synchronous read + synchronous write, registered output.
+     // Quartus 21.1 infers a single M9K block from this pattern.
++    //
++    // v3: read-address is muxed between the XBUS-derived lut_idx (when idle)
++    // and the lut_load_idx FSM source (when CTRL[8]-triggered auto-load is
++    // running).  Quartus still infers a single-port M9K because both
++    // sources collapse into one combinational wire feeding the BRAM read.
+     reg [31:0] lut_mem [0:255];
+     reg [31:0] lut_rdata_r;
++    wire [7:0] lut_rd_addr_mux = lut_load_active ? {4'd0, lut_load_idx[3:0]}
++                                                  : lut_idx;
+ 
+     always @(posedge clk) begin
+-        // Synchronous write (only when in_lut, sel asserted, not bulk_active)
+-        if (sel && (wstrb != 4'b0000) && in_lut && !bulk_active) begin
++        // Synchronous write — gated against auto-load FSM so the read port
++        // isn't fighting an active write address.
++        if (sel && (wstrb != 4'b0000) && in_lut && !bulk_active && !lut_load_active) begin
+             lut_mem[lut_idx] <= wdata;
+         end
+-        // Synchronous read — always update on every cycle; only matters when in_lut
+-        lut_rdata_r <= lut_mem[lut_idx];
++        lut_rdata_r <= lut_mem[lut_rd_addr_mux];
+     end
+ 
+     // ---- Bus reads ----
+@@ -260,7 +324,7 @@
+             rdata = lut_rdata_r;
+         end else begin
+             case (addr[5:2])
+-                4'h1:    rdata = {31'd0, done};          // STATUS
++                4'h1:    rdata = {30'd0, lut_load_active, done};   // STATUS [1]=lut_load_busy, [0]=done
+                 4'h8:    rdata = acc[0];                  // RES0
+                 4'h9:    rdata = acc[1];                  // RES1
+                 4'hA:    rdata = acc[2];                  // RES2
+-- 
+2.43.0
+

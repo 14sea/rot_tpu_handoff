@@ -1,0 +1,40 @@
+From 0043004300430043004300430043004300430043 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 22:33:00 +0100
+Subject: [PATCH] Plan C-1 v2: qsf adds cross-repo TPU Verilog refs
+
+Pulls the four TPU RTL files into the RoT bitstream build via
+cross-repo relative paths (../../neorv32_tpu/rtl/*.v).  Required for
+neorv32_rot patch 0041 which instantiates wb_tpu_accel inside
+ax301_top, and pairs with neorv32_tpu patch 0004 (which extends
+wb_tpu_accel + tpu_accel with the LUT memory window).
+
+The cross-repo reference assumes the sibling layout that the
+rot_tpu_handoff orchestrator maintains (neorv32_rot/ and neorv32_tpu/
+side-by-side under the same parent).  This is the same layout the
+`make tpu-then-rot` build chain already depends on.
+---
+ quartus/neorv32_demo.qsf | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/quartus/neorv32_demo.qsf b/quartus/neorv32_demo.qsf
+index 0000000..0000005 100644
+--- a/quartus/neorv32_demo.qsf
++++ b/quartus/neorv32_demo.qsf
+@@ -78,6 +78,13 @@ set_global_assignment -name VERILOG_FILE ../rtl/wb_sha256.v
+ set_global_assignment -name VERILOG_FILE ../rtl/sha256/sha256_core.v
+ set_global_assignment -name VERILOG_FILE ../rtl/wb_altasmi_parallel.v
+ set_global_assignment -name VERILOG_FILE ../rtl/wb_altremote_update.v
++# Plan C-1 v2 (2026-05-20): integrated TPU peripheral — cross-repo refs into the
++# sibling neorv32_tpu tree.  Pairs with neorv32_tpu patch 0004 (LUT memory) and
++# this repo's patch 0041 (XBUS mux wiring in ax301_top.vhd).
++set_global_assignment -name VERILOG_FILE ../../neorv32_tpu/rtl/wb_tpu_accel.v
++set_global_assignment -name VERILOG_FILE ../../neorv32_tpu/rtl/tpu_accel.v
++set_global_assignment -name VERILOG_FILE ../../neorv32_tpu/rtl/systolic_array_4x4.v
++set_global_assignment -name VERILOG_FILE ../../neorv32_tpu/rtl/pe.v
+
+ # ── Phase 2 IP: EPCS controller (altasmi_parallel, qmegawiz silent) ─────────
+ # Generated via:  cd ../rtl/ip && qmegawiz -silent epcs_ctrl.v
+--
+2.43.0
+

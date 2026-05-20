@@ -1,0 +1,123 @@
+From 0041004100410041004100410041004100410041 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 22:31:00 +0100
+Subject: [PATCH] Plan C-1 v2: wire wb_tpu_accel into ax301_top XBUS mux
+
+Adds the TPU peripheral to the existing XBUS multiplexer at address
+range 0xF00xxxxx, alongside SHA (0xF10), ASMI (0xF20), and REMOTE
+(0xF30) slaves.  Component declaration, instantiation, address-decode,
+and ack/err/data-mux extensions follow the exact same pattern as the
+three existing peripherals.
+
+The wb_tpu_accel.dbg_leds output is wired to a local tpu_dbg signal
+but left dangling; the existing wb_sdram_ctrl already drives the LED
+pins via dbg_leds.
+
+Silicon-validated 2026-05-20 with the merged Plan C-1 bitstream:
+cold-boot clean, mode_g v2 demo passed end-to-end.  Pairs with
+neorv32_tpu patch 0004 (RTL extension) and neorv32_rot patches
+0042 (mode_g v2 refactor) + 0043 (.qsf adds TPU Verilog refs).
+---
+ rtl/ax301_top.vhd | 60 +++++++++++++++++++++++++++++++++++++--
+ 1 file changed
+
+diff --git a/rtl/ax301_top.vhd b/rtl/ax301_top.vhd
+index 0000000..0000003 100644
+--- a/rtl/ax301_top.vhd
++++ b/rtl/ax301_top.vhd
+@@ -152,17 +152,41 @@
+     );
+   end component;
+ 
+-  -- XBUS mux: SHA @0xF10xxxxx, ASMI @0xF20xxxxx, REMOTE @0xF30xxxxx, else SDRAM
++  -- ── wb_tpu_accel (Plan C-1 integrated TPU peripheral, base 0xF0000000) ──
++  component wb_tpu_accel is
++    port (
++      clk        : in  std_ulogic;
++      rst_n      : in  std_ulogic;
++      xbus_adr   : in  std_ulogic_vector(31 downto 0);
++      xbus_dat_w : in  std_ulogic_vector(31 downto 0);
++      xbus_sel   : in  std_ulogic_vector(3 downto 0);
++      xbus_we    : in  std_ulogic;
++      xbus_stb   : in  std_ulogic;
++      xbus_cyc   : in  std_ulogic;
++      xbus_dat_r : out std_ulogic_vector(31 downto 0);
++      xbus_ack   : out std_ulogic;
++      xbus_err   : out std_ulogic;
++      dbg_leds   : out std_ulogic_vector(3 downto 0)
++    );
++  end component;
++
++  -- XBUS mux: TPU @0xF00xxxxx, SHA @0xF10xxxxx, ASMI @0xF20xxxxx, REMOTE @0xF30xxxxx, else SDRAM
++  signal tpu_range    : std_ulogic;
+   signal sha_range    : std_ulogic;
+   signal asmi_range   : std_ulogic;
+   signal remote_range : std_ulogic;
+-  signal periph_range : std_ulogic;  -- any of the F1x/F2x/F3x slaves
++  signal periph_range : std_ulogic;  -- any of the F0x/F1x/F2x/F3x slaves
+ 
++  signal tpu_stb    : std_ulogic;
+   signal sha_stb    : std_ulogic;
+   signal asmi_stb   : std_ulogic;
+   signal remote_stb : std_ulogic;
+   signal sdram_stb  : std_ulogic;
+ 
++  signal tpu_dat    : std_ulogic_vector(31 downto 0);
++  signal tpu_ack    : std_ulogic;
++  signal tpu_err    : std_ulogic;
++  signal tpu_dbg    : std_ulogic_vector(3 downto 0);
+   signal sha_dat    : std_ulogic_vector(31 downto 0);
+   signal sha_ack    : std_ulogic;
+   signal sha_err    : std_ulogic;
+@@ -295,24 +319,43 @@
+   LED(3) <= dbg_leds(3);
+ 
+   -- ── Wishbone → SDRAM bridge ───────────────────────────────────────────────
+-  -- ── XBUS mux (SHA / ASMI / REMOTE / SDRAM) ────────────────────────────
++  -- ── XBUS mux (TPU / SHA / ASMI / REMOTE / SDRAM) ──────────────────────
++  tpu_range    <= '1' when xbus_adr(31 downto 20) = x"F00" else '0';
+   sha_range    <= '1' when xbus_adr(31 downto 20) = x"F10" else '0';
+   asmi_range   <= '1' when xbus_adr(31 downto 20) = x"F20" else '0';
+   remote_range <= '1' when xbus_adr(31 downto 20) = x"F30" else '0';
+-  periph_range <= sha_range or asmi_range or remote_range;
++  periph_range <= tpu_range or sha_range or asmi_range or remote_range;
+ 
++  tpu_stb    <= xbus_stb and tpu_range;
+   sha_stb    <= xbus_stb and sha_range;
+   asmi_stb   <= xbus_stb and asmi_range;
+   remote_stb <= xbus_stb and remote_range;
+   sdram_stb  <= xbus_stb and (not periph_range);
+ 
+-  xbus_ack   <= sha_ack or asmi_ack or remote_ack or sdram_ack;
+-  xbus_err   <= sha_err or asmi_err or remote_err or sdram_err;
+-  xbus_dat_i <= sha_dat    when sha_ack    = '1' else
++  xbus_ack   <= tpu_ack or sha_ack or asmi_ack or remote_ack or sdram_ack;
++  xbus_err   <= tpu_err or sha_err or asmi_err or remote_err or sdram_err;
++  xbus_dat_i <= tpu_dat    when tpu_ack    = '1' else
++                sha_dat    when sha_ack    = '1' else
+                 asmi_dat   when asmi_ack   = '1' else
+                 remote_dat when remote_ack = '1' else
+                 sdram_dat;
+ 
++  wb_tpu_inst: wb_tpu_accel
++  port map (
++    clk        => CLOCK,
++    rst_n      => rstn_int,
++    xbus_adr   => xbus_adr,
++    xbus_dat_w => xbus_dat_o,
++    xbus_sel   => xbus_sel,
++    xbus_we    => xbus_we,
++    xbus_stb   => tpu_stb,
++    xbus_cyc   => xbus_cyc,
++    xbus_dat_r => tpu_dat,
++    xbus_ack   => tpu_ack,
++    xbus_err   => tpu_err,
++    dbg_leds   => tpu_dbg
++  );
++
+   wb_sha256_inst: wb_sha256
+   port map (
+     clk        => CLOCK,
+-- 
+2.43.0
+

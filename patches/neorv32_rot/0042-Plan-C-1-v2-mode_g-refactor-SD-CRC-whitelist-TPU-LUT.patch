@@ -1,0 +1,311 @@
+From 0042004200420042004200420042004200420042 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 22:32:00 +0100
+Subject: [PATCH] Plan C-1 v2: mode_g refactor - SD->CRC->whitelist->TPU LUT
+
+Replaces the Phase 8 two-bitstream mode_generate (steps 8-10 wrote a
+modified TPU.rbf to EPCS slot 1 then triggered AS REMOTE reconfig) with
+a single-bitstream variant that writes each verified record directly
+to the on-chip wb_tpu_accel LUT memory at 0xF0000040 (paired with
+neorv32_tpu patch 0004 which adds the LUT memory window).
+
+Trust chain preserved:
+ - Phase 8 magic + version + CRC-32 gate on edits.bin (untouched)
+ - Phase 7 lc_init pin-friendly-column whitelist gate (reused as
+   authorization layer; bit-flip surgery itself no longer invoked
+   because there is no second .rbf to modify under Plan C-1)
+ - New read-back verify pass over the written LUT entries
+
+Dropped: Step 1 (read base.rbf - no second .rbf needed), Step 3 (SHA
+verify base.rbf - no longer load-bearing), Step 6 (frame CRC repair),
+Steps 8-10 (EPCS write + AS REMOTE reconfig - both dead under C-1).
+mode_g_dirty static deleted (was the frame-dirty bitmap).
+
+Silicon-validated 2026-05-20 22:17 with merged C-1 v2 bitstream
+(md5 c0e0d20c).  Demo capture:
+  [stage2] Mode: generate (Plan C-1 v2 -- SD -> TPU LUT loader)
+  [sd] edits_lba=0x2219 edits_sz=0x18
+  [rot] edits.bin CRC OK n_records=1
+  [rot] wrote 1 records to TPU LUT @0xf0000040
+  [rot] TPU LUT readback OK (1 entries verified)
+  [rot] C-1 v2 mode_g complete -- dynamic load with trust anchor
+        demonstrated; no FPGA reconfiguration needed.
+Idempotent: two consecutive invocations produce identical traces.
+
+Record packing (firmware-side convention; the TPU's LUT BRAM stores
+the 32 bits verbatim):
+  [31:16] = mask      [15:11] = n[4:0]
+  [10: 5] = y[5:0]    [ 4: 0] = x[4:0]
+---
+ sw/stage2_loader/main.c | 200 +++++---------------------
+ 1 file changed
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 0000000..0000004 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -37,6 +37,14 @@
+ #define EPCS_READBACK_ADDR 0x41400000UL
+ #define UART_BAUD         115200
+ 
++/* Plan C-1 v2: on-chip TPU peripheral at XBUS 0xF0000000.
++ *   0xF0000000-0xF000003F  systolic-array regs
++ *   0xF0000040-0xF000043F  LUT memory (256 × 32-bit, M9K-backed)
++ * Used by mode_g (C-1 reinterpretation) for SD→on-chip dynamic load. */
++#define TPU_BASE          0xF0000000UL
++#define TPU_LUT_BASE      (TPU_BASE + 0x40UL)
++#define TPU_LUT_MAX       256u
++
+ #define SOH   0x01
+ #define EOT   0x04
+ #define ACK   0x06
+@@ -1666,14 +1674,9 @@
+ #define EDITS_MAGIC    0x54494445u  /* little-endian u32 of 'E','D','I','T' */
+ #define EDITS_VERSION  1u
+ 
+-/* Re-derived from CRC_NUM_CRAM_FRAMES — 217 B for 1727 frames.
+- * Static (not stack) because the stack lives in DMEM (8 KB) and we
+- * don't want to chew a quarter of it on the dirty bitmap. */
+-static uint8_t mode_g_dirty[CRC_DIRTY_BITMAP_BYTES];
+-
+ static void mode_generate(void)
+ {
+-    uart_puts("[stage2] Mode: generate (Phase 8 — LUT mask editor)\r\n");
++    uart_puts("[stage2] Mode: generate (Plan C-1 v2 — SD → TPU LUT loader)\r\n");
+ 
+     extern int sd_init(void);
+     extern int sd_read_block(uint32_t lba, uint8_t *dst);
+@@ -1700,10 +1703,10 @@
+                   "neorv32_rot v4+ to get edits.bin slot\r\n");
+         while (1) {}
+     }
+-    if (h->tpu_sz == 0) {
+-        uart_puts("[!] header tpu_sz=0 — base .rbf slot empty\r\n");
+-        while (1) {}
+-    }
++    /* C-1 v2: tpu_sz is no longer load-bearing — TPU is inside the running
++     * bitstream so there's no separate base.rbf to load.  Field is allowed
++     * to be 0 or non-zero (the SD might still be packed in Phase 8 layout
++     * for backward-compat).  Only edits.bin matters. */
+     if (h->edits_sz == 0) {
+         uart_puts("[!] header edits_sz=0 — SD packed without --edits;"
+                   " re-pack with host/gen_edits.py output\r\n");
+@@ -1721,13 +1724,10 @@
+     uart_puts(" edits_sz=");      uart_puthex32(h->edits_sz);
+     uart_puts("\r\n");
+ 
+-    /* === Step 1: read base.rbf into SDRAM === */
+-    uint32_t tpu_blks = (h->tpu_sz + 511) / 512;
+-    uart_puts("[sd] reading base.rbf\r\n");
+-    if (sd_read_many(h->tpu_lba, tpu_blks, (uint8_t *)TPU_SCRATCH_ADDR)) {
+-        uart_puts("[!] SD read FAIL lba="); uart_puthex32(h->tpu_lba);
+-        uart_puts("\r\n"); while (1) {}
+-    }
++    /* === Step 1 (C-1 v2): SKIPPED — no base.rbf to load ===
++     * Phase 8 read TPU.rbf into SDRAM for bit-flip surgery.  Under
++     * Plan C-1 the TPU is embedded in the running bitstream, so this
++     * step has no purpose.  tpu_sz field on SD is read but ignored. */
+ 
+     /* === Step 2: read edits.bin into SDRAM === */
+     uint32_t edits_blks = (h->edits_sz + 511) / 512;
+@@ -1781,37 +1781,46 @@
+     uart_puts("[rot] edits.bin CRC OK n_records=");
+     uart_puthex32(eh->n_records); uart_puts("\r\n");
+ 
+-    /* === Step 3: SHA-256 base.rbf vs baked golden === */
+-    {
+-        uint32_t H[8];
+-        sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H);
+-        uart_puts("[rot] base sha256=");
+-        for (int i = 0; i < 8; i++) uart_puthex32(H[i]);
+-        int match = 1;
+-        for (int i = 0; i < 8; i++)
+-            if (H[i] != rot_golden_tpu_bitstream[i]) { match = 0; break; }
+-        if (!match) {
+-            uart_puts(" [MISMATCH] golden=");
+-            for (int i = 0; i < 8; i++)
+-                uart_puthex32(rot_golden_tpu_bitstream[i]);
+-            uart_puts("\r\n[!] base SHA mismatch — refusing EPCS write\r\n");
+-            while (1) {}
+-        }
+-        uart_puts(" [OK]\r\n");
++    /* === Step 3 (C-1 v2): SKIPPED — no base.rbf to SHA-verify ===
++     * Phase 8 step 3 verified TPU.rbf vs rot_golden_tpu_bitstream.  In
++     * v2 the TPU is in the running bitstream and the trust anchor for
++     * the loaded records is the edits.bin CRC-32 (already validated
++     * above).  Future hardening: Ed25519 signature over edits.bin. */
++
++    /* === Step 5 (C-1 v2): whitelist-gate + write records to TPU LUT ===
++     *
++     * Original Phase 8 path used lut_apply_with_canon to bit-flip the
++     * in-SDRAM .rbf scratch (then re-CRC and reflash via EPCS).  Under
++     * Plan C-1 the TPU is inside the running bitstream, so we instead
++     * write each verified record directly into wb_tpu_accel's on-chip
++     * LUT memory at 0xF0000040.  lc_init is reused as the whitelist
++     * authorization gate — (x,y,n) must still be in the CE6 pin-friendly
++     * set, otherwise the record is rejected.  This keeps Phase 7
++     * LutCodec semantics load-bearing for the trust chain even though
++     * no .rbf is being modified.
++     *
++     * Record packing (firmware-side convention, BRAM stores 32 bits
++     * verbatim per tpu_accel.v):
++     *   [31:16] mask
++     *   [15:11] n[4:0]
++     *   [10: 5] y[5:0]
++     *   [ 4: 0] x[4:0]
++     */
++    if (eh->n_records > TPU_LUT_MAX) {
++        uart_puts("[!] n_records="); uart_puthex32(eh->n_records);
++        uart_puts(" exceeds TPU_LUT_MAX="); uart_puthex32(TPU_LUT_MAX);
++        uart_puts(" — refusing partial load\r\n");
++        while (1) {}
+     }
+ 
+-    /* === Step 5: apply edits === */
+-    for (uint32_t b = 0; b < sizeof(mode_g_dirty); b++) mode_g_dirty[b] = 0;
+     const struct edit_rec *recs =
+         (const struct edit_rec *)((const uint8_t *)EDITS_SCRATCH_ADDR
+                                   + sizeof(struct edits_hdr));
+-    uint8_t *rbf = (uint8_t *)TPU_SCRATCH_ADDR;
++    volatile uint32_t *tpu_lut = (volatile uint32_t *)TPU_LUT_BASE;
+     uint32_t applied = 0;
+     for (uint32_t i = 0; i < eh->n_records; i++) {
+-        lc_status_t st = lut_apply_with_canon(rbf,
+-                                              recs[i].x, recs[i].y,
+-                                              recs[i].n, recs[i].mask,
+-                                              mode_g_dirty);
++        lut_codec_t lc;
++        lc_status_t st = lc_init(&lc, recs[i].x, recs[i].y, recs[i].n);
+         if (st != LC_OK) {
+             uart_puts("[!] edit#"); uart_puthex32(i);
+             uart_puts(" (x="); uart_puthex32(recs[i].x);
+@@ -1822,87 +1831,51 @@
+             uart_puts(" — re-pin to clean column / fix manifest\r\n");
+             while (1) {}
+         }
++        uint32_t packed = ((uint32_t)recs[i].mask << 16)
++                        | (((uint32_t)recs[i].n & 0x1Fu) << 11)
++                        | (((uint32_t)recs[i].y & 0x3Fu) << 5)
++                        | ( (uint32_t)recs[i].x & 0x1Fu);
++        tpu_lut[i] = packed;
+         applied++;
+     }
+-    uart_puts("[rot] applied "); uart_puthex32(applied);
+-    uart_puts(" edits\r\n");
+-
+-    /* === Step 6: per-frame CRC repair over the dirty set === */
+-    lc_patch_rbf_crc_frames(rbf, mode_g_dirty);
+-    uart_puts("[rot] CRC patched (dirty frames only)\r\n");
+-
+-    /* === Step 7: SHA-256 of post-edit result (design-time unknown,
+-     * but reproducible: same base+edits → same SHA, used below for
+-     * idempotency check + post-write verify). === */
+-    uint32_t H_result[8];
+-    sha256_hw((const void *)(uintptr_t)TPU_SCRATCH_ADDR, h->tpu_sz, H_result);
+-    uart_puts("[rot] result sha256=");
+-    for (int i = 0; i < 8; i++) uart_puthex32(H_result[i]);
+-    uart_puts("\r\n");
+-
+-    /* === Step 8: Idempotent EPCS write + read-back SHA verify ===
+-     * Same pattern as mode_t (Phase 3): read slot 1, compare to the
+-     * post-edit SHA; only erase+program if mismatch.  Saves EPCS wear
+-     * if the same edits.bin is applied repeatedly. */
+-    {
+-        uint8_t *rb = (uint8_t *)EPCS_READBACK_ADDR;
+-        uint32_t H_flash[8];
++    uart_puts("[rot] wrote "); uart_puthex32(applied);
++    uart_puts(" records to TPU LUT @"); uart_puthex32((uint32_t)TPU_LUT_BASE);
++    uart_puts("\r\n");
+ 
+-        uart_puts("[rot] EPCS slot 1 idempotency check (read ");
+-        uart_puthex32(h->tpu_sz); uart_puts(" B @"); uart_puthex32(EPCS_TPU_BASE);
+-        uart_puts(")\r\n");
+-        epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
+-        sha256_hw(rb, h->tpu_sz, H_flash);
+-        uart_puts("[rot] EPCS sha256=");
+-        for (int i = 0; i < 8; i++) uart_puthex32(H_flash[i]);
+-        int already = 1;
+-        for (int i = 0; i < 8; i++)
+-            if (H_flash[i] != H_result[i]) { already = 0; break; }
+-        if (already) {
+-            uart_puts(" [MATCH] — slot already up-to-date, skipping write\r\n");
+-        } else {
+-            uart_puts(" [MISMATCH] — writing image\r\n");
+-            int rc = epcs_write_image(EPCS_TPU_BASE,
+-                                      (const uint8_t *)TPU_SCRATCH_ADDR,
+-                                      h->tpu_sz);
+-            if (rc != 0) {
+-                uart_puts("[!] epcs_write_image FAIL rc=");
+-                uart_puthex32((uint32_t)rc);
+-                uart_puts("\r\n"); while (1) {}
+-            }
+-            uart_puts("[rot] write OK — reading back for SHA verify\r\n");
+-            epcs_fast_read(EPCS_TPU_BASE, h->tpu_sz, rb);
+-            sha256_hw(rb, h->tpu_sz, H_flash);
+-            uart_puts("[rot] EPCS sha256=");
+-            for (int i = 0; i < 8; i++) uart_puthex32(H_flash[i]);
+-            int verify = 1;
+-            for (int i = 0; i < 8; i++)
+-                if (H_flash[i] != H_result[i]) { verify = 0; break; }
+-            if (!verify) {
+-                uart_puts(" [VERIFY FAIL] — EPCS persist broken\r\n");
+-                while (1) {}
+-            }
+-            uart_puts(" [VERIFY OK]\r\n");
++    /* === Step 6 (C-1 v2): read-back verify ===
++     *
++     * Prove the writes persisted in the M9K-backed LUT memory by reading
++     * each slot and comparing to the expected packed value.  Mismatch
++     * could indicate XBUS path issue, BRAM contention, or a record
++     * exceeding the 5/6/5/16-bit packing range. */
++    uint32_t mismatches = 0;
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        uint32_t expected = ((uint32_t)recs[i].mask << 16)
++                          | (((uint32_t)recs[i].n & 0x1Fu) << 11)
++                          | (((uint32_t)recs[i].y & 0x3Fu) << 5)
++                          | ( (uint32_t)recs[i].x & 0x1Fu);
++        uint32_t got = tpu_lut[i];
++        if (got != expected) {
++            uart_puts("[!] verify mismatch i="); uart_puthex32(i);
++            uart_puts(" exp="); uart_puthex32(expected);
++            uart_puts(" got="); uart_puthex32(got);
++            uart_puts("\r\n");
++            mismatches++;
+         }
+-        uart_puts("[rot] Phase 8 steps 1-9 complete — slot 1 holds the "
+-                  "edited bitstream.\r\n");
+     }
+ 
+-    /* === Step 10: ALTREMOTE_UPDATE reconfig into the freshly-written
+-     * slot (NOT page 0).  This is the CRTM closed-loop trigger:
+-     * altremote_update shifts pgm_sel into rublock then asserts rconfig,
+-     * which causes FPGA to reload its configuration from EPCS at the
+-     * specified byte address.  Point of no return. */
+-    uart_puts("[rot] altremote: pgm_sel="); uart_puthex32(EPCS_TPU_BASE);
+-    uart_puts(" WD_EN=0 AP_CONFIG_SEL=1 — triggering reconfig into slot 1\r\n");
+-    /* Audit #8: AP_CONFIG_SEL=1 so the chip honours pgm_sel and boots
+-     * the application image at 0x80000, instead of ignoring pgm_sel
+-     * and falling back to factory page 0 (the 2026-05-19 silicon bug). */
+-    int rr = epcs_remote_reconfig_ex(EPCS_TPU_BASE, 0u, 0u);
+-    /* Audit #9: any return is a failure — the success path reboots the
+-     * chip and the CPU is wiped before this line executes. */
+-    uart_puts("[rot] FALLBACK — TPU image bad, staying in ROT (status=");
+-    uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
++    if (mismatches != 0) {
++        uart_puts("[!] TPU LUT readback FAIL mismatches=");
++        uart_puthex32(mismatches); uart_puts("\r\n");
++        while (1) {}
++    }
++    uart_puts("[rot] TPU LUT readback OK ("); uart_puthex32(applied);
++    uart_puts(" entries verified)\r\n");
++    uart_puts("[rot] C-1 v2 mode_g complete — dynamic load with trust "
++              "anchor demonstrated; no FPGA reconfiguration needed.\r\n");
++    /* Legacy Phase 8 steps 6-10 (frame CRC repair / EPCS write / AS REMOTE
++     * reconfig) deleted under Plan C-1 — TPU is inside the running
++     * bitstream, no second .rbf to write and reconfig into. */
+ }
+ 
+ /* Mode 'l': Load Linux kernel + DTB + initramfs, boot directly */
+-- 
+2.43.0
+
