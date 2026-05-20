@@ -1308,10 +1308,16 @@ internal logic).  Achievable variants:
   build a single RoT bitstream that includes both RoT firmware and the
   TPU module as on-chip peripherals.  mode_g then updates the TPU's
   on-chip LUT memory directly (no FPGA reconfiguration).  Trust anchor
-  stays inside the bitstream.  **Risk**: combined LE budget — TPU alone
-  is 85 % LE on EP4CE10, and RoT is also significant; both may not fit.
-  Effort: 8-16 h to refit, may force LE-trimming pass from
-  `## LE-budget escape hatches`.
+  stays inside the bitstream.  **LE-feasibility (2026-05-20 dedup-aware
+  estimate, see `docs/analysis/plan_c1_le/feasibility.md`)**: standalone
+  sum RoT 85 % + TPU 53 % = 137 % is misleading because both designs
+  instantiate the same NEORV32 SoC.  `wb_tpu_accel` alone (the actual
+  TPU peripheral, Wishbone slave-only at 0xF0000000) costs only
+  ~1,093 LE + 15× DSP9 + 0 M9K.  Projected merged: **~9,832 LE / 10,320
+  (95.3 %)** first-pass, **~9,619 LE (93.2 %)** after removing dead
+  `wb_altremote_update` (no more AS REMOTE in C-1), **~6,000 LE (~58 %)**
+  if `wb_sha256` (3,633 LE) also drops to software.  Tight but
+  feasible.  Effort: 8-16 h to refit + 4-8 h mode_g software port.
 - **Plan C-2 (host-mediated reconfig)**: RoT signals the host PC over
   UART; host runs `openFPGALoader -f` to swap page 0 to TPU and trigger
   re-cold-boot.  Pros: works.  Cons: no longer self-contained CRTM —
@@ -1328,9 +1334,18 @@ internal logic).  Achievable variants:
   Effort: order/build new board (out-of-scope here).
 
 Recommended for next-session investigation: **C-1 first** (architecturally
-cleanest, no external dependencies, no board mod), with a quick LE-feasibility
-check (RoT 85 % + TPU 85 % vs 10,320 LE EP4CE10 → need ≈30 % trim
-somewhere) before committing.
+cleanest, no external dependencies, no board mod).  LE-feasibility was
+the unknown when this paragraph was originally written; it has since
+been **closed empirically** (2026-05-20 21:34, see
+`docs/analysis/plan_c1_le/feasibility.md` + `scratch_merge/quartus/
+neorv32_demo.fit.summary`): merged ax301_top fits at **9,458 LE / 10,320
+(91.7 %)**, 862 LE headroom, 16 DSP9, mem-bits unchanged from RoT
+baseline.  Better than the 95.3 % analytical projection because Quartus
+inferred one extra DSP9 and shared optimization context — `wb_tpu_accel`
+landed at 747 LE in-merged vs 1,093 LE standalone.  Earlier "TPU 85 %"
+plan claim was wrong on every level (empirical standalone TPU = 53 %;
+dedup-aware integration cost is ~750 LE not 1,103).  AS REMOTE infra
+(`wb_altremote_update` 212 LE) is removable on commit to C-1.
 
 **Iron state at session end**: EPCS contains v4 REMOTE-compiled RoT (page 0)
 + REMOTE-compiled TPU (page 1 at 0x80000).  Cold-boots cleanly to RoT
