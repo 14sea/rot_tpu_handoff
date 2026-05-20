@@ -1258,7 +1258,74 @@ canonical `sha256sum neorv32_tpu.rbf`.
   + `LutCodec.from_cram_model` Python output. Generated `lutcodec_data.c`
   + `.h` get committed (or auto-regenerated at build time).
 
-### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; CRTM closure gated on chip-side AS REMOTE rublock-wrapper bug — TPU REMOTE qsf hypothesis empirically REFUTED 2026-05-19 night)
+### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; Path B switched 2026-05-20; CRTM still gated on chip-side AS REMOTE — confirmed multi-image POF metadata required, NOT a wrapper/bitstream/byte-format issue)
+
+## 2026-05-20 late — Path B megafunction switch + AS REMOTE-mechanism blocker pinpointed
+
+**Path B switch (patch 0038)**: `wb_altremote_update.v` rewritten to wrap
+the `altremote_update` IP instead of direct `cycloneive_rublock` primitive.
+The "Lite 21.1 strips write_param/data_in" memory was empirically REFUTED
+— Verilog-instantiation + `quartus_map` elaborate path produces a
+fully-functional `db/rmtupdt_ik21.tdf` (290-line auto-generated IP with
+cycloneive_rublock primitive, cntr_acf/cntr_9cf counters, rublock_clock
+divider, full param protocol).  Reference archive:
+`docs/notes/altremote_update_elaborated_2026-05-20.tdf`.
+
+**Iron test trail 2026-05-20 evening**:
+1. Direct-primitive layout sweep via mode X — 4 hypotheses
+   (H_A=0x420000, H_B=0x40001, H_C=0x10020000, H_D=0x20000) — all
+   fall back to RoT.  Refutes "wrapper layout" theory; 5 prior sessions
+   of layout debugging were chasing a non-existent bug.
+2. Path B bitstream flashed (md5 `bb39b0b09f4f83d8…`, 8729/10320 LE
+   = 85%) — mode X reconfig fires correctly (chip honours rconfig
+   pulse), but `nSTATUS asserted` (reconfig source = 4) during slot-1
+   load.
+3. Byte-format audit via EPCS dump: openFPGALoader -f writes
+   **bit-reversed** bytes vs the .rbf source; our mode_g Plan B wrapper
+   writes **raw** bytes.  Pre-2026-05-20-late state had slot-1 raw,
+   page-0 bit-reversed.  Bit-rev fix attempted by rewriting slot 1 via
+   openFPGALoader -f → bit-reversed of TPU.rbf.  AS REMOTE reconfig
+   STILL fails with nSTATUS.  Bit-rev necessary but not sufficient.
+4. **Discriminating test**: wrote RoT.rbf (known-good, identical to the
+   working page-0 bitstream) to slot 1.  AS REMOTE reconfig STILL fails
+   with nSTATUS asserted.  Conclusively proves the blocker is the
+   **chip-side AS REMOTE mechanism itself**, NOT bitstream content or
+   format.
+
+**Inference for next session**: chip's AS REMOTE controller requires
+multi-image POF metadata — a "configuration map" embedded by Quartus's
+multi-page POF generation telling the AS controller about valid slot
+offsets + sizes.  Two separately-flashed `.rbf` files at non-overlapping
+EPCS offsets are insufficient regardless of bitstream validity / byte
+format.
+
+**Attempted multi-image POF generation**:
+`quartus_cpf -c <.cof>` in Lite 21.1 fails with "Illegal Configuration
+Scheme does not support dual boot" for our RoT/TPU SOFs.  Tried `<mode>`
+values 7/14/15 — all fail.  Reference: `docs/notes/multi_image_pof_attempt.cof`.
+Open question for next session: is dual-boot POF a Pro/Standard-edition
+feature, OR is there a qsf assignment (`INTERNAL_FLASH_UPDATE_MODE_PROGRAM_SELECT`?
+`INTERNAL_FLASH_UPDATE_MODE_APPLICATION_START_ADDRESS`?) we need to add
+to the RoT side to declare a valid application slot?
+
+**Final iron state 2026-05-20**:
+- EPCS page 0: bit-reversed Path B RoT.rbf via openFPGALoader -f
+- EPCS slot 1: bit-reversed TPU.rbf via openFPGALoader -f
+- Backups: `docs/safety/epcs_backup_20260520_{1913,end,sessionend}.bin`
+
+**Next-session priorities (depth-first on POF generation)**:
+1. Read Intel POF format spec; manually construct a 2-page POF binary
+   for RoT (page 0) + TPU (slot 1) and flash it as a single image.
+2. Investigate `INTERNAL_FLASH_UPDATE_MODE_PROGRAM_SELECT` qsf or
+   equivalent — does the FACTORY image need to declare application
+   slots at compile time?
+3. Try Quartus Pro / Standard edition's `quartus_cpf` to see if dual-
+   boot POF generation works there (then we know it's Lite-specific).
+4. As fallback: store TPU.rbf bit-reversed at slot 1 AND prepend slot 1
+   with whatever metadata header Quartus's multi-page POF would inject
+   (need to dissect a multi-image POF to learn the layout).
+
+
 
 mode_t end-to-end silicon-validated: SDRAM pre-flight → SD SHA → EPCS
 idempotent check → write_image → read-back VERIFY OK → byte-identical
