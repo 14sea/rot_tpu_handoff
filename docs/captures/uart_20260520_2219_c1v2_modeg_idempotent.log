@@ -1,0 +1,16 @@
+[stage2] Mode: generate (Plan C-1 v2 — SD → TPU LUT loader)
+[sd] tpu_lba=0x00001f49 tpu_sz=0x00059d8b edits_lba=0x00002219 edits_sz=0x00000018
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000001
+[rot] wrote 0x00000001 records to TPU LUT @0xf0000040
+[rot] TPU LUT readback OK (0x00000001 entries verified)
+[rot] C-1 v2 mode_g complete — dynamic load with trust anchor demonstrated; no FPGA reconfiguration needed.
+[stage2] ready for next cmd
+[stage2] Mode: generate (Plan C-1 v2 — SD → TPU LUT loader)
+[sd] tpu_lba=0x00001f49 tpu_sz=0x00059d8b edits_lba=0x00002219 edits_sz=0x00000018
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000001
+[rot] wrote 0x00000001 records to TPU LUT @0xf0000040
+[rot] TPU LUT readback OK (0x00000001 entries verified)
+[rot] C-1 v2 mode_g complete — dynamic load with trust anchor demonstrated; no FPGA reconfiguration needed.
+[stage2] ready for next cmd

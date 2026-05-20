@@ -1,0 +1,23 @@
+[stage2] Mode: read reconfig source (Path B)
+[rot] reconfig source = 0x00000000  (unknown)
+[stage2] ready for next cmd
+[stage2] Mode: generate (Plan C-1 v2 — SD → TPU LUT loader)
+[sd] tpu_lba=0x00001f49 tpu_sz=0x00000000 edits_lba=0x00002219 edits_sz=0x00000810
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000100
+[rot] wrote 0x00000100 records to TPU LUT @0xf0000040
+[rot] TPU LUT readback OK (0x00000100 entries verified)
+[rot] C-1 v2 mode_g complete — dynamic load with trust anchor demonstrated; no FPGA reconfiguration needed.
+[stage2] ready for next cmd
+[stage2] Mode: TPU compute (Plan C-1 v3 — LUT-driven)
+[c] acc cleared
+[c] LOAD_FROM_LUT triggered (CTRL[8]=1)
+[c] PE weights loaded from LUT[0..15][23:16]
+[c] X_IN = 0x04030201 (x0=1, x1=2, x2=3, x3=4 as signed int8)
+[c] compute done
+  RES[0] = 0xfffffe0a
+  RES[1] = 0xfffffde2
+  RES[2] = 0xfffffdba
+  RES[3] = 0xfffffd92
+[c] mode_c complete — results above are functions of the LUT contents loaded by the most recent mode_g.
+[stage2] ready for next cmd
