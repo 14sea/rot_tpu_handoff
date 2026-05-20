@@ -1,0 +1,36 @@
+From 7a63798015a78bb7ed18a59a9d94a85a91a28485 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 20:03:58 +0100
+Subject: [PATCH] gitignore: orchestrator state marker + __pycache__ + auto-POF
+
+These are reproducible build/orchestrator artifacts, not source:
+  .rot_tpu_handoff_applied  - rot_tpu_handoff make apply/unapply marker
+  __pycache__/              - Python compile cache (host/*.py)
+  quartus/*.pof             - auto-emitted next to .sof on every Quartus build
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .gitignore | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/.gitignore b/.gitignore
+index f262f76..3304ca4 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -46,3 +46,13 @@ sim/tb_*[!.v]
+ *.swp
+ *~
+ tools/
++
++# Orchestrator state marker (rot_tpu_handoff make apply/unapply flow)
++.rot_tpu_handoff_applied
++
++# Python caches
++__pycache__/
++*.pyc
++
++# Quartus auto-generated POF (auto-emitted next to .sof; reproducible)
++quartus/*.pof
+-- 
+2.43.0
+

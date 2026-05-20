@@ -1,0 +1,96 @@
+From 8ba876809a8048b57ed4f09c085d03a8c653e8c2 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Wed, 20 May 2026 20:06:26 +0100
+Subject: [PATCH] Phase 6 cleanup: drop dead ap_config_sel parameter from
+ epcs_remote_reconfig_ex
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Path B switch (patch 0038) made the ap_config_sel parameter dead — AnF
+is implicit in Cyclone IV (pgm_sel=0 = factory, pgm_sel != 0 = application).
+Function body cast it to void with a comment.  This patch removes the
+parameter from the signature + all 4 call sites + header comments.
+
+Net stage2 ELF: 24056 B -> 24052 B (-4 B from saving the dead arg pass).
+Cross-tests: 127/127 + 5/5 unchanged.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c          |  4 ++--
+ sw/stage2_loader/remote_update.c |  9 +++++----
+ sw/stage2_loader/remote_update.h | 10 +++++-----
+ 3 files changed, 12 insertions(+), 11 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 96f3c70..96a9061 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -1898,7 +1898,7 @@ static void mode_generate(void)
+     /* Audit #8: AP_CONFIG_SEL=1 so the chip honours pgm_sel and boots
+      * the application image at 0x80000, instead of ignoring pgm_sel
+      * and falling back to factory page 0 (the 2026-05-19 silicon bug). */
+-    int rr = epcs_remote_reconfig_ex(EPCS_TPU_BASE, 0u, 0u, 1u);
++    int rr = epcs_remote_reconfig_ex(EPCS_TPU_BASE, 0u, 0u);
+     /* Audit #9: any return is a failure — the success path reboots the
+      * chip and the CPU is wiped before this line executes. */
+     uart_puts("[rot] FALLBACK — TPU image bad, staying in ROT (status=");
+@@ -2090,7 +2090,7 @@ int main(void)
+             int fc;
+             while ((fc = uart_getc_timeout(60000)) < 0) {}
+             if (fc == 'y' || fc == 'Y') {
+-                int rr = epcs_remote_reconfig_ex(addr, 0u, 0u, 1u);
++                int rr = epcs_remote_reconfig_ex(addr, 0u, 0u);
+                 uart_puts("[rot] FALLBACK/TIMEOUT — chip stayed alive (status=");
+                 uart_puthex32((uint32_t)rr); uart_puts(")\r\n");
+             } else {
+diff --git a/sw/stage2_loader/remote_update.c b/sw/stage2_loader/remote_update.c
+index cf91772..c6ac5bd 100644
+--- a/sw/stage2_loader/remote_update.c
++++ b/sw/stage2_loader/remote_update.c
+@@ -60,10 +60,11 @@ static int write_field(uint32_t param, uint32_t data)
+ }
+ 
+ int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
+-                            uint32_t wd_tmr, uint32_t ap_config_sel)
++                            uint32_t wd_tmr)
+ {
+-    (void)ap_config_sel;  /* implicit in Cyclone IV: pgm_sel=0 = factory,
+-                             pgm_sel != 0 = application */
++    /* AnF (application-not-factory) is implicit in Cyclone IV: pgm_sel=0
++     * means factory boot, pgm_sel != 0 means application — the chip's
++     * AS controller derives AnF from the page-select value itself. */
+ 
+     /* Drain UART TX FIFO so any caller's "triggering reconfig" line
+      * finishes before rconfig fires. */
+@@ -110,5 +111,5 @@ int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
+ 
+ int epcs_remote_reconfig(uint32_t pgm_sel)
+ {
+-    return epcs_remote_reconfig_ex(pgm_sel, 0u, 0u, 0u);
++    return epcs_remote_reconfig_ex(pgm_sel, 0u, 0u);
+ }
+diff --git a/sw/stage2_loader/remote_update.h b/sw/stage2_loader/remote_update.h
+index ab60734..4537cdd 100644
+--- a/sw/stage2_loader/remote_update.h
++++ b/sw/stage2_loader/remote_update.h
+@@ -49,11 +49,11 @@ enum {
+ 
+ int epcs_remote_reconfig(uint32_t pgm_sel);
+ 
+-/* Audit #8 (2026-05-19): full-parameterized variant exposing WD_EN /
+- * WD_TMR / AP_CONFIG_SEL.  mode_g uses this with AP_CONFIG_SEL=1 so the
+- * chip honours pgm_sel; mode_r keeps the old defaults (factory boot)
+- * via the bare epcs_remote_reconfig wrapper. */
++/* Audit #8 (2026-05-19): parameterized variant exposing WD_EN / WD_TMR.
++ * AnF (application-not-factory) is IMPLICIT in Cyclone IV — pgm_sel=0 is
++ * factory, pgm_sel != 0 is application.  Path B switch 2026-05-20
++ * removed the now-dead ap_config_sel parameter. */
+ int epcs_remote_reconfig_ex(uint32_t pgm_sel, uint32_t wd_en,
+-                            uint32_t wd_tmr, uint32_t ap_config_sel);
++                            uint32_t wd_tmr);
+ 
+ #endif
+-- 
+2.43.0
+
