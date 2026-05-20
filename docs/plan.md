@@ -1258,9 +1258,89 @@ canonical `sha256sum neorv32_tpu.rbf`.
   + `LutCodec.from_cram_model` Python output. Generated `lutcodec_data.c`
   + `.h` get committed (or auto-regenerated at build time).
 
-### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; Path B switched 2026-05-20; CRTM still gated on chip-side AS REMOTE — confirmed multi-image POF metadata required, NOT a wrapper/bitstream/byte-format issue)
+### Phase 6 — HW validation flow  🟡 PARTIAL (RoT-side closed 2026-05-19; Path B + multi-image POF + STRATIXIII_UPDATE_MODE all confirmed working 2026-05-20; CRTM still gated — remaining blocker pinpointed at AX301 MSEL pin strap, HW-level, needs ohmmeter to confirm)
 
-## 2026-05-20 late — Path B megafunction switch + AS REMOTE-mechanism blocker pinpointed
+## 2026-05-20 NIGHT — Three SW fixes stacked + remaining HW-level blocker identified
+
+**Session-end state**: all software-side hypotheses for the AS REMOTE blocker
+have been empirically resolved.  Three real, additive fixes landed:
+
+1. **Path B megafunction wrapper** (patch 0038): `wb_altremote_update.v`
+   wraps `altremote_update` IP instead of direct primitive.  Refutes the
+   prior "Lite 21.1 strips write_param" memory.
+2. **Multi-image POF generation in Lite 21.1** (no patch needed; tooling
+   discovery): `quartus_cpf -c <.cof>` works when `<flash_loader_device>`
+   tag is REMOVED from the .cof.  Resolved the open question at line
+   1310-1315 of this plan.  Working template + .pof + .rpd archived at
+   `docs/safety/multi_image_2026-05-20/` and `…-NIGHT/`.
+3. **`STRATIXIII_UPDATE_MODE=REMOTE`** (patches RoT 0040 + TPU 0003):
+   Quartus 21.1 Lite for Cyclone IV E silently ignores `INTERNAL_FLASH_UPDATE_MODE`
+   (warning 169143 in every prior build).  The StratixIII-codepath
+   assignment is what actually enables REMOTE in the resulting bitstream
+   (24091-byte change in RoT.rbf).  See `feedback-quartus-warning-169143`
+   memory for re-use.
+
+**Iron v4 test (2026-05-20 night)**: with all three fixes stacked,
+`rot_tpu_multi_v4.rpd` flashed byte-perfect.  RoT cold-boots cleanly.
+Mode X 0x080000 STILL returns `RR_FALLBACK` + `reconfig source = 0x04
+nSTATUS asserted`.  See `docs/captures/uart_20260520_v4_REMOTE_modeX_080000.log`.
+
+**Conclusion**: blocker is **chip/board level**, not software.  Strongest
+hypothesis: AX301's MSEL[2:0] pin straps select a Cyclone IV E AS code
+that does NOT enable REMOTE update at the chip's AS state machine.
+EP4CE6F17C8 in F256 package has only MSEL[2:0] (no MSEL[3]); per UG-01083
+Table 8-3, only specific MSEL[2:0] codes enable REMOTE.  AX301 schematic
+page 4 shows R9/R10/R11 (10K) between D3V3 and MSEL[2:0]/H13/H12/G12 with
+a D2V5 net visible — schematic resolution prevents 100%-confident read.
+
+**Verification path requires physical board access** (ohmmeter on R9/R10/R11
+to determine VCC/D2V5/GND endpoints).  Outside the session-agent's
+capability — operator action.
+
+**If MSEL is non-REMOTE**: AS REMOTE truly impossible on this board.
+Pivot CRTM to one of the **real Plan C variants** (the earlier shorthand
+"RoT shifts TPU.rbf into config SRAM via PS-mode" is **physically
+impossible** on Cyclone IV E — per UG-01080 the chip's configuration
+SRAM is loaded ONLY by external configuration controllers, never from
+internal logic).  Achievable variants:
+
+- **Plan C-1 (integrated bitstream)**: drop the two-bitstream model;
+  build a single RoT bitstream that includes both RoT firmware and the
+  TPU module as on-chip peripherals.  mode_g then updates the TPU's
+  on-chip LUT memory directly (no FPGA reconfiguration).  Trust anchor
+  stays inside the bitstream.  **Risk**: combined LE budget — TPU alone
+  is 85 % LE on EP4CE10, and RoT is also significant; both may not fit.
+  Effort: 8-16 h to refit, may force LE-trimming pass from
+  `## LE-budget escape hatches`.
+- **Plan C-2 (host-mediated reconfig)**: RoT signals the host PC over
+  UART; host runs `openFPGALoader -f` to swap page 0 to TPU and trigger
+  re-cold-boot.  Pros: works.  Cons: no longer self-contained CRTM —
+  trust anchor now extends to the host PC.  Effort: 2-4 h.
+- **Plan C-3 (board mod for internal nCONFIG)**: solder a jumper from
+  an FPGA GPIO to nCONFIG, have RoT first overwrite EPCS page 0 with TPU
+  (after verifying TPU.rbf via SHA), then pulse the GPIO low to trigger
+  cold reconfig.  Pros: self-contained, near-CRTM.  Cons: requires board
+  modification, and "overwrite RoT to boot TPU" loses the recoverable-
+  fallback property of dual-image AS REMOTE.  Effort: 1 h hardware + 4 h
+  firmware.
+- **Plan C-4 (board replacement)**: switch to a Cyclone IV E board with
+  confirmed AS-REMOTE-enabling MSEL straps.  Sidesteps the entire issue.
+  Effort: order/build new board (out-of-scope here).
+
+Recommended for next-session investigation: **C-1 first** (architecturally
+cleanest, no external dependencies, no board mod), with a quick LE-feasibility
+check (RoT 85 % + TPU 85 % vs 10,320 LE EP4CE10 → need ≈30 % trim
+somewhere) before committing.
+
+**Iron state at session end**: EPCS contains v4 REMOTE-compiled RoT (page 0)
++ REMOTE-compiled TPU (page 1 at 0x80000).  Cold-boots cleanly to RoT
+stage2.  Backups:
+- `docs/safety/epcs_backup_20260520_pre_v4_flash.bin` (md5 c90dd61a…, pre-v4)
+- `docs/safety/epcs_backup_20260520_postflash_v4.bin` (md5 62b53820…, current)
+
+---
+
+## 2026-05-20 late — Path B megafunction switch + AS REMOTE-mechanism blocker pinpointed (superseded by NIGHT entry above)
 
 **Path B switch (patch 0038)**: `wb_altremote_update.v` rewritten to wrap
 the `altremote_update` IP instead of direct `cycloneive_rublock` primitive.
@@ -1299,31 +1379,52 @@ offsets + sizes.  Two separately-flashed `.rbf` files at non-overlapping
 EPCS offsets are insufficient regardless of bitstream validity / byte
 format.
 
-**Attempted multi-image POF generation**:
-`quartus_cpf -c <.cof>` in Lite 21.1 fails with "Illegal Configuration
-Scheme does not support dual boot" for our RoT/TPU SOFs.  Tried `<mode>`
-values 7/14/15 — all fail.  Reference: `docs/notes/multi_image_pof_attempt.cof`.
-Open question for next session: is dual-boot POF a Pro/Standard-edition
-feature, OR is there a qsf assignment (`INTERNAL_FLASH_UPDATE_MODE_PROGRAM_SELECT`?
-`INTERNAL_FLASH_UPDATE_MODE_APPLICATION_START_ADDRESS`?) we need to add
-to the RoT side to declare a valid application slot?
+**Attempted multi-image POF generation** (2026-05-20 evening — superseded
+2026-05-20 NIGHT): `quartus_cpf -c <.cof>` in Lite 21.1 fails with
+"Illegal Configuration Scheme does not support dual boot" for our RoT/TPU
+SOFs.  Tried `<mode>` values 7/14/15 — all fail.  Reference:
+`docs/notes/multi_image_pof_attempt.cof`.
+
+**RESOLVED 2026-05-20 NIGHT**: the failing .cof had a
+`<flash_loader_device>EP4CE10F17C8</flash_loader_device>` tag.  With that
+tag present, quartus_cpf treats the project as a Serial Flash Loader
+passthrough and bails.  **Removing that tag makes POF generation succeed**
+on the same Lite 21.1 toolchain.  No qsf application-slot-declaration is
+needed — page boundaries are declared in the .cof itself via
+`<start_address>00080000</start_address>` under the Page_1 `<sof_data>`.
+Working template: `docs/safety/multi_image_2026-05-20-NIGHT/multi_v4.cof`.
+
+Companion finding (resolves the parallel qsf question above): the actually-
+load-bearing qsf knob for Cyclone IV E AS REMOTE is `STRATIXIII_UPDATE_MODE`
+(not `INTERNAL_FLASH_UPDATE_MODE` which Lite silently ignores — warning
+169143).  Patches RoT 0040 + TPU 0003 add this assignment.
 
 **Final iron state 2026-05-20**:
 - EPCS page 0: bit-reversed Path B RoT.rbf via openFPGALoader -f
 - EPCS slot 1: bit-reversed TPU.rbf via openFPGALoader -f
 - Backups: `docs/safety/epcs_backup_20260520_{1913,end,sessionend}.bin`
 
-**Next-session priorities (depth-first on POF generation)**:
-1. Read Intel POF format spec; manually construct a 2-page POF binary
-   for RoT (page 0) + TPU (slot 1) and flash it as a single image.
-2. Investigate `INTERNAL_FLASH_UPDATE_MODE_PROGRAM_SELECT` qsf or
-   equivalent — does the FACTORY image need to declare application
-   slots at compile time?
-3. Try Quartus Pro / Standard edition's `quartus_cpf` to see if dual-
-   boot POF generation works there (then we know it's Lite-specific).
-4. As fallback: store TPU.rbf bit-reversed at slot 1 AND prepend slot 1
-   with whatever metadata header Quartus's multi-page POF would inject
-   (need to dissect a multi-image POF to learn the layout).
+**Next-session priorities (depth-first on POF generation)** — ALL RESOLVED
+2026-05-20 NIGHT.  Outcomes:
+1. ~~Manual POF binary construction.~~ NOT NEEDED — quartus_cpf produces
+   a valid 2-page POF once `<flash_loader_device>` is removed from the .cof.
+2. ~~`INTERNAL_FLASH_UPDATE_MODE_PROGRAM_SELECT` qsf investigation.~~ NOT
+   THE ANSWER.  The actually-honored knob is `STRATIXIII_UPDATE_MODE=REMOTE`
+   (patches 0040 / 0003).  `INTERNAL_FLASH_UPDATE_MODE` is silently ignored
+   by Lite 21.1 on Cyclone IV E — warning 169143 was telling us this all
+   along.
+3. ~~Quartus Pro / Standard edition.~~ NOT NEEDED — Lite 21.1 works.
+4. ~~Fallback: dissect multi-page POF metadata layout.~~ NOT NEEDED — the
+   11 header bytes at offsets 0x29 / 0x45 / 0x46 / 0x49 / 0x4A per page
+   ARE multi-image metadata (we mapped them empirically), but they are
+   necessary-not-sufficient.  The full 24091-byte STRATIXIII_UPDATE_MODE
+   bitstream change is what carries the actual REMOTE-mode logic the chip
+   validates against.
+
+**Net Phase 6 software outcome**: 3 fixes landed (Path B + multi-image POF
+tooling + STRATIXIII_UPDATE_MODE).  Iron v4 test confirms all three
+necessary, none sufficient on this board.  Remaining gate: HW-level MSEL
+strap on AX301 (see §"2026-05-20 NIGHT" above).
 
 
 

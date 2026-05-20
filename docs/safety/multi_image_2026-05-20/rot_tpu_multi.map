@@ -1,0 +1,16 @@
+BLOCK		START ADDRESS		END ADDRESS
+
+Page_1		0x00080000		0x000D9D8A
+Page_0		0x00000000		0x00059D8A
+
+
+Configuration device: EPCS16
+Configuration mode: Active Serial
+Quad-Serial configuration device dummy clock cycle: 8
+
+
+Notes:
+
+- Data checksum for this conversion is 0x158BB9DA
+
+- All the addresses in this file are byte addresses
