@@ -1,0 +1,330 @@
+From 63851ce3fbd75191538094635d3bf5c2cf989fcf Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Thu, 21 May 2026 20:02:17 +0100
+Subject: [PATCH] =?UTF-8?q?Plan=20C-1=20v5=20mode=20H:=20fabric=20surgery?=
+ =?UTF-8?q?=20=E2=80=94=20SD=20->=20.rbf=20=CF=83=E2=81=BB=C2=B9=20surgery?=
+ =?UTF-8?q?=20->=20EPCS=20slot=201?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Re-introduces the Phase 8 .rbf-flipping path that was dropped under
+Plan C-1 v2 in favor of on-chip TPU LUT memory.  Under v5 we DO touch
+fabric configuration: read page-0 .rbf into SDRAM, apply σ⁻¹ XOR per
+edits.bin record via lut_apply_with_canon + dirty-frame tracking,
+repair frame CRC-16 only on touched frames via
+lc_patch_rbf_crc_frames, and program the result to EPCS slot 1.
+User then manually copies slot 1 -> slot 0 with openFPGALoader and
+power-cycles to load the edited fabric.
+
+First-ship scope is SYMMETRIC MASKS ONLY ({0x0000, 0xFFFF}).  Reason:
+Quartus 21.1 Lite silently drops LCCOMB location_assignments
+(empirically verified 2026-05-21 against the h1h2 discriminator + the
+provider's known-good jbscan), so the original M0-M4 in-iron sentinel
+chain can't run.  For symmetric masks the H1 vs H2 distinction is
+unobservable (σ permutes identical cells), so codec correctness is
+implicitly validated by existing mode g/G silicon evidence.
+Asymmetric masks are gated until either Quartus Pro/Standard is
+available or a working post-fit placement-query mechanism is found.
+
+Trust chain (unchanged from mode g, plus one new gate):
+ - SD NEOLNX magic + layout v4+
+ - edits.bin magic + version + n_records + CRC-32 over
+   [version|n_records|records]
+ - lc_init pin-friendly-column whitelist per record
+ - NEW: symmetric-mask whitelist per record (rejects asymmetric
+   mask values for first-ship safety)
+ - readback SHA-256 byte-identity verify after slot-1 program
+
+Idempotent: re-running mode H with the same edits.bin on the same
+page-0 base is a no-op (slot-1 sha matches edited sha → skip write).
+Safe to abort at any point: slot 0 (the running bitstream) is never
+touched; only slot 1 is.  AS REMOTE is NOT triggered (broken in this
+toolchain per [[reference-rublock-complexity]]); promotion is user-
+mediated via openFPGALoader.
+
+Build verified (28780 B main.elf, +4.7 KB vs mode-g-only build).
+Iron-side untested in this commit; symmetric-mask demo target
+(picking a safe LE in production iron to flip 0xFFFF on) is a
+follow-up.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 247 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 247 insertions(+)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index 2c0df05..ebe1999 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -35,6 +35,12 @@
+  * 10 MB below EDITS_SCRATCH_ADDR.  Fits the same ~368 KB image used as
+  * the source, lets us SHA the EPCS contents without clobbering source. */
+ #define EPCS_READBACK_ADDR 0x41400000UL
++
++/* Plan C-1 v5 mode H: EP4CE10F17C8 .rbf byte length.  Page 0 and slot 1
++ * are both compiled to exactly this size by Quartus 21.1 Lite under the
++ * project's pinned QSF.  Used by mode_fabric_surgery to bound the SDRAM
++ * scratch buffer + epcs_fast_read length. */
++#define MODE_H_RBF_BYTES   368011u
+ #define UART_BAUD         115200
+ 
+ /* Plan C-1 v2: on-chip TPU peripheral at XBUS 0xF0000000.
+@@ -2068,6 +2074,245 @@ static void mode_generate_classic(void)
+  * Demo intent: after mode_g loads a new edits.bin, mode_c output
+  * reflects the loaded data — proving the SD->LUT load actually
+  * changes TPU compute behavior, not just stored state. */
++/* mode_fabric_surgery — Plan C-1 v5 mode H: SD-driven σ⁻¹ surgery on the
++ * page-0 .rbf, written to EPCS slot 1 for user-mediated cold-boot
++ * promotion (openFPGALoader slot 1 -> slot 0).  This is the reintroduction
++ * of the Phase 8 .rbf-flipping path that was dropped under C-1 v2 in
++ * favor of on-chip TPU LUT memory; here we DO touch fabric configuration.
++ *
++ * First-ship scope is SYMMETRIC MASKS ONLY ({0x0000, 0xFFFF}).  Reason:
++ * Quartus 21.1 Lite silently drops LCCOMB location_assignments, so the
++ * original M0-M4 in-iron sentinel validation can't run — see
++ * [[feedback-quartus-lite-no-lccomb-lock]] in memory.  For symmetric
++ * masks H1 vs H2 distinction is unobservable (σ permutes identical
++ * cells), so codec correctness is implicitly validated by existing
++ * mode g/G silicon evidence.  Asymmetric masks are gated until the
++ * toolchain limitation is resolved.
++ *
++ * Sequence:
++ *   1. SD boot header (NEOLNX magic + layout v4+).  Same gate as mode_g.
++ *   2. Read edits.bin into SDRAM.
++ *   3. Integrity gate: magic + version + n_records + CRC-32 over
++ *      [version|n_records|records].
++ *   4. Pre-flight reject: mask ∉ {0x0000, 0xFFFF} OR (x,y,n) not in
++ *      pin-friendly whitelist (lc_init dry-run).  Refuse-and-halt
++ *      before touching EPCS.
++ *   5. epcs_fast_read(0, MODE_H_RBF_BYTES) → page 0 .rbf into SDRAM.
++ *   6. For each record: lut_apply_with_canon onto in-SDRAM .rbf +
++ *      lc_mark_dirty into the 216-byte frame bitmap.
++ *   7. lc_patch_rbf_crc_frames(rbf, dirty) — recompute CRC-16 for the
++ *      frames the σ⁻¹ XORs touched (frames 25..1751, dirty subset only).
++ *   8. SHA-256 of edited .rbf → UART log.
++ *   9. Read current slot 1 → SHA-256; if equal to edited, skip write
++ *      (idempotent — running mode H twice with the same edits.bin is
++ *      a no-op).
++ *  10. Else: epcs_write_image(EPCS_TPU_BASE, ...) + readback SHA-256
++ *      verify.  No AS REMOTE — user manually copies slot 1 → slot 0
++ *      via openFPGALoader and power-cycles.  Slot 0 remains safe
++ *      throughout; abortable at any point.
++ */
++static void mode_fabric_surgery(void)
++{
++    uart_puts("[stage2] Mode: fabric surgery (Plan C-1 v5 mode H — "
++              ".rbf σ⁻¹ surgery, EPCS slot 1 staging)\r\n");
++    uart_puts("[rot] first-ship scope: symmetric masks {0x0000, 0xFFFF} "
++              "only; asymmetric gated by [[feedback-quartus-lite-no-lccomb-lock]]\r\n");
++
++    extern int sd_init(void);
++    extern int sd_read_block(uint32_t lba, uint8_t *dst);
++    extern int sd_read_many(uint32_t lba, uint32_t n, uint8_t *dst);
++
++    if (sd_init()) { uart_puts("[sd] init FAIL\r\n"); while (1) {} }
++
++    static uint8_t hdr_buf[512];
++    if (sd_read_block(0, hdr_buf)) {
++        uart_puts("[sd] read hdr FAIL\r\n"); while (1) {}
++    }
++
++    /* Magic + layout version — same gate as mode_g. */
++    const char magic[8] = { 'N','E','O','L','N','X','\0','\0' };
++    for (int i = 0; i < 8; i++) {
++        if (hdr_buf[i] != (uint8_t)magic[i]) {
++            uart_puts("[sd] bad magic\r\n"); while (1) {}
++        }
++    }
++    struct sd_boot_hdr *h = (struct sd_boot_hdr *)hdr_buf;
++    if (h->layout_version < 4) {
++        uart_puts("[!] layout_version="); uart_puthex32(h->layout_version);
++        uart_puts(" < 4 — re-pack SD with sd_pack.py to get edits.bin slot\r\n");
++        while (1) {}
++    }
++    if (h->edits_sz == 0) {
++        uart_puts("[!] header edits_sz=0 — SD packed without --edits;"
++                  " re-pack with host/gen_edits_h.py output\r\n");
++        while (1) {}
++    }
++    if (h->edits_sz < sizeof(struct edits_hdr)) {
++        uart_puts("[!] edits_sz="); uart_puthex32(h->edits_sz);
++        uart_puts(" < edits_hdr — corrupt header field\r\n");
++        while (1) {}
++    }
++
++    uart_puts("[sd] edits_lba=");  uart_puthex32(h->edits_lba);
++    uart_puts(" edits_sz=");       uart_puthex32(h->edits_sz);
++    uart_puts("\r\n");
++
++    /* === Step 2: read edits.bin into SDRAM === */
++    uint32_t edits_blks = (h->edits_sz + 511) / 512;
++    uart_puts("[sd] reading edits.bin\r\n");
++    if (sd_read_many(h->edits_lba, edits_blks,
++                     (uint8_t *)EDITS_SCRATCH_ADDR)) {
++        uart_puts("[!] SD read FAIL lba="); uart_puthex32(h->edits_lba);
++        uart_puts("\r\n"); while (1) {}
++    }
++
++    /* === Step 3: integrity gate on edits.bin (magic + version + CRC-32). */
++    const struct edits_hdr *eh =
++        (const struct edits_hdr *)EDITS_SCRATCH_ADDR;
++    if (eh->magic != EDITS_MAGIC) {
++        uart_puts("[!] edits.bin bad magic="); uart_puthex32(eh->magic);
++        uart_puts("\r\n"); while (1) {}
++    }
++    if (eh->version != EDITS_VERSION) {
++        uart_puts("[!] edits.bin version="); uart_puthex32(eh->version);
++        uart_puts(" unsupported\r\n"); while (1) {}
++    }
++    uint32_t need = sizeof(struct edits_hdr)
++                  + (uint32_t)eh->n_records * sizeof(struct edit_rec);
++    if (need > h->edits_sz) {
++        uart_puts("[!] edits.bin truncated\r\n"); while (1) {}
++    }
++    const uint8_t *eb = (const uint8_t *)EDITS_SCRATCH_ADDR;
++    uint32_t records_bytes = (uint32_t)eh->n_records
++                           * (uint32_t)sizeof(struct edit_rec);
++    uint32_t got_crc = crc32_two(eb + 4, 8,
++                                 eb + sizeof(struct edits_hdr),
++                                 records_bytes);
++    if (got_crc != eh->crc32) {
++        uart_puts("[!] edits.bin CRC FAIL computed=");
++        uart_puthex32(got_crc); uart_puts(" expected=");
++        uart_puthex32(eh->crc32); uart_puts("\r\n");
++        while (1) {}
++    }
++    uart_puts("[rot] edits.bin CRC OK n_records=");
++    uart_puthex32(eh->n_records); uart_puts("\r\n");
++
++    /* === Step 4: pre-flight — symmetric-mask gate + pin-friendly gate.
++     * Done BEFORE reading page-0 .rbf so we fail fast on bad records and
++     * never half-write EPCS.  lut_apply_with_canon also re-checks
++     * lc_init internally; the redundancy is intentional. */
++    const struct edit_rec *recs =
++        (const struct edit_rec *)((const uint8_t *)EDITS_SCRATCH_ADDR
++                                  + sizeof(struct edits_hdr));
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        if (recs[i].mask != 0x0000u && recs[i].mask != 0xFFFFu) {
++            uart_puts("[!] edit#"); uart_puthex32(i);
++            uart_puts(" mask="); uart_puthex32(recs[i].mask);
++            uart_puts(" rejected — mode H first-ship accepts only "
++                      "symmetric masks {0x0000, 0xFFFF}\r\n");
++            while (1) {}
++        }
++        lut_codec_t lc;
++        lc_status_t st = lc_init(&lc, recs[i].x, recs[i].y, recs[i].n);
++        if (st != LC_OK) {
++            uart_puts("[!] edit#"); uart_puthex32(i);
++            uart_puts(" (x="); uart_puthex32(recs[i].x);
++            uart_puts(",y="); uart_puthex32(recs[i].y);
++            uart_puts(",n="); uart_puthex32(recs[i].n);
++            uart_puts(") rejected by lc_init status=");
++            uart_puthex32((uint32_t)st); uart_puts("\r\n");
++            while (1) {}
++        }
++    }
++    uart_puts("[rot] pre-flight OK: ");
++    uart_puthex32(eh->n_records);
++    uart_puts(" records pass symmetric-mask + pin-friendly gates\r\n");
++
++    /* === Step 5: read page-0 .rbf from EPCS into SDRAM. === */
++    uint8_t *rbf = (uint8_t *)TPU_SCRATCH_ADDR;
++    uart_puts("[rot] reading page-0 .rbf ("); uart_puthex32(MODE_H_RBF_BYTES);
++    uart_puts(" B) from EPCS -> SDRAM @"); uart_puthex32(TPU_SCRATCH_ADDR);
++    uart_puts("\r\n");
++    epcs_fast_read(0u, MODE_H_RBF_BYTES, rbf);
++
++    /* === Step 6: σ⁻¹ XOR onto in-SDRAM .rbf + dirty-frame tracking. */
++    static uint8_t dirty[CRC_DIRTY_BITMAP_BYTES];
++    for (uint32_t i = 0; i < CRC_DIRTY_BITMAP_BYTES; i++) dirty[i] = 0;
++
++    for (uint32_t i = 0; i < eh->n_records; i++) {
++        lc_status_t st = lut_apply_with_canon(rbf,
++                                              recs[i].x, recs[i].y, recs[i].n,
++                                              recs[i].mask, dirty);
++        if (st != LC_OK) {
++            /* Should be unreachable — pre-flight already passed lc_init. */
++            uart_puts("[!] edit#"); uart_puthex32(i);
++            uart_puts(" lut_apply_with_canon FAIL status=");
++            uart_puthex32((uint32_t)st); uart_puts("\r\n");
++            while (1) {}
++        }
++    }
++    uart_puts("[rot] σ⁻¹ XOR applied to "); uart_puthex32(eh->n_records);
++    uart_puts(" record(s) in SDRAM\r\n");
++
++    /* === Step 7: per-frame CRC-16 repair on touched frames only. */
++    lc_patch_rbf_crc_frames(rbf, dirty);
++    uart_puts("[rot] frame CRC-16 repair complete (dirty-frame walk)\r\n");
++
++    /* === Step 8: SHA-256 of edited .rbf for the log. === */
++    uint32_t H_new[8];
++    sha256_hw(rbf, MODE_H_RBF_BYTES, H_new);
++    uart_puts("[rot] edited .rbf sha256=");
++    for (int i = 0; i < 8; i++) uart_puthex32(H_new[i]);
++    uart_puts("\r\n");
++
++    /* === Step 9: idempotency — read slot 1, SHA-compare, skip write
++     * if it's already what we'd be about to write. */
++    uint8_t *rb = (uint8_t *)EPCS_READBACK_ADDR;
++    uint32_t H_slot1[8];
++    uart_puts("[rot] reading EPCS slot 1 @"); uart_puthex32(EPCS_TPU_BASE);
++    uart_puts(" for idempotency check\r\n");
++    epcs_fast_read(EPCS_TPU_BASE, MODE_H_RBF_BYTES, rb);
++    sha256_hw(rb, MODE_H_RBF_BYTES, H_slot1);
++    uart_puts("[rot] slot 1 sha256=");
++    for (int i = 0; i < 8; i++) uart_puthex32(H_slot1[i]);
++    uart_puts("\r\n");
++    int already = 1;
++    for (int i = 0; i < 8; i++) if (H_slot1[i] != H_new[i]) { already = 0; break; }
++
++    if (already) {
++        uart_puts("[rot] slot 1 already byte-identical to edited .rbf "
++                  "— skipping EPCS write (idempotent)\r\n");
++    } else {
++        /* === Step 10: epcs_write_image + readback SHA verify. === */
++        uart_puts("[rot] writing edited .rbf to EPCS slot 1\r\n");
++        int rc = epcs_write_image(EPCS_TPU_BASE, rbf, MODE_H_RBF_BYTES);
++        if (rc != 0) {
++            uart_puts("[!] epcs_write_image FAIL rc=");
++            uart_puthex32((uint32_t)rc); uart_puts("\r\n");
++            while (1) {}
++        }
++        epcs_fast_read(EPCS_TPU_BASE, MODE_H_RBF_BYTES, rb);
++        sha256_hw(rb, MODE_H_RBF_BYTES, H_slot1);
++        for (int i = 0; i < 8; i++) {
++            if (H_slot1[i] != H_new[i]) {
++                uart_puts("[!] readback SHA FAIL — slot 1 != edited "
++                          ".rbf at word "); uart_puthex32((uint32_t)i);
++                uart_puts(" got="); uart_puthex32(H_slot1[i]);
++                uart_puts(" exp="); uart_puthex32(H_new[i]);
++                uart_puts("\r\n"); while (1) {}
++            }
++        }
++        uart_puts("[rot] EPCS slot 1 readback SHA OK ("
++                  "byte-identical to edited .rbf)\r\n");
++    }
++
++    uart_puts("[rot] mode H complete — slot 1 staged with σ⁻¹ fabric edits.\r\n");
++    uart_puts("[rot] user action required: openFPGALoader copy slot 1 "
++              "(0x80000) -> slot 0 (0x00000), then power-cycle to load "
++              "edited fabric.  Slot 0 unchanged until user promotes; "
++              "safe to abort at this point with no fabric change.\r\n");
++}
++
+ static void mode_compute(void)
+ {
+     uart_puts("[stage2] Mode: TPU compute (Plan C-1 v3 — LUT-driven)\r\n");
+@@ -2274,6 +2519,8 @@ int main(void)
+             mode_generate();           /* Plan C-1 v2: SD→LUT loader (raw mask) */
+         } else if (mode == 'G') {
+             mode_generate_classic();   /* Plan C-1 v4: SD→LUT loader with σ⁻¹ math */
++        } else if (mode == 'H') {
++            mode_fabric_surgery();     /* Plan C-1 v5: SD→.rbf σ⁻¹ surgery→EPCS slot 1 */
+         } else if (mode == 'c') {
+             mode_compute();            /* Plan C-1 v3: LUT-driven TPU compute demo */
+         } else if (mode == 'P') {
+-- 
+2.43.0
+

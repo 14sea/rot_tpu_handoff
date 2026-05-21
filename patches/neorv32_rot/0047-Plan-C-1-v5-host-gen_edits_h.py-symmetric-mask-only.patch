@@ -1,0 +1,170 @@
+From c7e965417febe861f731202f4fe91214f2b982bd Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Thu, 21 May 2026 20:03:40 +0100
+Subject: [PATCH] =?UTF-8?q?Plan=20C-1=20v5=20mode=20H:=20host/gen=5Fedits?=
+ =?UTF-8?q?=5Fh.py=20=E2=80=94=20symmetric-mask-only=20edits.bin=20generat?=
+ =?UTF-8?q?or?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Companion host tool for patch 0046 (mode_fabric_surgery).  Same
+edits.bin wire format as host/gen_edits.py (same header + record
+struct, same CRC-32 over [version|n_records|records]); imports
+pack_edits/parse_edits/_parse_mask from gen_edits.py to keep the
+format in one place.
+
+Narrows the mask domain to {0x0000, 0xFFFF} with a clear error message
+when an asymmetric mask is supplied, pointing the user at the
+toolchain blocker.  First line of defense before SD-side packing —
+the on-chip mode_fabric_surgery handler re-checks symmetry, so a
+manually-packed SD with an asymmetric record would still be rejected,
+but it's better to fail at host time than after a flash + reboot
+cycle.
+
+Smoke-tested:
+  - --edit 10,4,0,0xFFFF  -> writes 24 B edits.bin, parses back to
+    (x=10, y=4, n=0, mask=0xFFFF).
+  - --edit 10,4,0,0x6996  -> SystemExit with the asymmetric-mask
+    refusal pointing at the Quartus Lite blocker.
+
+For mode g/G exploration (TPU LUT memory loader, no fabric edit),
+use host/gen_edits.py — that file remains unrestricted.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ host/gen_edits_h.py | 122 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 122 insertions(+)
+ create mode 100755 host/gen_edits_h.py
+
+diff --git a/host/gen_edits_h.py b/host/gen_edits_h.py
+new file mode 100755
+index 0000000..16b9597
+--- /dev/null
++++ b/host/gen_edits_h.py
+@@ -0,0 +1,122 @@
++#!/usr/bin/env python3
++"""
++gen_edits_h.py — Emit a Plan C-1 v5 mode 'H' edits.bin file.
++
++Same wire format as host/gen_edits.py (Phase 8 edits header + records;
++struct.pack '<IIII' header + '<HHHH' per record).  Difference: a
++**symmetric-mask safety lock** rejects any record whose mask is not
++0x0000 or 0xFFFF.
++
++Why the lock exists:
++
++    Mode H performs σ⁻¹ XOR surgery on the page-0 .rbf in SDRAM and
++    programs the result to EPCS slot 1.  For non-symmetric masks the
++    H1 vs H2 question (does Cyclone IV LE read only the 16 LUT data
++    cells at runtime, or also canon-cells?) is unresolved on this
++    toolchain — Quartus 21.1 Lite silently drops LCCOMB
++    location_assignments, so the original M0-M4 in-iron sentinel
++    validation cannot run.  Empirical trail in
++    [[feedback-quartus-lite-no-lccomb-lock]].
++
++    For symmetric masks {0x0000, 0xFFFF} the codec correctness is
++    implicitly validated by existing mode g/G silicon evidence: σ
++    permutes identical cells, so the H1/H2 distinction collapses.
++
++    The on-chip mode_fabric_surgery handler enforces the same
++    symmetric-mask check; this host tool is the first line of defense
++    so the SD card never carries records the iron would refuse.
++
++Re-opening asymmetric scope requires one of: Quartus Pro/Standard
++(LCCOMB locks honored), a working post-fit placement-query mechanism
++in Lite (none found at the time of writing), or a Path-D alternative
++test (mode g writes asymmetric mask at an existing pin-friendly LE,
++observed via UART/XBUS).  Until then, use gen_edits.py for mode g/G
++exploration (those write to TPU LUT memory, not fabric).
++
++Input modes / output: same as gen_edits.py.
++"""
++import argparse
++import json
++import os
++import sys
++
++# Reuse pack_edits + whitelist machinery from the general edits-bin
++# generator.  Keeping the format in one place; this file only narrows
++# the mask domain.
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from gen_edits import pack_edits, parse_edits, _parse_mask  # noqa: E402
++
++
++MODE_H_SYMMETRIC_MASKS = (0x0000, 0xFFFF)
++
++
++def _check_symmetric(mask, where):
++    if mask not in MODE_H_SYMMETRIC_MASKS:
++        allowed = ", ".join(f"0x{m:04X}" for m in MODE_H_SYMMETRIC_MASKS)
++        raise SystemExit(
++            f"[gen_edits_h] {where}: mask=0x{mask:04X} is not symmetric.\n"
++            f"  Mode H first-ship accepts only {{{allowed}}}.\n"
++            f"  Asymmetric masks are gated until the Quartus Lite LCCOMB-\n"
++            f"  lock toolchain blocker is resolved — see\n"
++            f"  [[feedback-quartus-lite-no-lccomb-lock]] in memory.\n"
++            f"  For mode g/G (TPU LUT memory loader, no fabric edit)\n"
++            f"  use host/gen_edits.py instead — that has no mask\n"
++            f"  restriction.")
++
++
++def main():
++    ap = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--json", help="JSON manifest path (list of {x,y,n,mask})")
++    ap.add_argument("--edit", action="append", default=[],
++                    metavar="X,Y,N,M",
++                    help="add one record; repeatable. Mask must be "
++                         "0x0000 or 0xFFFF.")
++    ap.add_argument("--out", default="edits.bin",
++                    help="output path (default: edits.bin)")
++    ap.add_argument("--print", action="store_true",
++                    help="print parsed records after writing (smoke check)")
++    args = ap.parse_args()
++
++    records = []
++    if args.json:
++        with open(args.json) as f:
++            for entry in json.load(f):
++                mask = _parse_mask(entry["mask"])
++                _check_symmetric(mask, f"--json entry x={entry['x']} "
++                                       f"y={entry['y']} n={entry['n']}")
++                records.append((
++                    int(entry["x"]),
++                    int(entry["y"]),
++                    int(entry["n"]),
++                    mask,
++                ))
++    for e in args.edit:
++        parts = e.split(",")
++        if len(parts) != 4:
++            raise SystemExit(f"--edit must be X,Y,N,M (got {e!r})")
++        x, y, n = int(parts[0]), int(parts[1]), int(parts[2])
++        mask = _parse_mask(parts[3])
++        _check_symmetric(mask, f"--edit x={x} y={y} n={n}")
++        records.append((x, y, n, mask))
++
++    if not records:
++        raise SystemExit("no records — pass --json and/or --edit")
++
++    # pack_edits also runs the pin-friendly (X, Y, N) whitelist check
++    # that the on-chip lc_init enforces, so out-of-grid records are
++    # rejected here exactly as the iron would.
++    blob = pack_edits(records)
++    with open(args.out, "wb") as f:
++        f.write(blob)
++    print(f"[gen_edits_h] wrote {args.out} ({len(blob)} B, "
++          f"{len(records)} records, mode H symmetric-mask scope)")
++    if args.print:
++        for i, rec in enumerate(parse_edits(blob)):
++            print(f"  [{i}] x={rec[0]:2d} y={rec[1]:2d} n={rec[2]:2d} "
++                  f"mask=0x{rec[3]:04X}")
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0
+
