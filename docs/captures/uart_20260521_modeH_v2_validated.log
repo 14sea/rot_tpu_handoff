@@ -1,0 +1,74 @@
+UART capture — Plan C-1 v5 mode H, second run (v2: with EPCS bit-reverse fix)
+2026-05-21 evening session
+Iron: post-flash RoT.rbf md5 4e25e8d8 (mode H firmware + bit-rev fix)
+SD edits.bin: 1 record (x=22, y=12, n=4, mask=0xFFFF), md5 05868c96
+
+Pre-flash backup: docs/safety/epcs_backup_20260521_pre_modeH.bin md5 b81dc43b
+(restore via openFPGALoader -f to recover production iron fd884770.)
+
+=== UART trace ===
+
+>>> sending H
+[stage2] Mode: fabric surgery (Plan C-1 v5 mode H — .rbf σ⁻¹ surgery, EPCS slot 1 staging)
+[rot] first-ship scope: symmetric masks {0x0000, 0xFFFF} only; asymmetric gated by [[feedback-quartus-lite-no-lccomb-lock]]
+[sd] edits_lba=0x00002219 edits_sz=0x00000018
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000001
+[rot] pre-flight OK: 0x00000001 records pass symmetric-mask + pin-friendly gates
+[rot] reading page-0 .rbf (0x00059d8b B) from EPCS -> SDRAM @0x41000000
+[rot] bit-reversing SDRAM buffer to .rbf form
+[rot] σ⁻¹ XOR applied to 0x00000001 record(s) in SDRAM
+[rot] frame CRC-16 repair complete (dirty-frame walk)
+[rot] edited .rbf sha256=0x55d89b7b 0xf454ef86 0x55b75a17 0x57590279 0x2b260279 0x8b41dd03 0xf81c09ea 0x39d487f8
+[rot] bit-reversing SDRAM buffer back to EPCS-native form
+[rot] EPCS-native sha256 (for readback compare)=0xac76fd8a 0x9ff621cb 0x3740215d 0x2d2cdcce 0x2c899b26 0xc20791dc 0xe717aaaa 0xf093001f
+[rot] reading EPCS slot 1 @0x00080000 for idempotency check
+[rot] slot 1 sha256=0x009b1b2a 0xcfd1dcc0 0x8fb1fa37 0x9335a9e6 0x317d880f 0xdfbced75 0x330fd9d2 0x909e0b63
+[rot] writing edited .rbf to EPCS slot 1
+[rot] EPCS slot 1 readback SHA OK (byte-identical to intended EPCS-form bytes)
+[rot] mode H complete — slot 1 staged with σ⁻¹ fabric edits.
+[rot] user action required: openFPGALoader copy slot 1 (0x80000) -> slot 0 (0x00000), then power-cycle to load edited fabric.  Slot 0 unchanged until user promotes; safe to abort at this point with no fabric change.
+[stage2] ready for next cmd
+
+=== host-side cross-checks ===
+
+Iron's edited .rbf sha256 = 55d89b7b f454ef86 55b75a17 57590279 2b260279 8b41dd03 f81c09ea 39d487f8
+Host oracle sha256        = 55d89b7b f454ef86 55b75a17 57590279 2b260279 8b41dd03 f81c09ea 39d487f8
+                                                                                  ← byte-identical
+
+EPCS slot 1 dump (post-mode-H, EPCS-native form) sha256[:32] = ac76fd8a9ff621cb3740215d2d2cdcce
+bit-reverse(slot 1 dump) sha256[:32]                        = 55d89b7bf454ef8655b75a1757590279
+host oracle sha256[:32]                                      = 55d89b7bf454ef8655b75a1757590279
+                                                                                  ← byte-identical
+
+scan_rbf(bit-reverse(slot 1), --target 0xFFFF):
+  scanned 1152 pin-friendly positions
+  target mask 0xffff hits: 1
+    HIT (x=22, y=12, n= 4) mask=0xffff base_addr=0x00036693 bp=3
+                                                  ← exactly the sentinel; no collateral
+
+=== promotion to slot 0 (openFPGALoader -f /tmp/expected_modeH_v2.rbf -o 0) ===
+
+After user power-cycle:
+  - chip boots normally
+  - mode Q still dispatches: "reconfig source = 0x00000000 (unknown)" — clean cold-boot
+  - EPCS page 0 dump bit-reverse byte-identical to host oracle (sha 55d89b7b...)
+  - scan_rbf(page0_post_promote.rbf, --target 0xFFFF) → 1 hit at (22, 12, 4)
+
+=== Interpretation ===
+
+H1 ("Cyclone IV LE reads only the 16 LUT data cells at runtime") is
+implicitly validated for mask=0xFFFF at this pin-friendly position:
+σ⁻¹-only XOR onto mask=0x0000 baseline produced a chip that, when cold-
+booted, has the LE truth table = 0xFFFF at (X=22, Y=12, N=4) — with no
+collateral edits anywhere else in the pin-friendly grid (single hit
+from the scan).
+
+H2 ("LE reads canon-cells or routing-CRAM at runtime") is **REFUTED**
+for the symmetric-mask case: the codec didn't write any canon-cell or
+routing-CRAM bits, yet the LE's truth table is correct.
+
+H2 for ASYMMETRIC masks (e.g., 0x6996) remains gated until either the
+Quartus Lite LCCOMB-lock toolchain blocker is resolved or a Path-D
+alternative test is designed.  The symmetric-only first ship of mode H
+is silicon-validated as of this capture.

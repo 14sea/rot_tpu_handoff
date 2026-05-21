@@ -1,0 +1,20 @@
+[stage2] Mode: fabric surgery (Plan C-1 v5 mode H — .rbf σ⁻¹ surgery, EPCS slot 1 staging)
+[rot] first-ship scope: symmetric masks {0x0000, 0xFFFF} only; asymmetric gated by [[feedback-quartus-lite-no-lccomb-lock]]
+[sd] edits_lba=0x00002219 edits_sz=0x00000018
+[sd] reading edits.bin
+[rot] edits.bin CRC OK n_records=0x00000001
+[rot] pre-flight OK: 0x00000001 records pass symmetric-mask + pin-friendly gates
+[rot] reading page-0 .rbf (0x00059d8b B) from EPCS -> SDRAM @0x41000000
+[rot] bit-reversing SDRAM buffer to .rbf form
+[rot] σ⁻¹ XOR applied to 0x00000001 record(s) in SDRAM
+[rot] frame CRC-16 repair complete (dirty-frame walk)
+[rot] edited .rbf sha256=0x55d89b7b0xf454ef860x55b75a170x575902790x2b2602790x8b41dd030xf81c09ea0x39d487f8
+[rot] bit-reversing SDRAM buffer back to EPCS-native form
+[rot] EPCS-native sha256 (for readback compare)=0xac76fd8a0x9ff621cb0x3740215d0x2d2cdcce0x2c899b260xc20791dc0xe717aaaa0xf093001f
+[rot] reading EPCS slot 1 @0x00080000 for idempotency check
+[rot] slot 1 sha256=0x009b1b2a0xcfd1dcc00x8fb1fa370x9335a9e60x317d880f0xdfbced750x330fd9d20x909e0b63
+[rot] writing edited .rbf to EPCS slot 1
+[rot] EPCS slot 1 readback SHA OK (byte-identical to intended EPCS-form bytes)
+[rot] mode H complete — slot 1 staged with σ⁻¹ fabric edits.
+[rot] user action required: openFPGALoader copy slot 1 (0x80000) -> slot 0 (0x00000), then power-cycle to load edited fabric.  Slot 0 unchanged until user promotes; safe to abort at this point with no fabric change.
+[stage2] ready for next cmd
