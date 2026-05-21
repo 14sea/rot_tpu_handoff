@@ -1,5 +1,59 @@
 # Dynamic FPGA reconfiguration on EP4CE6 — plan v2
 
+## 2026-05-21 night — Plan C-1 v5 mode H SILICON-VALIDATED for symmetric scope
+
+End-to-end `.rbf` fabric surgery via EPCS slot-1 staging is now silicon-
+proven on iron.  Demo target was a single LE at pin-friendly position
+`(X=22, Y=12, N=4)` — mask=0x0000 in production iron, flipped to
+mask=0xFFFF via mode H.  Verification chain (full trail in
+`docs/captures/uart_20260521_modeH_v2_validated.log`):
+
+  iron's edited .rbf SHA-256          = host edit_rbf.py oracle SHA-256
+  EPCS slot 1 dump (bit-rev to .rbf)  = host oracle (byte-identical)
+  scan_rbf(slot 1 .rbf, mask=0xFFFF)  = 1 hit @ (22,12,4) — no collateral
+  user promotes slot 1 -> slot 0      = (openFPGALoader -f)
+  chip cold-boots cleanly             = mode Q dispatches, no brick
+  EPCS page 0 dump (bit-rev to .rbf)  = host oracle (byte-identical)
+  scan_rbf(page 0 .rbf, mask=0xFFFF)  = 1 hit @ (22,12,4) in live fabric
+
+This is the **strongest H1-implicit validation** the project produced:
+σ⁻¹-only XOR onto a mask=0x0000 baseline produced a chip whose LE
+truth table = 0xFFFF at the target position.  The 64 "extras" Quartus
+would have flipped (canon-state cells, routing-CRAM) were **not
+needed** — H2 ("LE reads canon-cells at runtime") is **refuted** for
+the symmetric-mask case.
+
+**Patches landed**: 0046 (mode_fabric_surgery / case 'H' / full
+pipeline + symmetric-mask whitelist), 0047 (host/gen_edits_h.py /
+symmetric-mask-only generator), 0048 (EPCS bit-reverse fix — operate
+codec on .rbf form, not on the EPCS-native bit-reversed form
+epcs_fast_read returns).  Build cost: stage2_loader main.elf grew
+~5 KB to 29112 B.
+
+**Scope still gated**: asymmetric masks (e.g. `0x6996`, `0xDEAD`)
+remain untested at silicon.  Two blockers:
+  1. Quartus 21.1 Lite silently drops all `LCCOMB_*` location
+     assignments, so the original M0-M4 sentinel-at-X10Y2N0 design
+     can't run.  See `[[feedback-quartus-lite-no-lccomb-lock]]`.
+  2. D2 (1152-position canon-2input no-op audit) from
+     Cyclone_CRAM_Mapper still pending — that's the safety gate
+     before opening mode H to arbitrary asymmetric masks.
+
+**Re-open path** for asymmetric: either Quartus Pro/Standard
+(LCCOMB locks honored), a working post-fit placement-query in Lite
+(none found this session despite 6 TCL API attempts), or a Path-D
+alternative (mode H writes asymmetric mask at an existing pin-friendly
+LE in production iron whose function we know enough about to observe
+runtime behavior change post-cold-boot).
+
+**Iron state at end of 2026-05-21 night session**: rolled back to
+pre-mode-H production baseline.  Page 0 .rbf md5 `fd884770` (Plan C-1
+v4 firmware, mode g/G/c/t etc., NO mode H).  Full backup:
+`docs/safety/epcs_backup_20260521_pre_modeH.bin` (md5 `b81dc43b`).
+`make apply-patches` re-introduces the 48-patch chain including mode H.
+
+---
+
 ## Context (revised 2026-05-15)
 
 **Goal**: enable a running NEORV32 on AX301 to switch to a different
