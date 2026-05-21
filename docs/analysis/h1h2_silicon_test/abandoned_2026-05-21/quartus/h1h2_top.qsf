@@ -1,0 +1,79 @@
+# h1h2_top.qsf -- standalone H1/H2 silicon discriminator project.
+# Device + pin map cloned from neorv32_rot/quartus/neorv32_demo.qsf (the
+# production AX301 settings) -- see reference-ax301-board-quirks.
+
+set_global_assignment -name FAMILY "Cyclone IV E"
+set_global_assignment -name DEVICE EP4CE10F17C8
+set_global_assignment -name TOP_LEVEL_ENTITY h1h2_top
+
+set_global_assignment -name VERILOG_FILE ../rtl/h1h2_top.v
+
+# I/O electrical
+set_global_assignment -name STRATIX_DEVICE_IO_STANDARD "3.3-V LVTTL"
+set_global_assignment -name CYCLONEII_RESERVE_NCEO_AFTER_CONFIGURATION "USE AS REGULAR IO"
+set_global_assignment -name RESERVE_ALL_UNUSED_PINS_WEAK_PULLUP "AS INPUT TRI-STATED"
+
+# Configuration scheme + EPCS (so quartus_asm emits a usable .rbf; the
+# bit/JIC artefacts are produced for completeness but the test flashes .rbf).
+set_global_assignment -name USE_CONFIGURATION_DEVICE ON
+set_global_assignment -name GENERATE_RBF_FILE ON
+set_global_assignment -name CYCLONEIII_CONFIGURATION_DEVICE EPCS16
+set_global_assignment -name CYCLONEIII_CONFIGURATION_SCHEME "ACTIVE SERIAL"
+
+# AX301 pin map (verified, see reference-ax301-board-quirks)
+set_location_assignment PIN_E1  -to CLOCK
+set_location_assignment PIN_G15 -to LED[0]
+set_location_assignment PIN_F16 -to LED[1]
+set_location_assignment PIN_F15 -to LED[2]
+set_location_assignment PIN_D16 -to LED[3]
+
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to CLOCK
+set_instance_assignment -name IO_STANDARD "3.3-V LVTTL" -to LED[*]
+
+# KEY2 (PIN_E16) intentionally omitted: Cyclone IV E pin E16 does not
+# support WEAK_PULL_UP_RESISTOR, the AX301 board has no external pull-up,
+# and production neorv32_demo confirmed empirically that floating E16
+# wedges KEY2-gated reset. Use POR counter only; observer derives tick-0
+# from LED[3:1] transitions.
+
+# Lock u0 (sentinel) + 15 pass-through LUTs into the X=10, Y=2 LAB column.
+# Lite Edition silently drops LCCOMB locks on isolated LEs; the chain forces
+# all 16 N slots in this LAB to be occupied, which makes the per-LE locks
+# stick (verified pattern from EP4CE6/jailbreak/jbscan).
+set_location_assignment LCCOMB_X10_Y2_N0  -to "u0"
+set_location_assignment LCCOMB_X10_Y2_N2  -to "padlut[1].u"
+set_location_assignment LCCOMB_X10_Y2_N4  -to "padlut[2].u"
+set_location_assignment LCCOMB_X10_Y2_N6  -to "padlut[3].u"
+set_location_assignment LCCOMB_X10_Y2_N8  -to "padlut[4].u"
+set_location_assignment LCCOMB_X10_Y2_N10 -to "padlut[5].u"
+set_location_assignment LCCOMB_X10_Y2_N12 -to "padlut[6].u"
+set_location_assignment LCCOMB_X10_Y2_N14 -to "padlut[7].u"
+set_location_assignment LCCOMB_X10_Y2_N16 -to "padlut[8].u"
+set_location_assignment LCCOMB_X10_Y2_N18 -to "padlut[9].u"
+set_location_assignment LCCOMB_X10_Y2_N20 -to "padlut[10].u"
+set_location_assignment LCCOMB_X10_Y2_N22 -to "padlut[11].u"
+set_location_assignment LCCOMB_X10_Y2_N24 -to "padlut[12].u"
+set_location_assignment LCCOMB_X10_Y2_N26 -to "padlut[13].u"
+set_location_assignment LCCOMB_X10_Y2_N28 -to "padlut[14].u"
+set_location_assignment LCCOMB_X10_Y2_N30 -to "padlut[15].u"
+
+# Keep the sentinel LUT and its inputs intact -- no merging into surrounding
+# fabric, no shift-register inference on the sweep counter, no constant
+# propagation through the all-zero baseline mask.
+set_global_assignment -name AUTO_SHIFT_REGISTER_RECOGNITION OFF
+set_global_assignment -name REMOVE_DUPLICATE_REGISTERS OFF
+set_global_assignment -name MUX_RESTRUCTURE OFF
+set_global_assignment -name OPTIMIZATION_TECHNIQUE BALANCED
+
+# Pessimistic synthesis -- we want zero LE-content optimization on the
+# sentinel LUT path so the silicon-side LE truly stores the mask we apply.
+set_instance_assignment -name PRESERVE_FANOUT_FREE_NODE ON -to "u0"
+
+# Don't strip the all-zero sentinel LUT. With mask=0x0000 + driven inputs,
+# Quartus would otherwise constant-fold combout to 0 and drop the LE.
+# (DONT_TOUCH is not a valid Quartus assignment; use the (* keep *)
+# attribute on the combout wire in h1h2_top.v and disable WYSIWYG
+# primitive resynthesis here.)
+set_global_assignment -name ADV_NETLIST_OPT_SYNTH_WYSIWYG_REMAP OFF
+
+set_global_assignment -name LAST_QUARTUS_VERSION "21.1.0 Lite Edition"
