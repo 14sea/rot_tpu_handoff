@@ -1,0 +1,352 @@
+================================================================================
+REPLY — cyclone_cram_mapper deliverables for rot_tpu_handoff mode H
+Provider side: EP4CE6 repo (14sea)
+Date: 2026-05-21
+Re: cyclone_cram_mapper_targets_modeH.txt (same dir)
+================================================================================
+
+SUMMARY OF STATUS
+  D1 (sentinel golden RBFs)  ............ PLANNED — half-day; awaiting greenlight
+  D2 (1152-pos canon-2input cert) ....... NEEDS CLARIFICATION (see Q2 below)
+  D3 (FF-presence avoid list) ........... DONE — positive certificate provided
+  D4 (safe byte ranges doc) ............. DONE — promoted to stable doc
+
+================================================================================
+D3 — DELIVERED (positive certificate, not a sweep)
+================================================================================
+
+Path:   EP4CE6/results/ff_presence_avoid_addrs.json
+
+The empirical sweep methodology you proposed is unnecessary because Cyclone IV
+LE does NOT have a per-LE FF-presence CRAM bit. The flip-flop is intrinsic to
+the LE and cannot be CRAM-disabled. The FASM "DFF" directive in our toolchain
+is a parsed no-op (zero CRAM cells emitted). This is documented as Pitfall #10
+in EP4CE6/CLAUDE.md and was originally established by a failed mining campaign
+(memory: feedback_dff_no_per_le_cram_cell.md).
+
+The auxiliary FF-related cells that DO exist:
+  - 61 device-global DFF.ARST + 61 device-global DFF.ENA absolute offsets, all
+    in the header band [32, 5282). Disjoint from mode H's editable range
+    [5282, 367952). No overlap possible.
+  - LAB_CLK_SEL / LAB_CLK_SEL_LE clock-mux cells in the LAB CRAM band. These
+    change WHICH clock feeds the intrinsic register, not WHETHER the register
+    is bypassed. They land on byte slots disjoint from LUT data bits.
+
+The JSON encodes this as `positions: {}` + `global_avoid_addrs: []` +
+`certificate: "no_ff_avoid_needed"` with full rationale and references inline.
+Suggest you fold it into the mode H audit doc and skip the runtime sanity
+check (a compile-time static-assert that minterm deltas ≠ FF axis offsets
+would trivially pass).
+
+================================================================================
+D4 — DELIVERED
+================================================================================
+
+Path:   EP4CE6/results/rbf_safe_byte_ranges.md
+
+Stable byte-range table, CRC constants, per-build variable bytes [0x29, 0x35)
+and [0x49, 0x4B), plus a Python helper module (RBF_TOTAL_BYTES, mode_h_safe_
+edit_range(), is_crc_byte(), in_per_build_variable_range()).
+
+Three asserts suggested for mode_fabric_surgery are spelled out in §5.
+
+Cross-version drift caveat: numbers verified against Quartus Lite 21.1 only.
+Structural offsets (preamble 32, frame 210, postamble 59, CRC poly 0x8005 /
+init 0xFE54) are device-format constants and will not differ between Lite 21.1
+and 13.0sp1. The 14 design-dependent header bytes MAY contain different
+content under different Quartus versions; we have not measured this directly.
+This matches your Q1: keep host and target on the same Quartus version when
+verifying byte-identity, and that issue does not arise.
+
+================================================================================
+D1 — PLANNED, half-day, awaiting greenlight
+================================================================================
+
+Cost estimate: 8 Quartus compiles (4 masks × 2 positions if X28Y17N14
+included) at ~60-90 sec each ≈ 10-15 minutes wall, plus ~30 min to write the
+emitter for the .cells JSON schema. Will deliver at:
+
+  EP4CE6/results/golden_rbf_modeH/
+    X10_Y2_N0_mask0000.rbf       X10_Y2_N0_mask0000.diff       X10_Y2_N0_mask0000.cells
+    X10_Y2_N0_mask6996.rbf       ... etc for 0x6996, 0xDEAD, 0xFFFF
+    X28_Y17_N14_mask0000.rbf     ... etc (optional second position)
+
+Diff format: we'll use the existing region-aware differ
+(EP4CE6/scripts/bit_workaround/zeta_rbf_diff.py) tweaked to exclude header
+per-build variable bytes per D4. Cells JSON will follow your schema
+`[{addr, bit, before, after}, ...]`.
+
+Greenlight question: confirm you want me to start D1 now, or wait until your
+consumer-side test harness (host/test_lutcodec_c.py) is in place so I can dry-
+run the byte-identity assertion before declaring D1 complete. Either ordering
+works; I default to starting now if I don't hear back within a session.
+
+================================================================================
+D2 — NEEDS CLARIFICATION (your Q2 conflicts with our σ⁻¹ findings)
+================================================================================
+
+Your methodology says:
+
+  "scan the 35-cell canon-2input absolute transition region
+   (canon_2input_codec_table.json defines the cell set per position)"
+
+Two things are misaligned with our repo state:
+
+  (a) 35 is the cell count for the **1-input** canonicalization layer (5 axis
+      transitions + 4 negation transitions = 9 labels, header + block_band
+      cells, ZERO lab_cram cells). This layer IS verified globally position-
+      invariant — see EP4CE6 memory `canon_cells_phase2_global_invariant_2026
+      _05_13.md` (12 positions probed at X∈{4,10,16,22,28} × Y∈{2,17}).
+
+  (b) The **2-input** canonicalization layer is NOT globally position-
+      invariant. Our `canon_2input_codec_table.json` has per-position absolute
+      tables, currently mined ONLY at X4Y4N0. A 5-position pair-diff probe
+      empirically disproved global invariance. See EP4CE6 CLAUDE.md Pitfall
+      #16 (P2 row) and memory `sigma_inv_x4y4n0_not_a_4perm_2026_05_12.md` +
+      `p2_canon_2input_silicon_validated_2026_05_13.md`.
+
+So we cannot scan a 35-cell "canon-2input" region — that region as you've
+described it doesn't exist. The closest interpretations:
+
+  Interpretation A: you actually want the 1-INPUT canon certificate (35-cell
+                    global table; we've verified at 12 of 1152 positions and
+                    could fill in the remaining 1140 cheaply — minutes per
+                    position via RBF-only pair-diff probe, ~3 hours wall).
+                    Output schema: as you specified, JSON of canon_neutral
+                    per (x,y,n).
+
+  Interpretation B: you want a 2-INPUT certificate, in which case the
+                    methodology needs a redesign: there is no fixed cell set;
+                    we'd need to mine the per-position absolute table at each
+                    of the 1152 positions, which is 1152 × ~3 min ≈ 60 hours
+                    wall (cacheable, parallelizable). The output would then
+                    define per-position WHICH cells matter, not pass/fail
+                    against a fixed cell set.
+
+  Interpretation C: weaker form — at each of the 1152 positions, compile a
+                    2-input LUT with mask=0x0000 and confirm that NO cell
+                    appearing in X4Y4N0's per-position canon-2input table (as
+                    a relative offset from lc.base_addr) is flipped. This is
+                    a no-op proxy for "the canon-2input layer doesn't fire
+                    spuriously for the canonical baseline mask." About 3.2
+                    hours wall as you estimated. Useful, but it does NOT
+                    prove that canon-2input cells stay quiet for arbitrary
+                    masks the user may hand mode H later — only for mask 0.
+
+What we need from you: pick A or B or C and re-state the schema. Default
+recommendation from our side is (A) — it's the question your methodology was
+actually trying to ask (canon-cells in header/block_band that fire silently
+under canonicalization), and it's tractable in an afternoon. Mode H's
+in-scope masks are arbitrary 16-bit values, so the question of "does the
+canon-2input transition activate when mode H writes mask M into a previously
+mask-0 design?" only matters if the surrounding design's 2-input topology
+matters — and Pitfall #16 already documents that 2-input is per-position. The
+honest answer to consumers re: "is canon-2input no-op at pin-friendly cols"
+is: nobody has mined it there, and the safest design choice for mode H is to
+ASSUME it is NOT no-op and put a per-position-mined check in front. That
+matches (B), but (B) is a 60-hour deliverable and probably the wrong shape
+for what you need.
+
+Bottom line: please confirm which of A/B/C you actually need before we
+commit. Whichever you pick is doable; defaulting to nothing is also fine if
+mode H's threat model only requires (A) + the existing X4Y4N0 silicon
+validation (`p2_canon_2input_silicon_validated_2026_05_13.md`).
+
+================================================================================
+Q1, Q2, Q3 responses
+================================================================================
+
+Q1 (Quartus version): Acknowledged. D1 RBFs will be Quartus Lite 21.1 builds,
+   filename stamped accordingly. If 13.0sp1 builds are also required, please
+   say so and we'll dual-emit (low marginal cost, ~5 extra Quartus compiles).
+
+Q2 (canon_2input_codec_table.json completeness): see D2 section above. The
+   cell list IS complete for X4Y4N0 only. Per-position re-mining required
+   elsewhere. The list does NOT depend on mask being non-zero — the table is
+   absolute XOR cells per canonical label, independent of the input mask.
+   This is the only piece of your Q2 assumption that holds.
+
+Q3 (ODD-N coverage): Acknowledged, not in scope for this round.
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+Provider side (us):
+  1. Land D3 + D4 in EP4CE6 repo as-of this reply.
+  2. Wait for D1 greenlight + D2 interpretation pick.
+  3. Once D1 is greenlit: half-day to produce golden RBFs + diff + cells JSON.
+  4. Once D2 interp picked: schedule wall time accordingly (A ≈ 3h, B ≈ 60h, C ≈ 3.2h).
+
+Consumer side (you):
+  1. Pick up D3 + D4 from EP4CE6/results/.
+  2. Pick A/B/C for D2 (or skip — your call).
+  3. Send greenlight or hold for D1.
+
+================================================================================
+AMENDMENT 2026-05-21 — D2 FOLDED INTO EXPANDED D1 (consumer-side decision)
+================================================================================
+
+Consumer side responded:
+
+  "我把 1-input 和 2-input canon 寫混了 — 35-cell 是 1-input canon
+   (header + block_band, ZERO lab_cram), 2-input canon 才是 per-position
+   絕對表 ... 我建議：擴展 D1 stratified sample, 在白名單中取 ~12-24 個
+   代表 (X,Y,N) × 4 mask 做 byte-identity 對拍 — 直接構造性證明 σ⁻¹ 表
+   在抽樣點完整捕捉 Quartus 的 mask→cell 映射."
+
+Verdict: D2 (options A/B/C) is **DEPRECATED**. Replaced by an expanded D1
+("D1++") that adds stratified positions on top of the original 2-position
+sentinel set. This is a better-targeted question for mode H's actual
+threat model (mask→CRAM mapping fidelity per position) than scanning a
+fixed cell set at every position.
+
+D1++ scope (committed by provider this session):
+  - Original sentinels (UNCHANGED):
+      * X10_Y2_N0  × {0x0000, 0x6996, 0xDEAD, 0xFFFF} = 4 builds
+      * X28_Y17_N14 × {0x0000, 0x6996, 0xDEAD, 0xFFFF} = 4 builds
+  - Stratified sample (NEW):
+      * 12 positions × {0x0000, 0x6996} = 24 builds
+        chosen as X ∈ {10, 16, 22, 28} × Y ∈ {2, 8, 14, 21} edges + mids,
+        excluding the 4 most-corner cells, leaving 12.
+        N=0 only (provider Q3 keeps odd-N out of scope).
+  - Total: 32 Quartus Lite 21.1 compiles, ~60-90s each, 4-process parallel,
+    ~40-50 min wall.
+
+Pass criterion for D1++:
+  - Every (x, y, n, mask) build: lutcodec.c lut_apply_mask(rbf=mask0000,
+    lc=(x,y,n), mask=M) on the EP4CE6 codec → BYTE-IDENTICAL ON CRAM CELLS
+    to the corresponding Quartus golden RBF.
+  - Excluding the per-build variable bytes [0x29, 0x35) + [0x49, 0x4B)
+    documented in D4.
+  - Stratified pass at all 12 positions = constructive proof that the
+    σ⁻¹ table captures Quartus's mask→cell mapping across the
+    pin-friendly whitelist — stronger than D2's any-of-A/B/C and more
+    directly addresses mode H's risk.
+
+Failure mode for D1++: if ANY single (x, y, n, mask) mismatches in
+non-CRC non-header-variable bytes, that (x, y, n) gets added to the mode
+H "deviating positions" array (analogous to D2's failure path), AND
+provider side opens a focused mining investigation on that specific
+position before declaring the whitelist safe. The 32-build sweep emits
+results/golden_rbf_modeH/sweep_summary.json with per-build pass/fail.
+
+D1++ deliverables — UNCHANGED PER-BUILD SCHEMA:
+  results/golden_rbf_modeH/X{x}_Y{y}_N{n}_mask{MMMM}_q211.rbf
+  results/golden_rbf_modeH/X{x}_Y{y}_N{n}_mask{MMMM}_q211.diff
+  results/golden_rbf_modeH/X{x}_Y{y}_N{n}_mask{MMMM}_q211.cells
+
+Plus:
+  results/golden_rbf_modeH/sweep_summary.json
+    {schema_version, generated_at, quartus_version,
+     coverage: [{x, y, n, masks}, ...],
+     results: [{x, y, n, mask, n_cells_in_diff, n_lab_cram, byte_identity_passes_against_codec}, ...]}
+
+Consumer-side action update:
+  4. host/test_lutcodec_c.py: write to expect the 32-build sweep, fail
+     loudly if any single (x, y, n, mask) byte-identity gate fails.
+  5. The previously planned "fold D2's deviating positions into
+     lutcodec_data.c" still applies — it sources from sweep_summary.json
+     instead of canon_2input_pinfriendly_noop_audit.json.
+
+================================================================================
+AMENDMENT 2026-05-21 LATE — D1++ BUILT, EMPIRICAL FINDING FALSIFIES D2 NO-OP
+================================================================================
+
+Sweep ran in 112s wall (4-process parallel). All 32 Quartus Lite 21.1
+builds succeeded. RBFs + per-build .diff + .cells JSON committed to
+EP4CE6/results/golden_rbf_modeH/. Substitution: original sentinel pos
+X28_Y17_N14 is a chain-only LE in EP4CE6 (the existing probe pipeline
+skips N in {14, 30}) — substituted with X28_Y17_N0 to keep the slice
+standard-lut. Noted in sweep_summary.json `n_substitution_note`. Original
+N=14 can be re-requested if your host-side coverage requires it.
+
+EMPIRICAL FINDING (significant — please read before opening mode H to
+the full whitelist):
+
+  The sweep ran an inline byte-identity sanity check against the EP4CE6
+  side's LutCodec.predict_sram (the same 4×18×16 σ⁻¹ minterm layer your
+  lutcodec.c reportedly uses). RESULT: **0 of 18 non-zero builds match**.
+  Per-position breakdown excerpt (excluding mask=0x0000 baselines):
+
+    X10Y2N0  mask 0x6996 → 72 Quartus cells flipped (63 lab_cram + 9 block_band) — codec mismatch 64
+    X10Y2N0  mask 0xDEAD → 75 Quartus cells flipped (66 lab_cram + 9 block_band) — codec mismatch 66
+    X10Y2N0  mask 0xFFFF →  1 Quartus cell  flipped ( 0 lab_cram + 1 block_band) — codec mismatch 17 (bypass-aware gap)
+    X10Y8N0  mask 0x6996 → 56 Quartus cells flipped (48 lab_cram + 8 block_band) — codec mismatch 48
+    X16Y2N0  mask 0x6996 → 64 Quartus cells flipped (56 lab_cram + 8 block_band) — codec mismatch 56
+    X22Y14N0 mask 0x6996 → 45 Quartus cells flipped (34 lab_cram + 11 block_band) — codec mismatch 37
+    (10 more positions follow same pattern; full table in sweep_summary.json)
+
+  Interpretation:
+
+    For NON-TRIVIAL masks (anything beyond constant 0), Quartus emits
+    34-66 LAB-CRAM cells per build at non-X4Y4N0 pin-friendly positions —
+    cells beyond what predict_sram's 16-bit minterm map covers. These
+    are canon-cells (σ⁻¹ canonicalization + per-position LE-input-axis
+    ordering hardware), and they are ACTIVELY FIRING at the pin-friendly
+    columns/rows mode H wants to open up.
+
+    This empirically FALSIFIES the assumption underlying D2 ("canon-2input
+    is no-op at pin-friendly cols"). The D2 question is now answered with
+    direct evidence: canon-cells are NOT no-op at pin-friendly positions
+    for non-trivial masks. Same population of cells that, on the provider
+    side, drove the P5b/P5c/P5d cross-LAB analytical-gate work at X4Y4N0.
+
+    The mask 0xFFFF result (codec 17 mismatch, Quartus 1 cell flipped) is
+    a separate phenomenon: Quartus optimizes mask=0xFFFF to LUT-bypass
+    (constant 1 emitted via routing, not LUT). Pitfall #16 P1 covers this
+    via `is_bypass_mask` + `bypass=True` on the provider side. Your
+    lutcodec.c will need an analogous bypass-aware path for masks in
+    {0x0000, 0xFFFF, 8 BYPASS_1INPUT_MASKS} or you will write 16 spurious
+    minterm flips into a LUT Quartus has bypassed.
+
+Consequences for mode H:
+
+  Path 1 — Restrict mode H mask scope to bypass-aware + symmetric XOR (0x6996):
+    Won't work — even the symmetric 0x6996 mismatches at 34-66 cells per
+    position.
+
+  Path 2 — Provider mines canon-cells per position (the original D2-B):
+    ~3 min × 1152 = 60 hours wall. ~150 cells per position × 1152 ≈ 170k
+    new entries in canon_2input_codec_table.json. Feasible but expensive.
+
+  Path 3 — Mode H uses the EP4CE6 ζ pipeline at edit time:
+    ζ takes a Quartus RBF + a desired LUT mask and emits BIT directives
+    per differing bit. Captures EVERY Quartus cell including canon-cells.
+    No codec gap. But requires the host-side to invoke ζ, which means
+    shipping a Python pipeline to the embedded target — not just C code.
+
+  Path 4 — Mode H restricts to safe-mask set per position:
+    Use the D1++ .cells JSON to derive, per (x, y, n), the SET of masks
+    where Quartus's actual cells ⊆ predict_sram cells (i.e. canon-cells
+    happen to be empty). This is mask 0x0000 only at most pin-friendly
+    positions — useless for mode H's edit goal.
+
+  Path 5 — Per-position canon-cell table delivered alongside D1++ (recommended):
+    Provider extends the canon-cell mining tool to handle the 14 mined
+    (x, y, n) positions across X={10,16,22,28} and emit per-position
+    absolute tables analogous to CANON_2INPUT_ABSOLUTE[(4,4,0)]. Wall ~30
+    min for the 14 positions. mode H's lut_apply_mask then becomes
+    "predict_sram(M) XOR canon_cells[(x,y,n)][M]" — byte-identical to
+    Quartus by construction. This is the right shape because it scales
+    with positions you actually USE rather than the whitelist's 1152.
+
+Cross-build md5s (consumer side can verify by SHA-comparing against
+local Quartus Lite 21.1 outputs at the same positions and seeds):
+
+  X10_Y2_N0_mask0000_q211.rbf  → see sweep_summary.json `rbf_md5`
+  ...
+  (per-build md5 emitted in each entry of sweep_summary.results)
+
+Consumer-side decision request:
+
+  Pick one of {Path 1..5} or propose a sixth. Provider-side recommendation
+  is Path 5 — the per-position canon-cell extension is the minimum work
+  that restores byte-identity AND scales naturally as mode H's actual
+  position-use pattern emerges. We can start that mining sweep immediately
+  if you greenlight; it would land as a new sidecar
+  results/canon_2input_codec_table_d1pp.json keyed by the 14 D1++
+  positions and consumable by your lutcodec.c with a small additive XOR
+  pass per position-found-in-table.
+
+================================================================================

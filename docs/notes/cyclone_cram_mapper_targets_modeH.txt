@@ -1,0 +1,224 @@
+================================================================================
+CYCLONE_CRAM_MAPPER — DELIVERABLES NEEDED FOR rot_tpu_handoff mode H
+Project: rot_tpu_handoff Plan C-1 v5 ("檔位 1" XPART-spirit fabric surgery)
+Date raised: 2026-05-21
+Consumer side: 14sea, neorv32_rot patches 0044-0047 (planned)
+Consumer-side plan doc: ~/.claude/plans/encapsulated-cooking-bunny.md
+================================================================================
+
+GOAL FROM YOUR SIDE
+  Provide enough new RE artifacts and validation oracles for the consumer side
+  to safely XOR-edit the LUT truth table of any pin-friendly (x,y,n) position
+  inside a Quartus-compiled .rbf, repair frame CRCs, and reflash via EPCS
+  slot-1 staging — with byte-identity proof and a 1152-position safety
+  certificate that the existing C codec is sound for the full whitelist.
+
+CONTEXT: WHAT THE CONSUMER SIDE ALREADY HAS WORKING
+  - σ⁻¹ table for pin-friendly cols packed into lutcodec_data.c (4×18×16 entries)
+  - lc_init() — whitelist gate + σ⁻¹ unpack, silicon-validated via mode g/G
+  - lut_apply_mask() — XOR per-minterm into rbf buffer, with dirty bitmap
+  - lc_patch_rbf_crc_frames() — frame CRC-16 repair (poly 0x8005, init 0xFE54,
+    frames 25..1751), C-port complete
+  - epcs_fast_read / epcs_erase_sector / epcs_program_page — all silicon-validated
+  - NEORV32 has 32 MB SDRAM at 0x40000000, full .rbf (368,011 B) fits trivially
+  - mode g (raw mask → TPU LUT mem) and mode G (σ⁻¹(mask) → TPU LUT mem)
+    are silicon-proven, but neither touches fabric configuration
+
+WHAT THE CONSUMER SIDE STILL NEEDS FROM YOU
+  Byte-identity oracle for the C codec at known positions + safety certificate
+  for the full 1152-position whitelist. mode H will not flash any EPCS without
+  the host-side ctypes test passing against Deliverable 1's golden RBFs.
+
+================================================================================
+DELIVERABLE 1 — SENTINEL GOLDEN RBF SET (BLOCKER)
+================================================================================
+
+Hand-off path:   results/golden_rbf_modeH/
+Deadline:        before consumer side M1 verification can run
+
+Compile a minimal one-LUT design through Quartus (whichever version your normal
+flow uses — both 13.0sp1 and Lite 21.1 are acceptable; stamp filename with
+version) with the LUT constrained to LCCOMB_X10_Y2_N0 and lut_mask explicitly
+parameterized. Provide .rbf bytes for at least:
+
+  - mask = 0x0000   (zero baseline)
+  - mask = 0x6996   (4-input XOR, stress mask that flips many minterms)
+  - mask = 0xDEAD   (uneven bit distribution)
+  - mask = 0xFFFF   (all-ones, opposite extreme of baseline)
+
+For EACH .rbf provide:
+
+  golden_rbf_modeH/X10_Y2_N0_mask<MASK>.rbf       (368,011 bytes)
+  golden_rbf_modeH/X10_Y2_N0_mask<MASK>.diff      (byte-level diff vs mask0000)
+  golden_rbf_modeH/X10_Y2_N0_mask<MASK>.cells     (JSON: list of {addr, bit, before, after})
+
+The consumer side will run host/test_lutcodec_c.py:
+    lutcodec.c lut_apply_mask(rbf=mask0000_buf, lc=(10,2,0), mask=MASK)
+        ==BYTE-IDENTICAL ON CRAM CELLS==
+    your golden_rbf_modeH/X10_Y2_N0_mask<MASK>.rbf
+
+Note: header/preamble bytes (0x29-0x34, 0x49-0x4A per your FINDINGS.md) WILL
+differ between any two Quartus builds. Diff should already exclude those.
+
+If you have time, repeat for one more pin-friendly position — e.g. X28_Y17_N14
+— useful to catch any per-column bugs in the C codec we don't currently
+exercise. Not blocking.
+
+================================================================================
+DELIVERABLE 2 — 1152-POSITION CANON-2INPUT NO-OP CERTIFICATE (RECOMMENDED)
+================================================================================
+
+Hand-off path:   results/canon_2input_pinfriendly_noop_audit.json
+Deadline:        before consumer side opens mode H to all pin-friendly positions
+
+Background: project-sigma-inv-empirical-correction memory says canon-2input
+asymmetric-mask layer is empirically no-op at pin-friendly columns, but the
+evidence is only 6 sampled positions. Consumer side wants this confirmed
+exhaustively before mode H is allowed to write any (x,y,n) the user hands it
+via edits.bin.
+
+Scope: all 4 × 18 × 16 = 1152 triples in the pin-friendly whitelist
+  X ∈ {10, 16, 22, 28}
+  Y ∈ LAB_Y_CE6 = {2,3,4,5,6,7,8,9,10,11,12,13,14,16,17,18,19,21}
+  N ∈ {0, 2, 4, ..., 30}
+
+Methodology:
+  for each (x,y,n) triple:
+    1. compile a 2-input LUT design at that position, mask=0x0000
+    2. scan the 35-cell canon-2input absolute transition region
+       (canon_2input_codec_table.json defines the cell set per position)
+    3. record the bit state of every transition cell
+
+Output schema (canon_2input_pinfriendly_noop_audit.json):
+{
+  "schema_version": 1,
+  "generated_at": "ISO8601",
+  "quartus_version": "...",
+  "coverage": {"x": [10,16,22,28], "y": [...], "n": [0,2,...,30]},
+  "results": [
+    {"x":10, "y":2, "n":0,  "canon_neutral": true,  "deviations": []},
+    {"x":10, "y":2, "n":2,  "canon_neutral": true,  "deviations": []},
+    ...
+    {"x":28, "y":21, "n":30, "canon_neutral": false, "deviations": [
+        {"cell_addr": "0x1234", "cell_bit": 5, "observed_state": 1}
+    ]}
+  ],
+  "summary": {"total": 1152, "neutral": 1152, "deviating": 0}
+}
+
+If summary.deviating == 0: consumer side keeps lut_apply_with_canon as a
+no-op wrapper, opens mode H to full whitelist.
+
+If summary.deviating > 0: consumer side adds a hard block in lc_init that
+refuses any (x,y,n) appearing in deviations[]. mode H whitelist shrinks
+accordingly. lut_apply_with_canon still doesn't need the canon transition
+table ported — it just refuses these positions.
+
+Estimated cost: 1152 compiles × ~10 sec each ≈ 3.2 hours single-machine,
+parallelizable across cores. CRAM extraction script reuses existing
+pair-diff infrastructure.
+
+================================================================================
+DELIVERABLE 3 — FF-PRESENCE BIT AVOID LIST (RECOMMENDED)
+================================================================================
+
+Hand-off path:   results/ff_presence_avoid_addrs.json
+Deadline:        before mode H goes beyond the sentinel single-record demo
+
+Background: Phase 4.5 notes say per-LE FF presence bits are "still open" — the
+61 device-global FF control bits are mapped, but the per-LE register bits that
+could spuriously enable a FF inside a LE that mode H is XOR-editing are not.
+A mode H edit that accidentally XOR-flips an FF-presence bit could turn a
+combinational LE into a registered one and break unrelated nets.
+
+What's needed:
+  For each (x,y,n) in the 1152 pin-friendly whitelist, the CRAM byte addresses
+  within ±64 bytes of lc.base_addr that, if XOR'd, would change FF-related
+  behavior. Mode H's dirty-bitmap walker will sanity-check that lut_apply_mask
+  NEVER writes to any of these addresses.
+
+Output schema (ff_presence_avoid_addrs.json):
+{
+  "schema_version": 1,
+  "scheme": "per-position-relative",   // addrs are deltas from lc.base_addr
+  "positions": {
+    "X10_Y2_N0": {
+      "base_addr": "0x13F5A",
+      "avoid_deltas": [-12, -10, -6, ...]
+    },
+    ...
+  },
+  "global_avoid_addrs": [],            // 0 entries if all addresses are per-position
+  "notes": "..."
+}
+
+If your mining shows mode H's XOR pattern never hits any FF cell (i.e. all
+avoid_deltas[] are disjoint from {lc.base_addr + pair*210 + delta for all
+16 minterms}), report that as a positive certificate too — the consumer side
+will fold it into the audit doc but skip the runtime sanity check.
+
+Estimated cost: ride along with deliverable 2's compile sweep — the same
+compiles can scan FF cells in the same pass. Adds maybe 10% to that runtime.
+
+================================================================================
+DELIVERABLE 4 — HEADER/FOOTER NON-TOUCH BYTE RANGES (LOW EFFORT)
+================================================================================
+
+Hand-off path:   results/rbf_safe_byte_ranges.md
+Deadline:        anytime before M3
+
+Already mostly in FINDINGS.md — just needs to be promoted to a stable
+machine-readable document. Provide the exact byte offsets for:
+
+  - Preamble:     [0, ?)         (currently described as "32 bytes 0xFF")
+  - Frame 0:      [?, ?)
+  - Frame 24:     [?, ?)         (last unprotected header frame)
+  - Frame 25:     [?, ?)         (first CRC-protected frame)
+  - Frame 1751:   [?, ?)         (last CRC-protected frame)
+  - Postamble:    [?, 368011)    (currently "59 bytes 0xFF")
+
+Plus the per-build variable bytes (0x29-0x34, 0x49-0x4A per FINDINGS) — confirm
+these offsets are stable across builds compiled by Quartus 13.0sp1 vs Lite 21.1,
+or document any drift.
+
+Format: a markdown file with a table + a small Python snippet that returns
+(safe_lo, safe_hi) byte offsets for the consumer side to assert on.
+
+================================================================================
+WHAT THE CONSUMER SIDE WILL DO ON RECEIPT
+================================================================================
+
+  1. Drop deliverable 1 .rbf files into scratch_merge/host/golden_rbf_modeH/.
+     Run host/test_lutcodec_c.py — must PASS for ≥3 positions × ≥2 masks before
+     any iron flash.
+
+  2. Fold deliverable 2's JSON into lutcodec_data.c as an optional
+     "deviating positions" array; if empty, the array is omitted.
+
+  3. Fold deliverable 3's JSON into lutcodec.c's lut_apply_mask sanity check —
+     OR (preferred) into a compile-time assert that the σ⁻¹ math output cells
+     are disjoint from FF avoid cells for all 1152 positions.
+
+  4. Use deliverable 4 to populate three asserts in mode_fabric_surgery:
+     - assert all dirty bitmap bits fall within [frame25_lo, frame1751_hi]
+     - assert no edit's lc.base_addr + pair*210 + delta touches [0, frame25_lo)
+       or [frame1751_hi, 368011)
+     - assert preamble/postamble byte regions in the readback verify match
+       the pre-edit input exactly
+
+================================================================================
+QUESTIONS / ASSUMPTIONS TO PUSH BACK ON
+================================================================================
+
+  Q1: I'm assuming Quartus 13.0sp1 OR Lite 21.1 is acceptable for the golden
+      RBFs. Stamp filename with version; consumer side will compare against
+      whichever matches its own build env.
+
+  Q2: I'm assuming canon_2input_codec_table.json's cell list is complete and
+      doesn't depend on the LUT mask being non-zero. If canon-2input cells
+      move based on mask, deliverable 2's methodology needs adjusting.
+
+  Q3: I'm not asking for ODD-N coverage extension. Sentinel + initial demos
+      use only even N. If consumer side later wants odd N, that's a separate
+      target.txt round.
+================================================================================
