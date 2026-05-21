@@ -1,0 +1,164 @@
+From 742738b81e13666ff4255bf2b46633c24e0dee12 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Thu, 21 May 2026 21:36:13 +0100
+Subject: [PATCH] =?UTF-8?q?Plan=20C-1=20v5=20mode=20H:=20EPCS=20bit-revers?=
+ =?UTF-8?q?e=20fix=20=E2=80=94=20operate=20codec=20on=20.rbf=20form?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First iron run of mode_fabric_surgery on 2026-05-21 evening completed
+successfully (all gates passed, EPCS slot 1 written, readback SHA OK)
+but produced a buffer whose SHA-256 differed from the host-side
+edit_rbf.py oracle.  Root cause: epcs_fast_read returns EPCS-native
+bytes, which are bit-reversed of the .rbf file format that the Phase 7
+LutCodec was designed for (openFPGALoader -f bit-reverses on write;
+the chip's configuration scanner reverses again on read at boot, so
+the chip-side stored form is the bit-reverse).  lut_apply_with_canon
+and lc_patch_rbf_crc_frames operated on bit-reversed bytes, flipping
+σ⁻¹ XOR at wrong bit positions.
+
+Fix: add mode_h_bitrev8 helper + mode_h_bitrev_buf wrapper.  In
+mode_fabric_surgery:
+  - After epcs_fast_read(0, MODE_H_RBF_BYTES, rbf):
+      bit-reverse rbf in place  →  .rbf form (codec operates correctly)
+  - After lc_patch_rbf_crc_frames + SHA-256 of .rbf form:
+      bit-reverse rbf back  →  EPCS-native form (correct bytes to write)
+  - Two SHA values now tracked: H_new (sha of .rbf form, matches host
+    oracle; used in UART log) and H_epcs (sha of EPCS-native form,
+    used for idempotency + readback verify).
+
+Second iron run validated byte-identity:
+  iron edited .rbf sha256 = 55d89b7b f454ef86 55b75a17 57590279
+                            2b260279 8b41dd03 f81c09ea 39d487f8
+  host oracle sha256      = (same)
+  EPCS slot 1 dump bit-reversed → byte-identical to host oracle
+  scan_rbf(slot 1 .rbf form, target=0xFFFF) → exactly 1 hit at
+                                              (X=22, Y=12, N=4)
+
+After promoting slot 1 -> slot 0 + user cold-boot, chip boots
+cleanly with mode Q dispatchable, and EPCS page 0 dump bit-reverses
+byte-identical to the host oracle.  Fabric LE at (22,12,4) now has
+truth table 0xFFFF in the live configuration.  H1 (Cyclone IV LE
+reads only the 16 LUT data cells at runtime) is implicitly validated
+for mask=0xFFFF; H2 (LE reads canon-cells at runtime) is refuted for
+this symmetric-mask case.
+
+Build: 29112 B main.elf (+332 B vs prior).  Iron rolled back to
+pre-mode-H baseline (md5 fd884770) at session end via
+openFPGALoader --file-type raw of the docs/safety backup.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/main.c | 56 ++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 47 insertions(+), 9 deletions(-)
+
+diff --git a/sw/stage2_loader/main.c b/sw/stage2_loader/main.c
+index ebe1999..cee6954 100644
+--- a/sw/stage2_loader/main.c
++++ b/sw/stage2_loader/main.c
+@@ -2111,6 +2111,25 @@ static void mode_generate_classic(void)
+  *      via openFPGALoader and power-cycles.  Slot 0 remains safe
+  *      throughout; abortable at any point.
+  */
++/* EPCS-vs-.rbf bit order: openFPGALoader -f writes .rbf bytes bit-reversed
++ * into the EPCS chip, and epcs_fast_read returns the raw EPCS bytes (no
++ * reverse) — so the SDRAM buffer after epcs_fast_read is bit-reversed
++ * relative to the .rbf format that the Phase 7 lutcodec was designed for.
++ * mode_fabric_surgery must bitrev the buffer around the codec call and
++ * around the slot-1 readback verify so the σ⁻¹ XOR lands at the right
++ * bit positions in the .rbf layout.  Empirically discovered 2026-05-21
++ * after first mode H iron run produced byte-mismatch with the host
++ * oracle. */
++static inline uint8_t mode_h_bitrev8(uint8_t b) {
++    b = (uint8_t)((b & 0xF0u) >> 4 | (b & 0x0Fu) << 4);
++    b = (uint8_t)((b & 0xCCu) >> 2 | (b & 0x33u) << 2);
++    b = (uint8_t)((b & 0xAAu) >> 1 | (b & 0x55u) << 1);
++    return b;
++}
++static void mode_h_bitrev_buf(uint8_t *buf, uint32_t n) {
++    for (uint32_t i = 0; i < n; i++) buf[i] = mode_h_bitrev8(buf[i]);
++}
++
+ static void mode_fabric_surgery(void)
+ {
+     uart_puts("[stage2] Mode: fabric surgery (Plan C-1 v5 mode H — "
+@@ -2234,6 +2253,9 @@ static void mode_fabric_surgery(void)
+     uart_puts(" B) from EPCS -> SDRAM @"); uart_puthex32(TPU_SCRATCH_ADDR);
+     uart_puts("\r\n");
+     epcs_fast_read(0u, MODE_H_RBF_BYTES, rbf);
++    /* EPCS-native (bit-reversed of .rbf) -> .rbf form for the codec. */
++    uart_puts("[rot] bit-reversing SDRAM buffer to .rbf form\r\n");
++    mode_h_bitrev_buf(rbf, MODE_H_RBF_BYTES);
+ 
+     /* === Step 6: σ⁻¹ XOR onto in-SDRAM .rbf + dirty-frame tracking. */
+     static uint8_t dirty[CRC_DIRTY_BITMAP_BYTES];
+@@ -2258,15 +2280,31 @@ static void mode_fabric_surgery(void)
+     lc_patch_rbf_crc_frames(rbf, dirty);
+     uart_puts("[rot] frame CRC-16 repair complete (dirty-frame walk)\r\n");
+ 
+-    /* === Step 8: SHA-256 of edited .rbf for the log. === */
++    /* === Step 8: SHA-256 of edited .rbf for the log (computed in .rbf
++     * form so it matches host-side oracles from edit_rbf.py). === */
+     uint32_t H_new[8];
+     sha256_hw(rbf, MODE_H_RBF_BYTES, H_new);
+     uart_puts("[rot] edited .rbf sha256=");
+     for (int i = 0; i < 8; i++) uart_puthex32(H_new[i]);
+     uart_puts("\r\n");
+ 
+-    /* === Step 9: idempotency — read slot 1, SHA-compare, skip write
+-     * if it's already what we'd be about to write. */
++    /* Convert back to EPCS-native (bit-reversed) so the bytes we write
++     * to slot 1 are what the configuration scanner expects on cold-boot.
++     * From here on the SDRAM buffer is in EPCS-native form. */
++    uart_puts("[rot] bit-reversing SDRAM buffer back to EPCS-native form\r\n");
++    mode_h_bitrev_buf(rbf, MODE_H_RBF_BYTES);
++
++    /* SHA of the EPCS-native bytes we'll write (= sha of `rbf` buffer
++     * now that it's been bit-reversed back).  Used to compare against
++     * slot-1 readback for idempotency + readback-verify. */
++    uint32_t H_epcs[8];
++    sha256_hw(rbf, MODE_H_RBF_BYTES, H_epcs);
++    uart_puts("[rot] EPCS-native sha256 (for readback compare)=");
++    for (int i = 0; i < 8; i++) uart_puthex32(H_epcs[i]);
++    uart_puts("\r\n");
++
++    /* === Step 9: idempotency — read slot 1, SHA-compare to H_epcs,
++     * skip write if it's already byte-identical. */
+     uint8_t *rb = (uint8_t *)EPCS_READBACK_ADDR;
+     uint32_t H_slot1[8];
+     uart_puts("[rot] reading EPCS slot 1 @"); uart_puthex32(EPCS_TPU_BASE);
+@@ -2277,7 +2315,7 @@ static void mode_fabric_surgery(void)
+     for (int i = 0; i < 8; i++) uart_puthex32(H_slot1[i]);
+     uart_puts("\r\n");
+     int already = 1;
+-    for (int i = 0; i < 8; i++) if (H_slot1[i] != H_new[i]) { already = 0; break; }
++    for (int i = 0; i < 8; i++) if (H_slot1[i] != H_epcs[i]) { already = 0; break; }
+ 
+     if (already) {
+         uart_puts("[rot] slot 1 already byte-identical to edited .rbf "
+@@ -2294,16 +2332,16 @@ static void mode_fabric_surgery(void)
+         epcs_fast_read(EPCS_TPU_BASE, MODE_H_RBF_BYTES, rb);
+         sha256_hw(rb, MODE_H_RBF_BYTES, H_slot1);
+         for (int i = 0; i < 8; i++) {
+-            if (H_slot1[i] != H_new[i]) {
+-                uart_puts("[!] readback SHA FAIL — slot 1 != edited "
+-                          ".rbf at word "); uart_puthex32((uint32_t)i);
++            if (H_slot1[i] != H_epcs[i]) {
++                uart_puts("[!] readback SHA FAIL — slot 1 != intended "
++                          "EPCS bytes at word "); uart_puthex32((uint32_t)i);
+                 uart_puts(" got="); uart_puthex32(H_slot1[i]);
+-                uart_puts(" exp="); uart_puthex32(H_new[i]);
++                uart_puts(" exp="); uart_puthex32(H_epcs[i]);
+                 uart_puts("\r\n"); while (1) {}
+             }
+         }
+         uart_puts("[rot] EPCS slot 1 readback SHA OK ("
+-                  "byte-identical to edited .rbf)\r\n");
++                  "byte-identical to intended EPCS-form bytes)\r\n");
+     }
+ 
+     uart_puts("[rot] mode H complete — slot 1 staged with σ⁻¹ fabric edits.\r\n");
+-- 
+2.43.0
+
