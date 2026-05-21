@@ -21,10 +21,10 @@ progressive demos:
 
 | Demo | Mechanism | Iron evidence |
 |---|---|---|
-| **v1** cold-boot + stability | Merged single-bitstream (RoT + TPU peripheral) cold-boots cleanly; SHA / ASMI / ALTREMOTE / TPU coexist on the XBUS mux | `docs/captures/uart_*_2153_stability.log` |
-| **v2** SD → TPU LUT load | `mode_g`: SD → CRC-32 gate → LutCodec `lc_init` whitelist → write to TPU on-chip LUT memory (256 × 32-bit M9K @ `0xF0000040`) → readback verify | `docs/captures/uart_*_2238_modeg_256.log` |
-| **v3** LUT-driven compute | `mode_c`: `CTRL[8]=1` triggers an FSM that auto-loads PE weights from LUT[0..15] bits [23:16] → systolic compute on `X_IN={1,2,3,4}` → results = Σ(x_k · w_k_row), byte-matches Python | `docs/captures/uart_*_2250_g_then_c.log` |
-| **v4** σ⁻¹ surgery preserved (TPU memory) | `mode_G`: same SD→CRC→whitelist gate, but replays Phase 7 `lut_apply_mask` (pair, delta) math per record and stores σ⁻¹(mask) in the LUT; silicon RES rows byte-match Python σ⁻¹ reference | `docs/captures/uart_*_2302_g_vs_G.log` |
+| **v1** cold-boot + stability | Merged single-bitstream (RoT + TPU peripheral) cold-boots cleanly; SHA / ASMI / ALTREMOTE / TPU coexist on the XBUS mux | `docs/captures/uart_20260520_2153_c1_merged_stability.log` |
+| **v2** SD → TPU LUT load | `mode_g`: SD → CRC-32 gate → LutCodec `lc_init` whitelist → write to TPU on-chip LUT memory (256 × 32-bit M9K @ `0xF0000040`) → readback verify | `docs/captures/uart_20260520_2238_c1v2_modeg_256.log` |
+| **v3** LUT-driven compute | `mode_c`: `CTRL[8]=1` triggers an FSM that auto-loads PE weights from LUT[0..15] bits [23:16] → systolic compute on `X_IN={1,2,3,4}` → results = Σ(x_k · w_k_row), byte-matches Python | `docs/captures/uart_20260520_2250_c1v3_g_then_c.log` |
+| **v4** σ⁻¹ surgery preserved (TPU memory) | `mode_G`: same SD→CRC→whitelist gate, but replays Phase 7 `lut_apply_mask` (pair, delta) math per record and stores σ⁻¹(mask) in the LUT; silicon RES rows byte-match Python σ⁻¹ reference | `docs/captures/uart_20260520_2302_c1v4_g_vs_G.log` |
 | **v5** real fabric LUT surgery | `mode_H`: same gate chain, but reads page-0 `.rbf` into SDRAM, bit-reverses to `.rbf` form, applies σ⁻¹ XOR + frame CRC-16 repair, bit-reverses back, writes EPCS slot 1.  User promotes slot 1 → slot 0; cold-booted chip's LE truth table = mask in live fabric.  Symmetric-mask scope only ({0x0000, 0xFFFF}) — see "Scope gating" below | `docs/captures/uart_20260521_modeH_v2_validated.log` |
 
 v1-v4 require no FPGA reconfiguration; the project's novel σ⁻¹ math
