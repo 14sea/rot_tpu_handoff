@@ -1,0 +1,87 @@
+
+[stage2] ready - RV32IMAC NEORV32 loader
+[stage2] CLK=0x02faf080
+[stage2] SDRAM word-write test...
+[stage2] SDRAM test PASS
+[stage2] l=xmodem s=smoke d=dump w=wtest W=wmulti R=rdhdr B=baud b/timeout=bootSD u=U-Boot
+[stage2] Mode: SD blob boot
+[sd] image_sz=0x00171744 dtb_sz=0x000005b5 initrd_sz=0x000008c0
+[sd] reading Image
+[sd] reading DTB
+[sd] reading initrd
+[dtb] initrd-end=0x41f808c0 patched=0x00000001
+[stage2] Kernel header:
+
+  0x40000000: 0x0000a8b1 0x00010000 0x00000000 0x00000000 
+[stage2] Booting Linux from SD...
+ABCD[    0.000000] Linux version 6.6.83 (test@H3C) (riscv-none-elf-gcc (xPack GNU RISC-V Embedded GCC x86_64) 14.2.0, GNU ld (xPack GNU RISC-V Embedded GCC x86_64) 2.43.1) #59 Sun Apr 26 16:25:17 BST 2026
+[    0.000000] Machine model: NEORV32 on HeiJin AX301 (EP4CE6)
+[    0.000000] Forcing kernel command line to: earlycon=neorv32,0xfff50000 console=ttyNEO0,115200
+[    0.000000] earlycon: neorv32 at MMIO 0xfff50000 (options '')
+[    0.000000] printk: bootconsole [neorv32] enabled
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] riscv: base ISA extensions acim
+[    0.000000] riscv: ELF capabilities acim
+E[    0.000000] Kernel command line: earlycon=neorv32,0xfff50000 console=ttyNEO0,115200
+[    0.000000] Dentry cache hash table entries: 4096 (order: 2, 16384 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 2048 (order: 1, 8192 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 8128
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] Memory: 30904K/32768K available (1075K kernel code, 141K rwdata, 160K rodata, 96K init, 52K bss, 1864K reserved, 0K cma-reserved)
+[    0.000000] SLUB: HWalign=64, Order=0-1, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] riscv-intc: 32 local interrupts mapped
+[    0.000000] clint: clint@fff40000: timer running at 50000000 Hz
+[    0.000000] clocksource: clint_clocksource: mask: 0xffffffffffffffff max_cycles: 0xb8812736b, max_idle_ns: 440795202655 ns
+[    0.000239] sched_clock: 64 bits at 50MHz, resolution 20ns, wraps every 4398046511100ns
+FGHIJK[    0.043794] Console: colour dummy device 80x25
+LMNOP[    0.063466] Calibrating delay loop (skipped), value calculated using timer frequency.. 100.00 BogoMIPS (lpj=200000)
+Q[    0.086192] pid_max: default: 4096 minimum: 301
+RS[    0.113705] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.132974] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+TUVabc<401119d0><40111ed2><40111f2e><40114592><40118e26><40119a58><40119b7c>def[    0.577728] devtmpfs: initialized
+@[0][1<4011116c><40111fbe><401129a6><40113036><40113fc2>[    1.052805] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+<401144ac>[    1.075371] futex hash table entries: 16 (order: -5, 192 bytes, linear)
+<40119ab4><40119b1c><40119b3c><40119b5c><400e62ce>][2<401138f8><401148f8><40114948><40116cc2><4011b11c><4011b60e><4011c24e><4011c8a6><4011cb02><4011cb14>][3<40110486><40001b40>[    1.283308] sched: RT throttling activated
+[    3.168271] cpu0: Ratio of byte access time to unaligned word access is 0.00, unaligned accesses are slow
+<400d0224><4011d72a>][4<40110cb6><40111e36><40112634><40112bbc><40114914><40115e48><40116aaa><40116a7e><4011c1bc><400e626a><4011d02c><4011fb22>][5<00<40111ada>>.<01<40113f7e>[    5.214655] clocksource: Switched to clocksource clint_clocksource
+>.<02<40118b14>>.<03<40118c02>>.<04<40118c32>>.<05<40118c9a>>.<06<40118cfa>>.<07<4011900c>>.<08<401199fc>>.<09<40119a86>>.<10<40119baa>>.<11<40119df4>>.<12<40119e3c>>.<13<40119e6a>>.<14<40119e94>>.<15<40119ece>>.<16<40119efc>>.<17<40119f34>>.<18<40119f6c>>.<19<40119f96>>.<20<40119fce>>.<21<4011a006>>.<22<4011a0e4>>.<23<4011a24c>>.<24<4011bf64>>.<25<40110362>[   10.904419] Unpacking initramfs...
+>.][6<00<40110c62>>.<01<4011174c>>.<02<40111778>>.<03<40111a80>>.<04<40113a72>>.<05<40113bc8>>.<06<40113eba>>.<07<40113ffa>>.<08<40114032>>.<09<40114098>>.<10<401140e0>>.<11<40114156>>.<12<4011453a>>.<13<4011456a>>.<14<401147da>>.<15<401169b4>[   11.484098] workingset: timestamp_bits=30 max_order=13 bucket_order=0
+>.<16<40118cca>>.<17<40118f00>>.<18<40119242>>.<19<4011a20c>>.<20<4011a268>>.<21<4011ac3a>>.<22<4011b032>>.<23<4011b098>>.<24<4011b0fe>>.<25<4011b274>>.<26<4011b294>>.<27<4011befc>(*PQ[   17.648178] fff50000.serial: ttyNEO0 at MMIO 0x0 (irq = 0, base_baud = 0) is a neorv32-uart
+[   17.681990] printk: console [ttyNEO0] enabled
+[   17.681990] printk: console [ttyNEO0] enabled
+[   17.712167] printk: bootconsole [neorv32] disabled
+[   17.712167] printk: bootconsole [neorv32] disabled
+R0+)>.<28<4011c02c>>.<29<4011c800>>.<30<4011c86e>>.][7<00<4010f4aa>>.<01<401117ba>>.<02<4011178a>>.<03<401119ac>>.<04<4011197c>>.<05<40112718>>.<06<40112b56>>.<07<40112c52>>.<08<40112f00>>.<09<40112fb8>>.<10<40112f88>>.<11<401134ae>>.<12<400d5a1a>>.<13<400d8b72>T0>.<14<4011d81a>>.<15<4011ad54>[   19.372098] clk: Disabling unused clocks
+>.<16<4011d714>>.]#$g12Sschijkl[   19.461209] This architecture does not have kernel memory protection.
+L[   19.512181] Freeing unused kernel image (initmem) memory: 96K
+Mmn[   19.531998] Run /init as init process
+Q1Q2Q3x1x2x3x4B1OS{|FDZe404984d2s404bfec0
+o!
+========================================
+ NEORV32 nommu Linux + TPU — mini shell 
+========================================
+Linux (none) 6.6.83 riscv32
+Uptime:    18 s
+Total RAM: 31000 KB
+Free RAM:  30260 KB
+
+--- Linux+TPU dense-layer classifier (auto) ---
+[tpu] reading workload /tpu_model.bin ...
+[tpu] model hash = 0x9ca88565  anchor = 0x9ca88565
+[tpu] trust OK; programming TPU weights (4x4 int8).
+  RES[0] = 200
+  RES[1] = 300
+  RES[2] = -100
+  RES[3] = 100
+[tpu] >>> predicted class = 1  (score 300)  [expect class 1, score 300]
+---T1----T2----------------------------------------
+
+Type 'help' for commands.
+
+nommu# 

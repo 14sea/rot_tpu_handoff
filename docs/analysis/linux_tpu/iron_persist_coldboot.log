@@ -1,0 +1,35 @@
+>.<25<40110362>[   10.904419] Unpacking initramfs...
+>.][6<00<40110c62>>.<01<4011174c>>.<02<40111778>>.<03<40111a80>>.<04<40113a72>>.<05<40113bc8>>.<06<40113eba>>.<07<40113ffa>>.<08<40114032>>.<09<40114098>>.<10<401140e0>>.<11<40114156>>.<12<4011453a>>.<13<4011456a>>.<14<401147da>>.<15<401169b4>[   11.484098] workingset: timestamp_bits=30 max_order=13 bucket_order=0
+>.<16<40118cca>>.<17<40118f00>>.<18<40119242>>.<19<4011a20c>>.<20<4011a268>>.<21<4011ac3a>>.<22<4011b032>>.<23<4011b098>>.<24<4011b0fe>>.<25<4011b274>>.<26<4011b294>>.<27<4011befc>(*PQ[   17.648178] fff50000.serial: ttyNEO0 at MMIO 0x0 (irq = 0, base_baud = 0) is a neorv32-uart
+[   17.681990] printk: console [ttyNEO0] enabled
+[   17.681990] printk: console [ttyNEO0] enabled
+[   17.712167] printk: bootconsole [neorv32] disabled
+[   17.712167] printk: bootconsole [neorv32] disabled
+R0+)>.<28<4011c02c>>.<29<4011c800>>.<30<4011c86e>>.][7<00<4010f4aa>>.<01<401117ba>>.<02<4011178a>>.<03<401119ac>>.<04<4011197c>>.<05<40112718>>.<06<40112b56>>.<07<40112c52>>.<08<40112f00>>.<09<40112fb8>>.<10<40112f88>>.<11<401134ae>>.<12<400d5a1a>>.<13<400d8b72>T0>.<14<4011d81a>>.<15<4011ad54>[   19.372098] clk: Disabling unused clocks
+>.<16<4011d714>>.]#$g12Sschijkl[   19.461209] This architecture does not have kernel memory protection.
+L[   19.512181] Freeing unused kernel image (initmem) memory: 96K
+Mmn[   19.531998] Run /init as init process
+Q1Q2Q3x1x2x3x4B1OS{|FDZe404984d2s404bfec0
+o!
+========================================
+ NEORV32 nommu Linux + TPU — mini shell 
+========================================
+Linux (none) 6.6.83 riscv32
+Uptime:    18 s
+Total RAM: 31000 KB
+Free RAM:  30260 KB
+
+--- Linux+TPU dense-layer classifier (auto) ---
+[tpu] reading workload /tpu_model.bin ...
+[tpu] model hash = 0x9ca88565  anchor = 0x9ca88565
+[tpu] trust OK; programming TPU weights (4x4 int8).
+  RES[0] = 200
+  RES[1] = 300
+  RES[2] = -100
+  RES[3] = 100
+[tpu] >>> predicted class = 1  (score 300)  [expect class 1, score 300]
+---T1----T2----------------------------------------
+
+Type 'help' for commands.
+
+nommu# 

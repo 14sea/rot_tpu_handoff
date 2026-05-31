@@ -47,9 +47,20 @@ make image RISCV_PREFIX=/home/test/xpack-riscv-none-elf-gcc-14.2.0-3/bin/riscv-n
 NEORV32_HOME=/home/test/see_neorv32_run_linux/neorv32 IMAGE_GEN=$PWD/image_gen`,
 then `cp neorv32_imem_image.vhd ../rtl/` and rebuild the bitstream.
 
+## ✅ SILICON-VALIDATED end-to-end (2026-05-31)
+Ran this runbook on the AX301. Step 0 backup md5 `b81dc43b` (page-0 `fd884770`)
+confirmed the v4 baseline. Step 2 SRAM pre-burn (`iron_persist_sram_validate.log`)
+and Step 4 EPCS cold-boot (`iron_persist_coldboot.log`) both: stage2 from
+IMEM-ROM → auto SD-boot → `trust OK` → `RES=[200,300,-100,100]` → **class 1
+(score 300)**, no host. Step 3 EPCS readback byte-identical to the persist .rbf
+(md5 `d85d5214`). Power-on → Linux → classifier is autonomous.
+
 ## Tools / constants
 - openFPGALoader: `/home/test/see_neorv32_run_linux/tools/openFPGALoader/build/openFPGALoader`
-- spiOverJtag bridge (EP4CE10F17C8): auto-detected (`spiOverJtag_ep4ce1017.rbf.gz`).
+- spiOverJtag bridge: **pass explicitly** for all flash (dump/-f) ops —
+  `-B /home/test/see_neorv32_run_linux/tools/openFPGALoader/spiOverJtag/spiOverJtag_ep4ce1017.rbf.gz`
+  (the EP4CE6/EP4CE10 shared idcode can't auto-select it; bare name fails to
+  open — needs the full path). NOT needed for plain SRAM config (`-m`/no `-f`).
 - EPCS chip: ST M25P16, 2 MB (32 × 64 KB sectors). Console baud 115200.
 - **Current EPCS = RoT C-1 v4 CRTM deliverable** (page-0 .rbf md5 `fd884770`,
   modes g/G/c/H). Existing full backup: `docs/safety/epcs_backup_20260521_pre_modeH.bin`
@@ -59,12 +70,16 @@ then `cp neorv32_imem_image.vhd ../rtl/` and rebuild the bitstream.
 
 ## Iron sequence
 
-`OFL=/home/test/see_neorv32_run_linux/tools/openFPGALoader/build/openFPGALoader`
-Cold-boot / power-cycle is **your** action. Listener-first on every boot.
+```
+OFL=/home/test/see_neorv32_run_linux/tools/openFPGALoader/build/openFPGALoader
+BR=/home/test/see_neorv32_run_linux/tools/openFPGALoader/spiOverJtag/spiOverJtag_ep4ce1017.rbf.gz
+```
+`$OFL` + `-B $BR` for every flash op (dump/-f). Cold-boot / power-cycle is
+**your** action. Listener-first on every boot.
 
 ### Step 0 — fresh EPCS backup (before anything)
 ```
-$OFL -c usb-blaster --dump-flash --file-size 2097152 \
+$OFL -c usb-blaster -B $BR --dump-flash --file-size 2097152 \
     docs/safety/epcs_backup_$(date +%Y%m%d_%H%M)_pre_persist.bin
 md5sum docs/safety/epcs_backup_*_pre_persist.bin   # expect b81dc43b (== v4 baseline)
 ```
@@ -119,7 +134,7 @@ first (likely SD-blob/sd.c or the timeout default). Save the log to
 
 ### Step 3 — burn persist bitstream to EPCS page 0
 ```
-$OFL -c usb-blaster -f \
+$OFL -c usb-blaster -B $BR -f \
     /home/test/rot_tpu_handoff/docs/analysis/linux_tpu/scratch_merge/quartus/neorv32_demo_persist.rbf
 ```
 `-f` writes bit-reversed bytes to EPCS (the AS-config convention; cold-boot
@@ -127,7 +142,7 @@ decodes correctly — proven on this board for the RoT builds).
 
 Static-verify the readback (dump page-0 region, bit-reverse, compare to the .rbf):
 ```
-$OFL -c usb-blaster --dump-flash --file-size 2097152 \
+$OFL -c usb-blaster -B $BR --dump-flash --file-size 2097152 \
     docs/safety/epcs_backup_$(date +%Y%m%d_%H%M)_post_persist.bin
 # page-0 region [0 .. 368011) bit-reversed must equal neorv32_demo_persist.rbf
 python3 - <<'PY'
