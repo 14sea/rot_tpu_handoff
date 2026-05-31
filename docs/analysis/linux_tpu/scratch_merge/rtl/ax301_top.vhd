@@ -8,10 +8,12 @@
 --   0xFFF50000              : UART0 (internal, 115200 baud = 50MHz/434)
 --   0xFFFC0000              : GPIO  (internal, gpio_o[3:0] → LED)
 --
--- Boot sequence (BOOT_MODE_SELECT=0):
---   CPU resets → bootloader ROM → waits on UART for firmware upload
---   Send firmware with: neorv32/sw/image_gen/uart_upload.sh /dev/ttyUSB0 app.bin
---   Bootloader default baud: 19200
+-- Boot sequence (BOOT_MODE_SELECT=2 — EPCS-persist build):
+--   CPU resets → runs stage2 baked into IMEM-ROM (neorv32_imem_image.vhd) →
+--   stage2 auto-boots Linux from the SD NEOLNX blob (no host, no UART upload).
+--   stage2 source: ../sw/stage2_loader/ ; rebuild image via `make image` there.
+--   (BOOT_MODE_SELECT=0, the UART-bootloader dev build, is what host tooling
+--    drives for SD packing; this persist build only ever READS the SD card.)
 
 library ieee;
 use ieee.std_logic_1164.all;
@@ -152,8 +154,9 @@ begin
   generic map (
     -- Clocking
     CLOCK_FREQUENCY  => 50_000_000,
-    -- Boot: 0 = internal UART bootloader (at 0xFFE00000)
-    BOOT_MODE_SELECT => 0,
+    -- Boot: 2 = boot IMEM image (stage2 baked into IMEM-ROM, no bootloader).
+    --       0 = internal UART bootloader (dev build, host-uploaded stage2).
+    BOOT_MODE_SELECT => 2,
     -- ISA: RV32IMAC + base counters (Zaamo needed by U-Boot SMP init path)
     RISCV_ISA_C      => true,
     RISCV_ISA_M      => true,

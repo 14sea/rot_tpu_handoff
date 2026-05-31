@@ -1,0 +1,7 @@
+# stage2 build outputs (regenerate via `make image`)
+build/
+image_gen
+elf.bin
+main.elf
+neorv32_exe.bin
+neorv32_imem_image.vhd

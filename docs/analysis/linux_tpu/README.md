@@ -34,6 +34,15 @@ symlink to the patched Linux submodule).
 | P1 | Integrate TPU into the Linux SoC + build combined bitstream | ✅ done |
 | P2 | Reach the TPU from Linux userspace | ✅ **silicon-validated** |
 | P3 | Quantized dense-layer classifier (load + trust-verify weights → infer) | ✅ **silicon-validated** |
+| P4 | **EPCS-persist** — cold-boot → Linux → classifier, no host | 🛠️ host-side built; iron pending → **`EPCS_PERSIST_RUNBOOK.md`** |
+
+**P4 (EPCS-persist):** make the demo autonomous on power-on. Persist build sets
+`BOOT_MODE_SELECT=2` so stage2 is baked into IMEM-ROM (trust anchor in the
+bitstream) and auto-boots Linux from the SD `NEOLNX` blob; bitstream → EPCS page
+0, kernel/dtb/classifier-initramfs → SD card. Host-side bitstream built +
+statically verified (`neorv32_demo_persist.rbf`, md5 `d85d5214`, 5,418 LE,
+IMEM-ROM, 0 errors); the iron session (backup → SD pack → SRAM pre-burn validate
+→ EPCS burn → your cold-boot) is in **`EPCS_PERSIST_RUNBOOK.md`**.
 
 **P2/P3 approach — corrected from the original "mmap /dev/mem" plan.** The real
 rootfs is a 2.9 KB nolibc static `init` (no busybox, no `/dev/mem`,

@@ -61,7 +61,8 @@ set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_debug_auth.vhd
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_debug_dm.vhd -library neorv32
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_top.vhd -library neorv32
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_cache_ram.vhd -library neorv32
-set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_imem_image.vhd -library neorv32
+# EPCS-persist: IMEM-ROM init = stage2 (handoff-local, generated from ../sw/stage2_loader)
+set_global_assignment -name VHDL_FILE ../rtl/neorv32_imem_image.vhd -library neorv32
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_imem_rom.vhd -library neorv32
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_imem_ram.vhd -library neorv32
 set_global_assignment -name VHDL_FILE ../neorv32/rtl/core/neorv32_dmem_ram.vhd -library neorv32
