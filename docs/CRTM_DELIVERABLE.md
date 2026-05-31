@@ -1,9 +1,13 @@
 # Self-Reconfiguring CRTM on Cyclone IV E — Silicon-Validated Deliverable
 
-**Date**: 2026-05-20  
+**Date**: 2026-05-31  
 **Board**: ALINX AX301 (EP4CE10F17C8, 10,320 LE / 423,936 mem-bits)  
-**Status**: silicon-validated end-to-end, four progressively richer demos  
-**Repos**: `neorv32_rot/`, `neorv32_tpu/`, orchestrator `rot_tpu_handoff/`
+**Status**: silicon-validated end-to-end across **three orthogonal CRTM
+demonstrations** — (A) LUT-memory dynamic load + compute (mode g/G/c);
+(B) real `.rbf` fabric LUT surgery via EPCS staging + cold-boot (mode H,
+symmetric scope — JBits/XPART-spirit); (C) the same trust-anchored dynamic
+load under a full OS (nommu Linux userspace driving the TPU).  
+**Repos**: `neorv32_rot/`, `neorv32_tpu/`, `see_neorv32_run_linux/`, orchestrator `rot_tpu_handoff/`
 
 ---
 
@@ -24,6 +28,30 @@ A trust-anchored **dynamic-loading CRTM** that:
 Every step above has been demonstrated on real iron and captured in
 `docs/captures/uart_*.log`.
 
+**Two further demonstrations extend the same CRTM property to a self-modifying
+fabric and to a full OS** (2026-05-21 / 2026-05-31):
+
+6. **Real fabric LUT surgery (mode H, Plan C-1 v5).** Instead of writing TPU
+   *memory*, the RoT edits the *bitstream itself*: reads page-0 `.rbf` into
+   SDRAM, applies the σ⁻¹ cell pattern + repairs frame CRC-16, stages the result
+   to EPCS slot 1, and (after operator slot-promote) cold-boots into the edited
+   fabric. Silicon-validated for the symmetric mask scope `{0x0000,0xFFFF}` at
+   LE (22,12,4) on 2026-05-21 — the JBits/XPART-spirit "self-modifying fabric"
+   contribution. Asymmetric-mask scope is gated: the 2026-05-31 caveat-#2
+   analysis (`docs/analysis/mode_h_canon/`) proved the minimal-design canon
+   delta is **not portable** onto a populated production `.rbf` (0/44 clean;
+   canon cells are shared/block-level), so asymmetric surgery is parked pending
+   Quartus Pro / RTL-observability — *not* the canon-transfer route.
+7. **Trust-anchored dynamic load under a full OS (Linux + TPU).** The same
+   property one level up the stack: nommu Linux 6.6.83 boots from the trusted
+   in-bitstream anchor, a userspace `init` reads a model file, FNV-1a
+   trust-gates it against an anchor baked into the trusted image, and only then
+   drives the integrated TPU as a quantized dense-layer classifier (4-in → 4
+   class scores, argmax). Confirms the CRTM-flexibility principle — CPU / OS /
+   load-source are all substitutable; only "dynamic load + trust anchor →
+   useful compute" is load-bearing. Silicon-validated 2026-05-31
+   (`docs/analysis/linux_tpu/`).
+
 ## 2. Iron evidence
 
 | Demo | Capture | What it proves |
@@ -35,6 +63,9 @@ Every step above has been demonstrated on real iron and captured in
 | 256-record load | `uart_20260520_2238_c1v2_modeg_256.log` | Full LUT-memory capacity (256 × 32-bit M9K) exercised; all 256 records survive the trust gates and persist. |
 | Compute path | `uart_20260520_2250_c1v3_g_then_c.log` | mode_c auto-loads PE weights from LUT[0..15] and computes; results = Σ(x_k · LUT_byte_k_row) byte-match Python compute. |
 | σ⁻¹ surgery | `uart_20260520_2302_c1v4_g_vs_G.log` | mode_G applies Phase 7 (pair, delta) math per record; silicon RES values byte-match Python σ⁻¹ reference (RES[0]=-66 / -66 / -322 / -322) across 4 rows. |
+| **Fabric LUT surgery (mode H, v5)** | `docs/captures/uart_20260521_modeH_v2_validated.log` | RoT edits page-0 .rbf (σ⁻¹ XOR + CRC repair) → EPCS slot 1; iron SHA = host `edit_rbf.py` oracle; post-promote cold-boot clean; `scan_rbf` confirms exactly 1 LE @ (22,12,4) flipped 0x0000→0xFFFF, no collateral. Self-modifying fabric, silicon-proven (symmetric). |
+| **Linux+TPU classifier (good)** | `docs/analysis/linux_tpu/iron_run1.log` | nommu Linux boots on the combined bitstream; `/init` trust-gates the model (hash 0x9ca88565 = anchor) and drives the TPU via direct U-mode MMIO → `RES=[200,300,-100,100]` → class 1 (score 300), byte-identical to `host_reference.py`. |
+| **Linux+TPU trust gate (tamper)** | `docs/analysis/linux_tpu/iron_run2_tampered.log` | Tampered model (hash 0xfcddd2e4 ≠ anchor) → `TRUST FAIL: refusing to load fabric`. Trust anchor is load-bearing under Linux. |
 
 ## 3. Architecture
 
@@ -186,6 +217,8 @@ entirely. The MSEL strap blocker becomes moot. As a side effect:
 | 8 | mode_g (LUT mask editor) | ✅ DONE — reinterpreted as mode_g/G writing to TPU LUT memory instead of .rbf surgery + AS REMOTE |
 | 9 | EPCS slot rotation | moot under C-1 (single bitstream, no high-frequency EPCS writes on mode_g path) |
 | C-1 v2/v3/v4 | Integrated bitstream + LUT + σ⁻¹ replay | ✅ silicon-validated 2026-05-20 |
+| C-1 v5 (mode H) | Real `.rbf` fabric LUT surgery (EPCS stage + cold-boot) | ✅ silicon-validated 2026-05-21 (symmetric); asymmetric parked (§1.6) |
+| Candidate (d) | Trust-anchored dynamic load + TPU classify under nommu Linux | ✅ silicon-validated 2026-05-31 (§1.7) |
 
 ## 8. Patches (orchestrator chain, applied 2026-05-20)
 
@@ -213,5 +246,12 @@ sibling tips: `neorv32_rot` = `563dffb`, `neorv32_tpu` = `ac98ec7`.
   shift accordingly.
 - **`editable_les.bin` allowlist sidecar** (per plan §Phase 8 future-hardening): per-base bitstream allowlist of editable LE positions, cross-checked
   against each record alongside the static lc_init whitelist.
-- **Linux/FreeRTOS workload that consumes TPU outputs**: orthogonal to
-  the CRTM proof but would close a more application-shaped story.
+- ~~**Linux/FreeRTOS workload that consumes TPU outputs**~~: ✅ **DONE
+  2026-05-31** — nommu Linux + a userspace TPU dense-layer classifier with an
+  FNV-1a trust gate; see §1.7 / §2 and `docs/analysis/linux_tpu/`.
+- **Asymmetric mode H on production iron**: ruled out via the minimal-design
+  canon-transfer route (2026-05-31 caveat-#2, §1.6). Reachable only via Quartus
+  Pro (LCCOMB locks → pinned sentinel) or RTL-observability at a free covered LE.
+- **EPCS-persist the Linux+TPU demo**: currently SRAM-loaded per boot; flashing
+  the combined bitstream (+ kernel/initramfs staging) to EPCS would make it
+  cold-boot standalone.

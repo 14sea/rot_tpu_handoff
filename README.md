@@ -4,20 +4,21 @@ Cross-repo orchestration for a **self-reconfiguring CRTM (Continuous
 Root of Trust Measurement)** demo on ALINX AX301 (Cyclone IV E
 EP4CE10F17C8 — *not* EP4CE6 despite the legacy naming).
 
-**Status (2026-05-21): Plan C-1 v5 silicon-validated for symmetric mask
-scope.**  Mode H performs real `.rbf` fabric LUT surgery via EPCS
-slot-1 staging; demo `mask=0xFFFF` at LE `(X=22, Y=12, N=4)` proven
-byte-identical to host-side `edit_rbf.py` oracle, then promoted to
-slot 0, cold-booted, and observed in the live fabric (scan_rbf finds
-exactly 1 LE with mask=0xFFFF — the sentinel position).  See
-[`docs/CRTM_DELIVERABLE.md`](docs/CRTM_DELIVERABLE.md) for the C-1 v4
-formal write-up + the v5 silicon section at the top of
-[`docs/plan.md`](docs/plan.md); this README is the navigation layer.
+**Status (2026-05-31): CRTM goal silicon-validated three orthogonal ways.**
+(A) LUT-memory dynamic load + compute (mode g/G/c); (B) real `.rbf` fabric LUT
+surgery via EPCS slot-1 staging + cold-boot (mode H, symmetric scope —
+JBits/XPART-spirit; `mask=0xFFFF` at LE `(22,12,4)` proven byte-identical to the
+host `edit_rbf.py` oracle, then observed in the live fabric); (C) the same
+trust-anchored dynamic load **under nommu Linux** — a userspace classifier
+drives the TPU after an FNV-1a trust gate (silicon-validated 2026-05-31,
+[`docs/analysis/linux_tpu/`](docs/analysis/linux_tpu/)).  See
+[`docs/CRTM_DELIVERABLE.md`](docs/CRTM_DELIVERABLE.md) for the full formal
+write-up (all three demos); this README is the navigation layer.
 
 ## What was proven
 
 A trust-anchored dynamic-loading chain, validated on iron across five
-progressive demos:
+progressive Plan C-1 demos, **plus an orthogonal full-OS demo (d)**:
 
 | Demo | Mechanism | Iron evidence |
 |---|---|---|
@@ -26,6 +27,7 @@ progressive demos:
 | **v3** LUT-driven compute | `mode_c`: `CTRL[8]=1` triggers an FSM that auto-loads PE weights from LUT[0..15] bits [23:16] → systolic compute on `X_IN={1,2,3,4}` → results = Σ(x_k · w_k_row), byte-matches Python | `docs/captures/uart_20260520_2250_c1v3_g_then_c.log` |
 | **v4** σ⁻¹ surgery preserved (TPU memory) | `mode_G`: same SD→CRC→whitelist gate, but replays Phase 7 `lut_apply_mask` (pair, delta) math per record and stores σ⁻¹(mask) in the LUT; silicon RES rows byte-match Python σ⁻¹ reference | `docs/captures/uart_20260520_2302_c1v4_g_vs_G.log` |
 | **v5** real fabric LUT surgery | `mode_H`: same gate chain, but reads page-0 `.rbf` into SDRAM, bit-reverses to `.rbf` form, applies σ⁻¹ XOR + frame CRC-16 repair, bit-reverses back, writes EPCS slot 1.  User promotes slot 1 → slot 0; cold-booted chip's LE truth table = mask in live fabric.  Symmetric-mask scope only ({0x0000, 0xFFFF}) — see "Scope gating" below | `docs/captures/uart_20260521_modeH_v2_validated.log` |
+| **(d)** Linux + TPU classifier | nommu Linux boots on the combined bitstream; userspace `init` reads `/tpu_model.bin`, FNV-1a **trust-gates** it vs a baked-in anchor, then drives the TPU via direct U-mode MMIO as a 4-in→4-out quantized dense layer → argmax (`class 1, score 300` = host reference). Tampered model → `TRUST FAIL`. Orthogonal OS-level demonstration (no kernel/driver change) | `docs/analysis/linux_tpu/iron_run1.log` + `iron_run2_tampered.log` |
 
 v1-v4 require no FPGA reconfiguration; the project's novel σ⁻¹ math
 from Phase 7 is exercised end-to-end in `mode_G` without touching an
@@ -46,9 +48,13 @@ handler both enforce this whitelist.  Asymmetric masks (e.g.
      original M0-M4 sentinel-at-a-known-position design isn't
      buildable in our toolchain.  See
      `[[feedback-quartus-lite-no-lccomb-lock]]` in memory.
-  2. The 1152-position canon-2input no-op audit (Cyclone_CRAM_Mapper
-     D2) is still pending; that's the safety gate before opening
-     mode H to arbitrary asymmetric positions.
+  2. The Cyclone_CRAM_Mapper D2 canon table landed 2026-05-31 (the "no-op"
+     premise was **falsified** — canon is a real per-position delta), and the
+     consumer byte-identity gate passes 44/44.  But the 2026-05-31 caveat-#2
+     analysis (`docs/analysis/mode_h_canon/`) showed the minimal-design canon
+     delta is **not portable** onto a populated production `.rbf` (0/44 clean;
+     canon cells are shared/block-level) — so canon-transfer is ruled out as the
+     asymmetric route.
 
 Re-open paths: Quartus Pro/Standard (LCCOMB locks honored), a working
 post-fit placement-query TCL API in Lite (6 attempts this session,
@@ -197,8 +203,8 @@ EP4CE10F17C8  (9,501 LE / 92 %, 1 M9K added, 16 DSP9)
 - **`editable_les.bin` allowlist sidecar**: per-base allowlist of
   editable LE positions, cross-checked alongside the static `lc_init`
   whitelist.
-- **Linux/FreeRTOS workload consuming TPU outputs**: orthogonal to the
-  CRTM proof but would close an application-shaped story.  Project
-  charter ([[project-crtm-flexibility]] memory) explicitly relaxes
-  Linux as load-bearing — FreeRTOS, bare-metal, or PicoRV32 swaps are
-  all fair game if LE budget pressure returns.
+- ~~**Linux/FreeRTOS workload consuming TPU outputs**~~: ✅ **DONE 2026-05-31**
+  (demo (d) above) — nommu Linux + a userspace TPU classifier with an FNV-1a
+  trust gate; see [`docs/analysis/linux_tpu/`](docs/analysis/linux_tpu/).
+  Confirms the project charter's OS-substitutability (FreeRTOS / bare-metal /
+  PicoRV32 swaps remain fair game if LE budget pressure returns).
