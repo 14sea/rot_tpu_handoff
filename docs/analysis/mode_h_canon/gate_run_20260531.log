@@ -1,0 +1,18 @@
+# consumer byte-identity gate run — 2026-05-31T10:38:59Z
+# host: Linux 6.18.20.3-microsoft-standard-WSL2+ x86_64; gcc: gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+# table md5: 4dc37fbab8828034acda1270b19fa5e5
+# golds: $EP4CE6_REPO=/home/test/EP4CE6 (read-only oracle)
+# lutcodec.so built from docs/analysis/plan_c1_le/scratch_merge/sw/stage2_loader/{lutcodec,lutcodec_data,crc16}.c
+
+built: /home/test/rot_tpu_handoff/docs/analysis/h1h2_silicon_test/host/lutcodec.so
+== σ⁻¹ (C codec) + D2 canon  vs  Quartus golds ==
+  => 44/44 byte-identical (excl. per-build header bytes)
+
+== σ⁻¹ ONLY, no canon  (expected to FAIL — proves canon is NOT a no-op) ==
+  => 0/44 pass WITHOUT canon (44 fail → canon carries real per-position cells)
+
+== negative control: drop 1 canon cell on first entry (must FAIL) ==
+  X10Y2N0 0x4444 with 1 canon cell removed: diff_bytes=3 ['0x5967B', '0x596BE', '0x596BF'] -> OK (gate discriminates)
+
+[scope] lossless mine->verify round-trip; consumer-C-codec + canon parity gate, NOT a hold-out or silicon proof.
+RESULT: PASS

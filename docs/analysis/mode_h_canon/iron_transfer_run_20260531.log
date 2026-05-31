@@ -1,0 +1,90 @@
+# production-iron transfer static analysis (caveat #2) — 2026-05-31T11:35:18Z
+# prod iron: /tmp/prod_iron_page0.rbf = bitrev(epcs_backup_20260521_pre_modeH.bin[:368011])
+#   page-0 .rbf md5 fd884770 (Plan C-1 v4, NO mode H) — authoritative production state
+
+production iron : /tmp/prod_iron_page0.rbf (368011 B)
+editable range  : [5282, 367952)  (D4 frames 25..1751)
+
+== covered positions: current production-iron mask + data-cell baseline match ==
+  pos          prod_mask  gold0_mask  data16_match  base_addr   bp
+  X10Y2N0      0x0900     0x0000      False        0x013FDA  7  (Y=2 header)
+  X10Y8N0      0x9966     0x0000      False        0x013FE1  5
+  X10Y14N0      0x0008     0x0000      False        0x013FE7  3
+  X16Y2N0      0xEA4A     0x0000      False        0x02BFC2  7  (Y=2 header)
+  X16Y8N0      0xF0CA     0x0000      False        0x02BFC9  5
+  X16Y14N0      0x0000     0x0000      True         0x02BFCF  3  <- candidate
+  X16Y21N0      0xF5A0     0x0000      False        0x02BF4C  0
+  X22Y2N0      0xFFDF     0x0000      False        0x03671A  7  (Y=2 header)
+  X22Y8N0      0xB080     0x0000      False        0x036721  5
+  X22Y14N0      0xCCA0     0x0000      False        0x036727  3
+  X22Y21N0      0xCCCC     0x0000      False        0x0366A4  0
+  X28Y8N0      0xA000     0x0000      False        0x04E709  5
+  X28Y14N0      0xCCF0     0x0000      False        0x04E70F  3
+  X28Y17N0      0xFEFE     0x0000      False        0x04E712  2
+
+== transfer collision matrix (delta = predict △ canon, vs gold_mask0 baseline) ==
+  collisions = touched cells where production != minimal-baseline (UNSAFE to XOR)
+  pos        mask    Δcells  collide    region breakdown of collisions
+  X10Y2N0     0x4444  48      6          lab_cram:6
+  X10Y2N0     0x6996  72      10         lab_cram:8 lut_data:2
+  X10Y2N0     0xDEAD  75      9          lab_cram:8 lut_data:1
+  X10Y2N0     0xFFFF  1       1          lab_cram:1
+  X10Y8N0     0x4444  35      6          lab_cram:6
+  X10Y8N0     0x6996  56      9          lab_cram:5 lut_data:4
+  X10Y8N0     0xDEAD  59      11         lab_cram:6 lut_data:5
+  X10Y14N0     0x4444  36      15         lab_cram:15
+  X10Y14N0     0x6996  58      19         lab_cram:19
+  X10Y14N0     0xDEAD  61      19         lab_cram:19
+  X16Y2N0     0x4444  43      8          lab_cram:8
+  X16Y2N0     0x6996  64      10         lab_cram:6 lut_data:4
+  X16Y2N0     0xDEAD  67      12         lab_cram:8 lut_data:4
+  X16Y8N0     0x4444  30      5          lab_cram:5
+  X16Y8N0     0x6996  45      7          lab_cram:3 lut_data:4
+  X16Y8N0     0xDEAD  48      9          lab_cram:5 lut_data:4
+  X16Y14N0     0x4444  29      1          lab_cram:1
+  X16Y14N0     0x6996  48      2          lab_cram:2
+  X16Y14N0     0xDEAD  51      2          lab_cram:2
+  X16Y21N0     0x4444  35      7          lab_cram:7
+  X16Y21N0     0x6996  56      12         lab_cram:8 lut_data:4
+  X16Y21N0     0xDEAD  59      14         lab_cram:8 lut_data:6
+  X22Y2N0     0x4444  35      8          lab_cram:8
+  X22Y2N0     0x6996  57      11         lab_cram:3 lut_data:8
+  X22Y2N0     0xDEAD  60      14         lab_cram:6 lut_data:8
+  X22Y8N0     0x4444  32      3          lab_cram:3
+  X22Y8N0     0x6996  48      8          lab_cram:6 lut_data:2
+  X22Y8N0     0xDEAD  51      9          lab_cram:6 lut_data:3
+  X22Y14N0     0x4444  30      7          lab_cram:7
+  X22Y14N0     0x6996  45      13         lab_cram:10 lut_data:3
+  X22Y14N0     0xDEAD  48      16         lab_cram:10 lut_data:6
+  X22Y21N0     0x4444  37      7          lab_cram:3 lut_data:4
+  X22Y21N0     0x6996  59      14         lab_cram:10 lut_data:4
+  X22Y21N0     0xDEAD  62      15         lab_cram:10 lut_data:5
+  X28Y8N0     0x4444  30      5          lab_cram:5
+  X28Y8N0     0x6996  46      6          lab_cram:5 lut_data:1
+  X28Y8N0     0xDEAD  49      7          lab_cram:6 lut_data:1
+  X28Y14N0     0x4444  26      5          lab_cram:5
+  X28Y14N0     0x6996  43      9          lab_cram:5 lut_data:4
+  X28Y14N0     0xDEAD  46      11         lab_cram:7 lut_data:4
+  X28Y17N0     0x4444  29      9          lab_cram:9
+  X28Y17N0     0x6996  50      13         lab_cram:6 lut_data:7
+  X28Y17N0     0xDEAD  53      15         lab_cram:8 lut_data:7
+  X28Y17N0     0xFFFF  1       1          lab_cram:1
+
+  clean (0-collision) (pos,mask) transfers: 0/44
+
+== deep-dive: X16Y14N0 mask 0x4444 ==
+  base_addr=0x02BFCF bp=3  Δ=29 cells
+  region breakdown : {'lab_cram': 24, 'block_band': 5}
+  all in editable range [5282,367952): True   any CRC-byte cell: False
+  locality: 9/29 within ±1680 B (LE 8-frame window); max dist from base = 186028 B (885 frames)
+  D3 FF-avoid: no per-LE FF CRAM bit exists (cert) — but D3 covered only the 16 minterm cells, NOT these canon cells.
+
+  sample of farthest cells (region, dist_frames, prod_bit, gold0_bit):
+    0x05967B.2 lab_cram    dist= 885f prod=0 gold0=1 COLLIDE
+    0x058D6A.2 block_band  dist= 874f prod=0 gold0=0 ok
+    0x058BBF.2 block_band  dist= 872f prod=0 gold0=0 ok
+    0x058A1B.2 block_band  dist= 870f prod=0 gold0=0 ok
+    0x05898C.4 block_band  dist= 870f prod=0 gold0=0 ok
+    0x0588D4.3 block_band  dist= 869f prod=0 gold0=0 ok
+    0x0355D3.2 lab_cram    dist= 182f prod=0 gold0=0 ok
+    0x03544F.2 lab_cram    dist= 181f prod=0 gold0=0 ok

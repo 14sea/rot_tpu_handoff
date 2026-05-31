@@ -1,5 +1,65 @@
 # Dynamic FPGA reconfiguration on EP4CE6 — plan v2
 
+## 2026-05-31 — Cyclone_CRAM_Mapper delivered D1–D4; canon "no-op" FALSIFIED; consumer byte-identity gate PASSES
+
+The producer (`EP4CE6` / Cyclone_CRAM_Mapper) shipped all four mode-H contract
+deliverables (`docs/notes/cyclone_cram_mapper_modeH_reply_2026_05_31.txt`):
+D1 golden RBF set (58 .rbf), D2 the **actual canon table**
+(`canon_2input_codec_table_d1pp.json`), D3 FF-avoid list, D4 safe byte ranges.
+
+**D2 changed shape**: the requested "1152-position canon-2input *no-op
+certificate*" was abandoned because the no-op premise is FALSE. Canon-2input
+is a real per-position XOR delta (17–66 cells/pos, lab_cram + block_band).
+The producer shipped the table you must apply instead.
+
+**Consumer-side proof** (`docs/analysis/mode_h_canon/`, ingested + gated this
+session, no iron action): the on-chip C codec (`lutcodec.so`) + D2 canon
+reconstructs every Quartus gold byte-for-byte —
+
+| pass | σ⁻¹ (C) only | σ⁻¹ + D2 canon |
+|------|--------------|----------------|
+| byte-identical to gold | 0 / 44 | **44 / 44** |
+
+(negative control: drop 1 canon cell → diff>0, gate discriminates). This
+**falsifies** the `lut_apply_with_canon` no-op comment, now corrected in the
+scratch_merge codec (fold into a neorv32_rot patch separately).
+
+**Reconciliation with the 2026-05-21 silicon result** — two different goals,
+both true: byte-identity to Quartus's *output* needs canon (above); but for
+the symmetric `{0x0000,0xFFFF}` scope mode H ships, σ⁻¹-only is
+silicon-validated at *runtime* (the LE reads only its 16 LUT data cells, H1).
+Canon cells are real bits Quartus emits but are not runtime-load-bearing for
+the symmetric case. Whether they are load-bearing for **asymmetric** masks
+(H2) is still untested.
+
+**What this unblocks / does NOT**:
+- ✅ The host-side byte-identity gate the original target.txt required before
+  any asymmetric flash. The D2-pending blocker cited in the v5 section below
+  is RESOLVED (in changed form).
+- ⛔ Asymmetric **silicon** validation still gated. The caveat-#2 static
+  analysis is now DONE (`docs/analysis/mode_h_canon/iron_transfer_findings.md`,
+  `analyze_iron_transfer.py`) and gives a hard NO for the canon-transfer idea:
+  **0/44 mined (pos,mask) transfer cleanly onto production iron** — 13/14
+  covered positions are already occupied, and the canon cells are shared/
+  block-level (one cell appears in all 14 positions; block_band cells in
+  8–11), spread up to 885 frames from base. So the minimal-design canon is a
+  byte-identity oracle, NOT a portable per-LE patch. The viable path is
+  **σ⁻¹-only** (which DOES transfer cleanly — at the one free LE X16Y14N0 the
+  16 data cells match baseline), gated on validating **H1 for asymmetric**
+  (runtime LE reads only its 16 data cells) — i.e. back to the original H1/H2
+  discriminator + an observable LE, NOT canon ingestion. Coverage also partial
+  (N=0, Y∈{2,8,14,17,21}, 3 mask-classes); full 1152×mask-class×N is a producer
+  scaling task (reply Part C).
+- ⛔ On-chip cannot hold the 246 KB table → asymmetric mode H must be
+  host-prepared (.rbf assembled host-side, mode H only stages it).
+
+**XPART question answered**: Cyclone IV E has no ICAP / no partial reconfig, so
+literal live-fabric XPART is HW-impossible. mode H (EPCS-stage + cold-boot LUT
+surgery) is the correct and only substitute — already the XPART-spirit
+equivalent; do not chase ICAP.
+
+---
+
 ## 2026-05-21 night — Plan C-1 v5 mode H SILICON-VALIDATED for symmetric scope
 
 End-to-end `.rbf` fabric surgery via EPCS slot-1 staging is now silicon-

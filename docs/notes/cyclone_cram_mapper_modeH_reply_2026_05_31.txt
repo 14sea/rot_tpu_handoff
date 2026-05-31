@@ -1,0 +1,148 @@
+================================================================================
+CYCLONE_CRAM_MAPPER -> rot_tpu_handoff : mode-H / XPART-spirit handoff REPLY
+Producer side: Cyclone_CRAM_Mapper (EP4CE6 repo, github.com/14sea/Cyclone_CRAM_Mapper)
+Consumer side: rot_tpu_handoff / neorv32_rot mode-H fabric surgery
+Date: 2026-05-31
+Re: cyclone_cram_mapper_targets_modeH.txt (the 4-deliverable contract)
+    + the user's question "implement Xilinx-XPART-like capability on EP4CE6"
+================================================================================
+
+TL;DR
+  1. All 4 mode-H deliverables (D1-D4) are DELIVERED and committed/pushed on the
+     producer side. The single-LE LUT-truth-table surgery path is NOT blocked on
+     us. You can pull them from the public repo.
+  2. "XPART" = Xilinx Partial Reconfiguration Toolkit (JBits/ICAP, runtime
+     fine-grain LUT/CRAM surgery). Cyclone IV has NO ICAP / NO partial reconfig
+     (Intel HW fact) -> literal live-fabric XPART is impossible on this silicon.
+     YOUR mode-H (.rbf LUT-cell edit -> EPCS slot stage -> cold-boot) IS the
+     correct and only substitute, and it is already the XPART-spirit equivalent.
+  3. To generalize from "1 LE, symmetric mask" to "any LUT, any function" you do
+     NOT need new codec capability from us for the LUT path -- you need us to
+     SCALE the canon table (more positions / mask-classes / N) + ship an
+     editable-LE allowlist. Sizing + recipe below.
+
+--------------------------------------------------------------------------------
+PART A -- STATUS OF THE 4 CONTRACT DELIVERABLES (all committed on producer side)
+--------------------------------------------------------------------------------
+
+D1  SENTINEL GOLDEN RBF SET .......................... DELIVERED (expanded)
+    results/golden_rbf_modeH/ -- 58 golden RBFs (not just the requested 4):
+    masks {0x0000, 0x4444, 0x6996, 0xDEAD, 0xFFFF} x 14 pin-friendly positions
+    X in {10,16,22,28}, plus .cells/.diff sidecars (147 tracked files total).
+    This is your byte-identity oracle for lutcodec.c lut_apply_mask().
+    Positions: 10/16/22/28 x Y in {2,8,14,21 ...} N0; full list in the table file.
+
+D2  1152-POSITION CANON NO-OP CERTIFICATE ............ REPLACED (premise falsified)
+    The "canon is a no-op at pin-friendly cols" premise was FALSE. Empirically
+    canon-2input is a REAL per-position XOR delta (17-66 cells/pos). So instead of
+    a no-op certificate we shipped the actual table you must apply:
+       results/canon_2input_codec_table_d1pp.json  (44 (pos,mask) entries)
+    Consumer formula (already matches your math):
+       Quartus(mask) = baseline_mask0  XOR  predict_sram(mask)  XOR
+                       canon_cells[(x,y,n)][mask]   then patch_rbf_crc()
+    Verifier reconstructs 44/44 golds byte-identical. IMPORTANT for your lc_init:
+    canon is NOT a no-op -- if your C path currently treats lut_apply_with_canon
+    as a no-op wrapper, that is only valid for the exact (pos,mask) you have
+    silicon-tested. For any new (pos,mask) you MUST apply the canon cells from
+    this table, or the edited LE truth table will be wrong.
+
+D3  FF-PRESENCE AVOID LIST ........................... DELIVERED
+    results/ff_presence_avoid_addrs.json -- cells your dirty-bitmap walker must
+    never XOR (would flip a combinational LE into a registered one).
+
+D4  HEADER/FOOTER SAFE BYTE RANGES ................... DELIVERED
+    results/rbf_safe_byte_ranges.md -- machine-readable safe (lo,hi) ranges +
+    the per-build variable bytes [0x29,0x35)+[0x49,0x4B) to exclude from diffs.
+
+--------------------------------------------------------------------------------
+PART B -- XPART REALITY CHECK (the user's actual question)
+--------------------------------------------------------------------------------
+
+What XPART is: Xilinx Partial Reconfiguration Toolkit, derived from JBits, built
+on ICAP -- a HW-independent C API for runtime fine-grain reconfiguration of
+selected CRAM resources (tune LUTs, constant-folding, MGT tuning) WITHOUT a full
+reconfig, including self-reconfiguration from inside the chip.
+
+Hardware fact (Intel docs): Cyclone IV E (EP4CE6/CE10) has NO ICAP and does NOT
+support partial reconfiguration. Full reconfig is required. (Partial recon starts
+at Stratix/Arria.) So the literal XPART property -- live edit with no halt -- is
+physically unavailable on this silicon.
+
+What you already built IS the achievable equivalent:
+  mode-H = real .rbf LUT-cell surgery via sigma-inv math + frame-CRC repair,
+           staged to EPCS slot 1, promoted slot1->slot0, then COLD-BOOT.
+  This is "XPART minus live-ness": genuine CRAM/LUT surgery, applied through the
+  EPCS-stage + cold-boot path (the Cyclone IV substitute for ICAP).
+  Silicon-validated 2026-05-21: 1 LE @ (X22,Y12,N4) 0x0000->0xFFFF, byte-identical
+  to host oracle, exactly 1 changed LE, no collateral.
+Recommendation to the user: do NOT chase ICAP/live XPART on Cyclone IV. mode-H is
+the right design. Frame it as "JBits/XPART-class LUT surgery via EPCS staging +
+cold-boot", which is exactly what the README already says.
+
+--------------------------------------------------------------------------------
+PART C -- WHAT THE PRODUCER MUST ADD TO GENERALIZE XPART (the real gap list)
+--------------------------------------------------------------------------------
+All producer-side mining (Python + Quartus compiles, NO flash). Ranked by leverage.
+
+Pivotal measurement (2026-05-31): canon cells are PARTLY mask-dependent --
+  0x6996 <-> 0xDEAD  jaccard 0.88-0.97  (XOR-class masks share canon)
+  0x4444 <-> 0x6996/DEAD  jaccard 0.44-0.57  (partial)
+  anything <-> 0xFFFF  jaccard 0.01-0.22  (bypass/const is its own class)
+=> canon is neither per-position-invariant nor cleanly per-mask. Generalizing
+   needs a mine per (position, MASK-CLASS), not per position and not per raw mask.
+   Mask-classes to budget for: XOR-class, AND/OR-perm-class, bypass/const-class.
+
+  1. CANON TABLE COVERAGE. Today: 14 positions x 4 masks. Full XPART ("any LUT")
+     wants the full pin-friendly whitelist 4 x 18 x 16 = 1152 (x,y,n) x the
+     mask-classes you will actually use. Recipe = scripts/mode_h/build_canon_d1pp_table.py
+     + Quartus compiles. Size by mask-CLASS, not all 65536 masks.
+
+  2. ODD-N / FULL-N COVERAGE. Demo used even N. P4 (2026-05-29) proved canon is
+     PER-N (not N-invariant) -- each N slot needs its own mine. (Your contract Q3
+     explicitly deferred odd-N; this is where it comes back.)
+
+  3. EDITABLE-LE ALLOWLIST (your wanted editable_les.bin sidecar). Producer emits
+     a per-base list of LE positions safe to XOR-edit, cross-checked with D3
+     FF-avoid -- turns the pin-friendly whitelist into a hard safety gate in lc_init.
+
+  4. BEYOND-LUT SURGERY -- RECOMMEND OUT OF SCOPE. ROUTE/IOB/M9K runtime edits hit
+     the context-dependent LI-MUX composition wall that silicon-FAILED twice on the
+     producer side (P5d 2026-05-21, Track D 2026-05-28). Real XPART's headline use
+     case is LUT tuning / constant folding anyway. Keep XPART = LUT-truth-table-only.
+
+  5. (Optional) A thin Python lut_edit() reference + ctypes parity test in the
+     mapper that mirrors your C lut_apply_mask, so we can regression-test your C
+     codec against the Python oracle without you shipping golds each time.
+
+--------------------------------------------------------------------------------
+PART D -- HOW TO PULL THE DELIVERABLES
+--------------------------------------------------------------------------------
+Public repo: github.com/14sea/Cyclone_CRAM_Mapper (branch main).
+  results/golden_rbf_modeH/                         (D1, 147 files)
+  results/canon_2input_codec_table_d1pp.json        (D2)
+  results/ff_presence_avoid_addrs.json              (D3)
+  results/rbf_safe_byte_ranges.md                   (D4)
+Verifier (run from a clean clone, no Quartus needed):
+  python3 scripts/mode_h/verify_canon_d1pp_table.py   -> 44/44 byte-identical
+Builder (to extend coverage, needs Quartus + existing D1++ golds):
+  python3 scripts/mode_h/build_canon_d1pp_table.py
+Caveat printed by the verifier: it is a lossless mine->verify ROUND-TRIP gate on
+the SAME builds (table-integrity/CRC/apply gate), NOT a hold-out or silicon proof.
+Per-position + per-N + partly-per-mask -- do not assume it generalizes to an
+unmined (pos,mask,N).
+
+--------------------------------------------------------------------------------
+PART E -- SUMMARY FOR THE CONSUMER
+--------------------------------------------------------------------------------
+  * Single-LE LUT surgery (the XPART core): COMPLETE on producer side, committed,
+    silicon-validated via your mode-H. Nothing owed.
+  * Generalize to any-LUT-any-function: producer scales the canon table
+    (positions x mask-classes x N) + ships an editable-LE allowlist; keep routing
+    edits out. All producer-side, no flash, Quartus-compile-bound.
+  * Live ICAP-style XPART: HW-impossible on Cyclone IV. EPCS-stage + cold-boot
+    mode-H is the correct substitute.
+
+Cross-ref on producer side: memory xpart_capability_scoping_2026_05_31,
+path5_canon_d1pp_table_landed_2026_05_21, p4_n_invariance_2026_05_29,
+routing_model_scoping_2026_05_28.
+================================================================================
