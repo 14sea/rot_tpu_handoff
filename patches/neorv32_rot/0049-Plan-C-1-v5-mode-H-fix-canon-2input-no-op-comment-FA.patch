@@ -1,0 +1,62 @@
+From b1e67d5fb21141989f854af01bebe618e1d0e457 Mon Sep 17 00:00:00 2001
+From: 14sea <wanhuaning@gmail.com>
+Date: Sun, 31 May 2026 15:25:59 +0100
+Subject: [PATCH] Plan C-1 v5 mode H: fix canon-2input no-op comment (FALSIFIED
+ by D2)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The prior comment in lut_apply_with_canon claimed the canon-2input layer is
+"empirically a no-op at pin-friendly columns". Cyclone_CRAM_Mapper deliverable
+D2 (canon_2input_codec_table_d1pp.json) FALSIFIED that: canon-2input is a real
+per-position XOR delta of 17-66 cells. The consumer byte-identity gate
+docs/analysis/mode_h_canon/test_canon_vs_golden.py reconstructs the Quartus
+golds 0/44 without canon, 44/44 with it.
+
+Comment-only correction. The σ⁻¹-only code path is unchanged and remains
+correct for the shipped symmetric scope {0x0000,0xFFFF}: at runtime the LE
+reads only its 16 LUT data cells (H1, silicon-validated @ (22,12,4)
+2026-05-21), so canon cells Quartus would emit are fitter metadata, not
+load-bearing. Asymmetric masks require a host-prepared .rbf and remain gated.
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+---
+ sw/stage2_loader/lutcodec.c | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/sw/stage2_loader/lutcodec.c b/sw/stage2_loader/lutcodec.c
+index a1d97e2..09f8f6d 100644
+--- a/sw/stage2_loader/lutcodec.c
++++ b/sw/stage2_loader/lutcodec.c
+@@ -118,11 +118,22 @@ lc_status_t lut_apply_with_canon(uint8_t *rbf,
+     lut_codec_t lc;
+     lc_status_t st = lc_init(&lc, x, y, n);
+     if (st != LC_OK) return st;
+-    /* canon-2input asymmetric-mask layer is empirically a no-op at
+-     * pin-friendly columns (Quartus emission matches zero-baseline
+-     * canon state).  When this port is extended to X∈{3,4,6,7}
+-     * (left-edge), apply the appropriate CANON_2INPUT_ABSOLUTE
+-     * transition cells here before lut_apply_mask. */
++    /* IMPORTANT (2026-05-31): the canon-2input layer is NOT a no-op — that
++     * earlier claim was FALSIFIED by Cyclone_CRAM_Mapper D2
++     * (canon_2input_codec_table_d1pp.json): it is a real per-position XOR
++     * delta of 17-66 cells (lab_cram + block_band). The consumer byte-identity
++     * gate (docs/analysis/mode_h_canon/test_canon_vs_golden.py) reconstructs
++     * the Quartus golds 0/44 without canon, 44/44 with it.
++     *
++     * This path INTENTIONALLY applies σ⁻¹ ONLY, because:
++     *   (a) for the symmetric scope {0x0000,0xFFFF} that mode H ships,
++     *       σ⁻¹-only is silicon-validated (mode H @ (22,12,4), 2026-05-21):
++     *       the runtime LE reads only its 16 LUT data cells (H1), so the canon
++     *       cells Quartus would emit are fitter metadata, not load-bearing; and
++     *   (b) the 246 KB canon table cannot fit on-chip.
++     * Asymmetric masks therefore require a HOST-prepared .rbf (σ⁻¹+canon
++     * applied on the host, mode H only stages it) and remain gated — see
++     * docs/analysis/mode_h_canon/README.md. Do NOT apply canon on-chip here. */
+     lut_apply_mask(rbf, &lc, mask, dirty);
+     return LC_OK;
+ }
+-- 
+2.43.0
+
