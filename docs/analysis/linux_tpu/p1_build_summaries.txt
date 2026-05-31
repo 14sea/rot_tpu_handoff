@@ -1,0 +1,36 @@
+=== P1 combined Linux+TPU build summaries (2026-05-31) ===
+--- FIT ---
+Fitter Status : Successful - Sun May 31 12:52:06 2026
+Quartus Prime Version : 21.1.0 Build 842 10/21/2021 SJ Lite Edition
+Revision Name : neorv32_demo
+Top-level Entity Name : ax301_top
+Family : Cyclone IV E
+Device : EP4CE10F17C8
+Timing Models : Final
+Total logic elements : 5,459 / 10,320 ( 53 % )
+    Total combinational functions : 4,754 / 10,320 ( 46 % )
+    Dedicated logic registers : 3,094 / 10,320 ( 30 % )
+Total registers : 3147
+Total pins : 51 / 180 ( 28 % )
+Total virtual pins : 0
+Total memory bits : 175,104 / 423,936 ( 41 % )
+Embedded Multiplier 9-bit elements : 16 / 46 ( 35 % )
+Total PLLs : 0 / 2 ( 0 % )
+
+--- STA (summary) ---
+------------------------------------------------------------
+Timing Analyzer Summary
+------------------------------------------------------------
+
+Type  : Slow 1200mV 85C Model Setup 'CLOCK'
+Slack : -0.959
+TNS   : -13.505
+
+Type  : Slow 1200mV 85C Model Setup 'S_CLK'
+Slack : 5.917
+TNS   : 0.000
+
+Type  : Slow 1200mV 85C Model Hold 'S_CLK'
+Slack : -0.971
+TNS   : -0.971
+

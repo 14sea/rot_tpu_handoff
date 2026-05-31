@@ -1,0 +1,5 @@
+# build outputs — regenerate with `make` (+ ../host_reference.py for the .bin)
+init
+gen_init_cpio
+neo_initramfs*.cpio.gz
+filelist.txt

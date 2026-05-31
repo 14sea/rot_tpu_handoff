@@ -1,0 +1,153 @@
+[*] Kernel:    1,513,284 bytes → 0x40000000
+[*] DTB:       1,461 bytes → 0x41f00000
+[*] Initramfs: 2,240 bytes → 0x41f80000
+[*] Total: 1,516,985 bytes, ~145s at 115200 baud
+
+[1] Programming FPGA: /home/test/rot_tpu_handoff/docs/analysis/linux_tpu/scratch_merge/quartus/neorv32_demo.rbf
+empty
+
+Load SRAM: [=========================                         ] 48.56%
+
+Load SRAM: [================================================= ] 97.11%
+
+Load SRAM: [==================================================] 100.00%
+
+Done
+
+[2] Connecting to bootloader at 19200 baud...
+  [1.6s] got 38B
+[2] Bootloader ready
+[2] Stage2: 7,904 bytes
+[2] Stage2 uploaded OK
+
+[3] Switched to 115200 baud
+[3] Sent 'l' for Linux direct boot mode
+[stage2] Mode: Linux direct boot
+[stage2] Memory layout:
+  Kernel:    0x40000000
+  DTB:       0x41f00000
+  Initramfs: 0x41f80000
+[stage2] send kernel via xmodem
+
+[4] Waiting for kernel xmodem prompt...
+
+[stage2] waiting for sender (NAK)...
+
+[4] Sending kernel (1,513,284 bytes) via xmodem...
+  [xmodem] 1513344 bytes, 11823 blocks
+  [xmodem] 100/11823 (0%)  [xmodem] 200/11823 (1%)  [xmodem] 300/11823 (2%)  [xmodem] 400/11823 (3%)  [xmodem] 500/11823 (4%)  [xmodem] 600/11823 (5%)  [xmodem] 700/11823 (5%)  [xmodem] 800/11823 (6%)  [xmodem] 900/11823 (7%)  [xmodem] 1000/11823 (8%)  [xmodem] 1100/11823 (9%)  [xmodem] 1200/11823 (10%)  [xmodem] 1300/11823 (10%)  [xmodem] 1400/11823 (11%)  [xmodem] 1500/11823 (12%)  [xmodem] 1600/11823 (13%)  [xmodem] 1700/11823 (14%)  [xmodem] 1800/11823 (15%)  [xmodem] 1900/11823 (16%)  [xmodem] 2000/11823 (16%)  [xmodem] 2100/11823 (17%)  [xmodem] 2200/11823 (18%)  [xmodem] 2300/11823 (19%)  [xmodem] 2400/11823 (20%)  [xmodem] 2500/11823 (21%)  [xmodem] 2600/11823 (21%)  [xmodem] 2700/11823 (22%)  [xmodem] 2800/11823 (23%)  [xmodem] 2900/11823 (24%)  [xmodem] 3000/11823 (25%)  [xmodem] 3100/11823 (26%)  [xmodem] 3200/11823 (27%)  [xmodem] 3300/11823 (27%)  [xmodem] 3400/11823 (28%)  [xmodem] 3500/11823 (29%)  [xmodem] 3600/11823 (30%)  [xmodem] 3700/11823 (31%)  [xmodem] 3800/11823 (32%)  [xmodem] 3900/11823 (32%)  [xmodem] 4000/11823 (33%)  [xmodem] 4100/11823 (34%)  [xmodem] 4200/11823 (35%)  [xmodem] 4300/11823 (36%)  [xmodem] 4400/11823 (37%)  [xmodem] 4500/11823 (38%)  [xmodem] 4600/11823 (38%)  [xmodem] 4700/11823 (39%)  [xmodem] 4800/11823 (40%)  [xmodem] 4900/11823 (41%)  [xmodem] 5000/11823 (42%)  [xmodem] 5100/11823 (43%)  [xmodem] 5200/11823 (43%)  [xmodem] 5300/11823 (44%)  [xmodem] 5400/11823 (45%)  [xmodem] 5500/11823 (46%)  [xmodem] 5600/11823 (47%)  [xmodem] 5700/11823 (48%)  [xmodem] 5800/11823 (49%)  [xmodem] 5900/11823 (49%)  [xmodem] 6000/11823 (50%)  [xmodem] 6100/11823 (51%)  [xmodem] 6200/11823 (52%)  [xmodem] 6300/11823 (53%)  [xmodem] 6400/11823 (54%)  [xmodem] 6500/11823 (54%)  [xmodem] 6600/11823 (55%)  [xmodem] 6700/11823 (56%)  [xmodem] 6800/11823 (57%)  [xmodem] 6900/11823 (58%)  [xmodem] 7000/11823 (59%)  [xmodem] 7100/11823 (60%)  [xmodem] 7200/11823 (60%)  [xmodem] 7300/11823 (61%)  [xmodem] 7400/11823 (62%)  [xmodem] 7500/11823 (63%)  [xmodem] 7600/11823 (64%)  [xmodem] 7700/11823 (65%)  [xmodem] 7800/11823 (65%)  [xmodem] 7900/11823 (66%)  [xmodem] 8000/11823 (67%)  [xmodem] 8100/11823 (68%)  [xmodem] 8200/11823 (69%)  [xmodem] 8300/11823 (70%)  [xmodem] 8400/11823 (71%)  [xmodem] 8500/11823 (71%)  [xmodem] 8600/11823 (72%)  [xmodem] 8700/11823 (73%)  [xmodem] 8800/11823 (74%)  [xmodem] 8900/11823 (75%)  [xmodem] 9000/11823 (76%)  [xmodem] 9100/11823 (76%)  [xmodem] 9200/11823 (77%)  [xmodem] 9300/11823 (78%)  [xmodem] 9400/11823 (79%)  [xmodem] 9500/11823 (80%)  [xmodem] 9600/11823 (81%)  [xmodem] 9700/11823 (82%)  [xmodem] 9800/11823 (82%)  [xmodem] 9900/11823 (83%)  [xmodem] 10000/11823 (84%)  [xmodem] 10100/11823 (85%)  [xmodem] 10200/11823 (86%)  [xmodem] 10300/11823 (87%)  [xmodem] 10400/11823 (87%)  [xmodem] 10500/11823 (88%)  [xmodem] 10600/11823 (89%)  [xmodem] 10700/11823 (90%)  [xmodem] 10800/11823 (91%)  [xmodem] 10900/11823 (92%)  [xmodem] 11000/11823 (93%)  [xmodem] 11100/11823 (93%)  [xmodem] 11200/11823 (94%)  [xmodem] 11300/11823 (95%)  [xmodem] 11400/11823 (96%)  [xmodem] 11500/11823 (97%)  [xmodem] 11600/11823 (98%)  [xmodem] 11700/11823 (98%)  [xmodem] 11800/11823 (99%)  [xmodem] 11823/11823 (100%)
+  [xmodem] Transfer complete
+[stage2] kernel size=0x00171780 CRC:0x0266eccb
+  [kernel] CRC MATCH: 0266eccb ✓
+
+[5] Waiting for DTB xmodem prompt...
+[stage2] send DTB via xmodem
+
+[5] Sending DTB (1,461 bytes) via xmodem...
+  [xmodem] 1536 bytes, 12 blocks
+  [xmodem] 12/12 (100%)
+  [xmodem] Transfer complete
+[stage2] DTB size=0x00000600 CRC:0x9c0bd85f
+  [DTB] CRC MATCH: 9c0bd85f ✓
+
+[6] Waiting for initramfs xmodem prompt...
+[stage2] send initramfs via xmodem
+
+[6] Sending initramfs (2,240 bytes) via xmodem...
+  [xmodem] 2304 bytes, 18 blocks
+  [xmodem] 18/18 (100%)
+  [xmodem] Transfer complete
+[stage2] initramfs size=0x00000900 CRC:0xffc36268
+  [initramfs] CRC MATCH: ffc36268 ✓
+
+============================================================
+ Linux console output (Ctrl+C to exit)
+============================================================
+
+[dtb] initrd-end=0x41f80900 patched=0x00000001
+
+[stage2] All payloads loaded:
+  Kernel:  0x00171780 bytes
+  DTB:     0x00000600 bytes
+  Initrd:  0x00000900 bytes
+
+[stage2] Kernel header:
+
+  0x40000000: 0x0000a8b1 0x00010000 0x00000000 0x00000000 
+  0x40000010: 0x0017f218 0x00000000 0x00000000 0x00000000 
+[stage2] DTB header:
+
+  0x41f00000: 0xedfe0dd0 0xb5050000 0x38000000 0x80040000 
+[stage2] Booting Linux...
+  a0 = 0 (hartid)
+  a1 = 0x41f00000 (DTB)
+  PC = 0x40000000 (kernel)
+[stage2] SDRAM exec test @0x40171780
+ ← SDRAM exec OK
+ABCD[    0.000000] Linux version 6.6.83 (test@H3C) (riscv-none-elf-gcc (xPack GNU RISC-V Embedded GCC x86_64) 14.2.0, GNU ld (xPack GNU RISC-V Embedded GCC x86_64) 2.43.1) #59 Sun Apr 26 16:25:17 BST 2026
+[    0.000000] Machine model: NEORV32 on HeiJin AX301 (EP4CE6)
+[    0.000000] Forcing kernel command line to: earlycon=neorv32,0xfff50000 console=ttyNEO0,115200
+[    0.000000] earlycon: neorv32 at MMIO 0xfff50000 (options '')
+[    0.000000] printk: bootconsole [neorv32] enabled
+[    0.000000] Zone ranges:
+[    0.000000]   Normal   [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] Movable zone start for each node
+[    0.000000] Early memory node ranges
+[    0.000000]   node   0: [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] Initmem setup node 0 [mem 0x0000000040000000-0x0000000041ffffff]
+[    0.000000] riscv: base ISA extensions acim
+[    0.000000] riscv: ELF capabilities acim
+E[    0.000000] Kernel command line: earlycon=neorv32,0xfff50000 console=ttyNEO0,115200
+[    0.000000] Dentry cache hash table entries: 4096 (order: 2, 16384 bytes, linear)
+[    0.000000] Inode-cache hash table entries: 2048 (order: 1, 8192 bytes, linear)
+[    0.000000] Built 1 zonelists, mobility grouping on.  Total pages: 8128
+[    0.000000] mem auto-init: stack:all(zero), heap alloc:off, heap free:off
+[    0.000000] Memory: 30904K/32768K available (1075K kernel code, 141K rwdata, 160K rodata, 96K init, 52K bss, 1864K reserved, 0K cma-reserved)
+[    0.000000] SLUB: HWalign=64, Order=0-1, MinObjects=0, CPUs=1, Nodes=1
+[    0.000000] NR_IRQS: 64, nr_irqs: 64, preallocated irqs: 0
+[    0.000000] riscv-intc: 32 local interrupts mapped
+[    0.000000] clint: clint@fff40000: timer running at 50000000 Hz
+[    0.000000] clocksource: clint_clocksource: mask: 0xffffffffffffffff max_cycles: 0xb8812736b, max_idle_ns: 440795202655 ns
+[    0.000239] sched_clock: 64 bits at 50MHz, resolution 20ns, wraps every 4398046511100ns
+FGHIJK[    0.043794] Console: colour dummy device 80x25
+LMNOP[    0.063466] Calibrating delay loop (skipped), value calculated using timer frequency.. 100.00 BogoMIPS (lpj=200000)
+Q[    0.086192] pid_max: default: 4096 minimum: 301
+RS[    0.113705] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.132974] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+TUVabc<401119d0><40111ed2><40111f2e><40114592><40118e26><40119a58><40119b7c>def[    0.577728] devtmpfs: initialized
+@[0][1<4011116c><40111fbe><401129a6><40113036><40113fc2>[    1.052805] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 7645041785100000 ns
+<401144ac>[    1.075371] futex hash table entries: 16 (order: -5, 192 bytes, linear)
+<40119ab4><40119b1c><40119b3c><40119b5c><400e62ce>][2<401138f8><401148f8><40114948><40116cc2><4011b11c><4011b60e><4011c24e><4011c8a6><4011cb02><4011cb14>][3<40110486><40001b40>[    1.283308] sched: RT throttling activated
+[    3.168271] cpu0: Ratio of byte access time to unaligned word access is 0.00, unaligned accesses are slow
+<400d0224><4011d72a>][4<40110cb6><40111e36><40112634><40112bbc><40114914><40115e48><40116aaa><40116a7e><4011c1bc><400e626a><4011d02c><4011fb22>][5<00<40111ada>>.<01<40113f7e>[    5.214655] clocksource: Switched to clocksource clint_clocksource
+>.<02<40118b14>>.<03<40118c02>>.<04<40118c32>>.<05<40118c9a>>.<06<40118cfa>>.<07<4011900c>>.<08<401199fc>>.<09<40119a86>>.<10<40119baa>>.<11<40119df4>>.<12<40119e3c>>.<13<40119e6a>>.<14<40119e94>>.<15<40119ece>>.<16<40119efc>>.<17<40119f34>>.<18<40119f6c>>.<19<40119f96>>.<20<40119fce>>.<21<4011a006>>.<22<4011a0e4>>.<23<4011a24c>>.<24<4011bf64>>.<25<40110362>[   10.904419] Unpacking initramfs...
+[   11.165633] Initramfs unpacking failed: invalid magic at start of compressed archive
+>.][6<00<40110c62>>.<01<4011174c>>.<02<40111778>>.<03<40111a80>>.<04<40113a72>>.<05<40113bc8>>.<06<40113eba>>.<07<40113ffa>>.<08<40114032>>.<09<40114098>>.<10<401140e0>>.<11<40114156>>.<12<4011453a>>.<13<4011456a>>.<14<401147da>>.<15<401169b4>[   11.504107] workingset: timestamp_bits=30 max_order=13 bucket_order=0
+>.<16<40118cca>>.<17<40118f00>>.<18<40119242>>.<19<4011a20c>>.<20<4011a268>>.<21<4011ac3a>>.<22<4011b032>>.<23<4011b098>>.<24<4011b0fe>>.<25<4011b274>>.<26<4011b294>>.<27<4011befc>(*PQ[   17.672206] fff50000.serial: ttyNEO0 at MMIO 0x0 (irq = 0, base_baud = 0) is a neorv32-uart
+[   17.706029] printk: console [ttyNEO0] enabled
+[   17.706029] printk: console [ttyNEO0] enabled
+[   17.736200] printk: bootconsole [neorv32] disabled
+[   17.736200] printk: bootconsole [neorv32] disabled
+R0+)>.<28<4011c02c>>.<29<4011c800>>.<30<4011c86e>>.][7<00<4010f4aa>>.<01<401117ba>>.<02<4011178a>>.<03<401119ac>>.<04<4011197c>>.<05<40112718>>.<06<40112b56>>.<07<40112c52>>.<08<40112f00>>.<09<40112fb8>>.<10<40112f88>>.<11<401134ae>>.<12<400d5a1a>>.<13<400d8b72>T0>.<14<4011d81a>>.<15<4011ad54>[   19.372098] clk: Disabling unused clocks
+>.<16<4011d714>>.]#$g12Sschijkl[   19.461058] This architecture does not have kernel memory protection.
+L[   19.512101] Freeing unused kernel image (initmem) memory: 96K
+Mmn[   19.529958] Run /init as init process
+Q1Q2Q3x1x2x3x4B1OS{|FDZe404984d2s404bfec0
+o!
+========================================
+ NEORV32 nommu Linux + TPU — mini shell 
+========================================
+Linux (none) 6.6.83 riscv32
+Uptime:    18 s
+Total RAM: 31000 KB
+Free RAM:  30260 KB
+
+--- Linux+TPU dense-layer classifier (auto) ---
+[tpu] reading workload /tpu_model.bin ...
+[tpu] model hash =T1T2 0xfcddd2e4  anchor = 0x9ca88565
+[tpu] TRUST FAIL: model hash != anchor — refusing to load fabric.
+-----------------------------------------------
+
+Type 'help' for commands.
+
+nommu# 
